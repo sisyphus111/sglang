@@ -1791,6 +1791,17 @@ class ConfigureLoggingReq(BaseReq):
 
 
 @dataclass
+class ConfigureDecoupledSpecPeersReq(BaseReq):
+    connect_endpoints: List[str]
+
+
+@dataclass
+class ConfigureDecoupledSpecPeersReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
 class OpenSessionReqInput(BaseReq):
     capacity_of_str_len: int
     session_id: Optional[str] = None

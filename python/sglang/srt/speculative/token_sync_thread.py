@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from dataclasses import dataclass, field
@@ -20,7 +21,14 @@ from sglang.srt.speculative.tracer import (
     NullSpecTracer,
     trace_speculative,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_zmq_socket,
+    get_zmq_socket_on_host,
+)
+
+logger = logging.getLogger(__name__)
 
 TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
 
@@ -30,9 +38,9 @@ class TokenSyncThread:
     """Drafter-side token sync thread for decoupled speculation IPC."""
 
     context: zmq.Context | None = None
-    control_bind_endpoint: str | None = None
-    verifier_result_endpoints: list[str] | tuple[str, ...] | None = None
     drafter_rank: int = 0
+    control_bind_endpoint: str | None = field(default=None, init=False)
+    verifier_result_endpoints: list[str] = field(default_factory=list, init=False)
     _pending_control_inbox: DraftControlInbox = field(
         default_factory=DraftControlInbox
     )
@@ -53,32 +61,24 @@ class TokenSyncThread:
     def __post_init__(self) -> None:
         if self.tracer is None:
             self.tracer = NullSpecTracer()
-        if (
-            self.context is None
-            or self.control_bind_endpoint is None
-            or self.verifier_result_endpoints is None
-        ):
+        if self.context is None:
             self._thread = threading.Thread(
                 target=self._run,
                 name="sglang-token-sync-thread",
                 daemon=True,
             )
             return
-        self.control_recv_socket = get_zmq_socket(
-            self.context,
-            zmq.PULL,
-            self.control_bind_endpoint,
-            True,
+        bind_host = get_local_ip_auto("127.0.0.1")
+        port, self.control_recv_socket = get_zmq_socket_on_host(
+            self.context, zmq.PULL, host=bind_host
         )
-        self.result_send_sockets = {
-            verifier_rank: get_zmq_socket(
-                self.context,
-                zmq.PUSH,
-                endpoint,
-                False,
-            )
-            for verifier_rank, endpoint in enumerate(self.verifier_result_endpoints)
-        }
+        self.control_bind_endpoint = NetworkAddress(bind_host, port).to_tcp()
+        logger.info(
+            "Bound decoupled-spec drafter control endpoint: "
+            "drafter_rank=%s endpoint=%s",
+            self.drafter_rank,
+            self.control_bind_endpoint,
+        )
         self._thread = threading.Thread(
             target=self._run,
             name="sglang-token-sync-thread",
@@ -86,6 +86,8 @@ class TokenSyncThread:
         )
 
     def start(self) -> None:
+        if not self.result_send_sockets:
+            return
         if self._thread is None:
             return
         if not self._thread.is_alive():
@@ -100,6 +102,35 @@ class TokenSyncThread:
             self.control_recv_socket.close(linger=0)
         for socket in self.result_send_sockets.values():
             socket.close(linger=0)
+
+    def configure_peer_endpoints(self, verifier_result_endpoints: list[str]) -> None:
+        endpoints = list(verifier_result_endpoints)
+        if not endpoints:
+            raise RuntimeError(
+                "Decoupled drafter requires at least one verifier result endpoint"
+            )
+        if self.result_send_sockets:
+            if endpoints == self.verifier_result_endpoints:
+                return
+            raise RuntimeError("Decoupled drafter peer endpoints are already configured")
+        if self.context is None:
+            raise RuntimeError("Decoupled drafter ZMQ context is not initialized")
+        self.result_send_sockets = {
+            verifier_rank: get_zmq_socket(
+                self.context,
+                zmq.PUSH,
+                endpoint,
+                False,
+            )
+            for verifier_rank, endpoint in enumerate(endpoints)
+        }
+        self.verifier_result_endpoints = endpoints
+        logger.info(
+            "Configured decoupled-spec drafter peers: "
+            "drafter_rank=%s verifier_result_endpoints=%s",
+            self.drafter_rank,
+            endpoints,
+        )
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET)
     def _drain_control_socket(self) -> bool | dict[str, Any]:
@@ -158,6 +189,8 @@ class TokenSyncThread:
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
             return
+        if not self.result_send_sockets:
+            raise RuntimeError("Decoupled drafter peer endpoints are not configured")
         queued_batch = DraftTailStreamOutputBatch(outputs=list(result_batch.outputs))
         self._outgoing_results.put(queued_batch)
         self._wakeup.set()

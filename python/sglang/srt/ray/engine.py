@@ -289,6 +289,9 @@ class RayEngine(Engine):
 
         event_loop_refs = controller.event_loop_refs
 
+        endpoint_infos = []
+        for info in controller.scheduler_infos:
+            endpoint_infos.extend(info.get("decoupled_spec_endpoint_infos", []))
         def wait_for_completion():
             try:
                 ray.get(event_loop_refs)
@@ -296,7 +299,13 @@ class RayEngine(Engine):
                 logger.error(f"Ray scheduler actor terminated with error: {e}")
 
         return RaySchedulerInitResult(
-            scheduler_infos=scheduler_infos,
+            scheduler_infos=[
+                {
+                    **scheduler_infos[0],
+                    "status": "ready",
+                    "decoupled_spec_endpoint_infos": endpoint_infos,
+                }
+            ],
             wait_for_completion=wait_for_completion,
             scheduler_actors=controller.scheduler_actors,
         )

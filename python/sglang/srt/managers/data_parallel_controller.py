@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ConfigureDecoupledSpecPeersReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -59,6 +60,7 @@ from sglang.srt.utils.network import (
     bind_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
+    wait_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
@@ -163,6 +165,8 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.scheduler_infos = []
+        self.scheduler_infos_lock = threading.Lock()
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
 
@@ -230,6 +234,7 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
+                (ConfigureDecoupledSpecPeersReq, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -244,12 +249,9 @@ class DataParallelController:
         sockets = []
         ready_events = []
         for dp_rank in range(server_args.dp_size):
-            tmp_port_args = PortArgs.init_new(server_args)
+            tmp_port_args = PortArgs.init_new(server_args, dp_rank)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
-            tmp_port_args.decoupled_spec_ipc_config = (
-                port_args.decoupled_spec_ipc_config
-            )
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -328,24 +330,66 @@ class DataParallelController:
             na = NetworkAddress.parse(server_args.dist_init_addr)
             na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
         endpoint = na.to_tcp()
+        logger.info(
+            "DP-attention worker-port broadcast endpoint: "
+            "node_rank=%s nnodes=%s dist_init_addr=%s endpoint=%s worker_ports=%s",
+            server_args.node_rank,
+            server_args.nnodes,
+            server_args.dist_init_addr,
+            endpoint,
+            worker_ports,
+        )
 
         if server_args.node_rank == 0:
+            logger.info(
+                "Checking DP-attention worker-port broadcast port availability: "
+                "endpoint=%s port=%s",
+                endpoint,
+                na.port,
+            )
+            wait_port_available(
+                na.port,
+                "dp_attention_worker_port_broadcast_port",
+            )
             # Node 0: Broadcast worker ports to all other nodes
             return self._broadcast_ports_as_server(
-                endpoint, server_args.nnodes - 1, worker_ports
+                endpoint, server_args.nnodes - 1, worker_ports, server_args
             )
         else:
             # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint, server_args.node_rank)
 
     def _broadcast_ports_as_server(
-        self, endpoint: str, expected_clients: int, worker_ports: List[int]
+        self,
+        endpoint: str,
+        expected_clients: int,
+        worker_ports: List[int],
+        server_args: ServerArgs,
     ) -> List[int]:
         """Broadcast worker ports to all client nodes."""
-        logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
-        logger.debug(f"Worker ports: {worker_ports}")
+        logger.info(
+            "Binding DP-attention worker-port broadcast socket: "
+            "endpoint=%s expected_clients=%s worker_ports=%s",
+            endpoint,
+            expected_clients,
+            worker_ports,
+        )
 
-        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+        try:
+            rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+        except Exception:
+            logger.exception(
+                "Failed to bind DP-attention worker-port broadcast socket: "
+                "endpoint=%s node_rank=%s nnodes=%s dist_init_addr=%s "
+                "handshake_port_delta=%s worker_ports=%s",
+                endpoint,
+                server_args.node_rank,
+                server_args.nnodes,
+                server_args.dist_init_addr,
+                DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+                worker_ports,
+            )
+            raise
 
         try:
             connected_clients = 0
@@ -394,7 +438,12 @@ class DataParallelController:
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
-        logger.debug(f"Connecting to node 0 to receive worker ports")
+        logger.info(
+            "Connecting to node 0 for DP-attention worker ports: "
+            "node_rank=%s endpoint=%s",
+            node_rank,
+            endpoint,
+        )
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
         req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
@@ -427,18 +476,25 @@ class DataParallelController:
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
         if server_args.node_rank == 0:
+            logger.info(
+                "Pre-allocating DP-attention scheduler input ports: "
+                "bind_host=%s dp_size=%s dist_init_addr=%s",
+                bind_host,
+                server_args.dp_size,
+                server_args.dist_init_addr,
+            )
             for dp_rank in range(server_args.dp_size):
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
                 worker_ports.append(worker_port)
                 self.workers[dp_rank] = worker_socket
-                logger.debug(
-                    "Assigned port %s to worker %s on host %s",
-                    worker_port,
-                    dp_rank,
-                    bind_host,
-                )
+            logger.info(
+                "Pre-allocated DP-attention scheduler input ports: "
+                "bind_host=%s worker_ports=%s",
+                bind_host,
+                worker_ports,
+            )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
@@ -501,11 +557,6 @@ class DataParallelController:
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
 
-                    # For decoupled-spec, every dp rank should know the same peer ipc config.
-                    rank_port_args.decoupled_spec_ipc_config = (
-                        port_args.decoupled_spec_ipc_config
-                    )
-
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     server_args.base_gpu_id
@@ -567,6 +618,8 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        with self.scheduler_infos_lock:
+            self.scheduler_infos.extend(scheduler_info)
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -656,11 +709,15 @@ def run_data_parallel_controller_process(
         scheduler_pids = [
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
+        endpoint_infos = []
+        for info in controller.scheduler_infos:
+            endpoint_infos.extend(info.get("decoupled_spec_endpoint_infos", []))
         pipe_writer.send(
             {
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "decoupled_spec_endpoint_infos": endpoint_infos,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )

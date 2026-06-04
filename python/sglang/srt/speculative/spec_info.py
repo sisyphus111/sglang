@@ -209,27 +209,10 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
 
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
-        if server_args.enable_dp_attention:
-            raise ValueError(
-                "decoupled speculative decoding does not support dp attention."
-            )
-        if server_args.dp_size != 1:
-            raise ValueError("decoupled verifier currently requires dp_size == 1.")
-        if not server_args.decoupled_spec_bind_endpoint:
-            raise ValueError(
-                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
-            )
-        if not server_args.decoupled_spec_connect_endpoints:
-            raise ValueError(
-                "decoupled speculative decoding requires a non-empty "
-                "--decoupled-spec-connect-endpoints list."
-            )
-        if server_args.decoupled_spec_rank is None:
-            raise ValueError(
-                "decoupled speculative decoding requires --decoupled-spec-rank."
-            )
-        if int(server_args.decoupled_spec_rank) < 0:
-            raise ValueError("--decoupled-spec-rank must be non-negative.")
+        if server_args.pp_size != 1:
+            raise ValueError(f"decoupled verifier currently requires pp_size == 1.")
+        if server_args.decoupled_spec_rank_base < 0:
+            raise ValueError("--decoupled-spec-rank-base must be non-negative.")
         if server_args.page_size is not None and server_args.page_size > 1:
             raise ValueError(
                 "decoupled drafter currently requires page_size == 1 because "
@@ -288,27 +271,10 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
 
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
-        if server_args.enable_dp_attention:
-            raise ValueError(
-                "decoupled speculative decoding does not support dp attention."
-            )
-        if server_args.dp_size != 1:
-            raise ValueError("decoupled drafter currently requires dp_size == 1.")
-        if not server_args.decoupled_spec_bind_endpoint:
-            raise ValueError(
-                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
-            )
-        if not server_args.decoupled_spec_connect_endpoints:
-            raise ValueError(
-                "decoupled speculative decoding requires a non-empty "
-                "--decoupled-spec-connect-endpoints list."
-            )
-        if server_args.decoupled_spec_rank is None:
-            raise ValueError(
-                "decoupled speculative decoding requires --decoupled-spec-rank."
-            )
-        if int(server_args.decoupled_spec_rank) < 0:
-            raise ValueError("--decoupled-spec-rank must be non-negative.")
+        if server_args.pp_size != 1:
+            raise ValueError(f"decoupled drafter currently requires pp_size == 1.")
+        if server_args.decoupled_spec_rank_base < 0:
+            raise ValueError("--decoupled-spec-rank-base must be non-negative.")
 
         if server_args.max_running_requests is None:
             server_args.max_running_requests = 64

@@ -28,6 +28,7 @@ except ImportError:
     import common
 
 LOCAL_HOST = "127.0.0.1"
+DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,7 +138,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Tokenizer path used for prompt length filtering. Defaults to target model.",
     )
-    parser.add_argument("--target-tp-size", type=int, required=True)
+    parser.add_argument(
+        "--target-tp-size",
+        type=int,
+        required=True,
+        help=(
+            "Target/verifier TP size. When --target-enable-dp-attention is set, "
+            "this is the attention TP size per DP lane; the SGLang engine "
+            "tp_size is target_tp_size * target_dp_size."
+        ),
+    )
+    parser.add_argument(
+        "--target-dp-size",
+        type=int,
+        default=1,
+        help="Target/verifier DP size.",
+    )
+    parser.add_argument(
+        "--target-enable-dp-attention",
+        "--enable-dp-attention",
+        dest="target_enable_dp_attention",
+        action="store_true",
+        help=(
+            "Enable DP attention for the target/verifier engine. With this set, "
+            "--target-tp-size is interpreted per DP lane."
+        ),
+    )
     parser.add_argument(
         "--target-ep-size",
         type=int,
@@ -184,7 +210,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Total GPUs reserved for the verifier. Single-node mode supports "
-            "one verifier replica, so this must equal --target-tp-size when set."
+            "one verifier replica, so this must equal the target verifier world "
+            "size when set."
         ),
     )
     parser.add_argument(
@@ -211,8 +238,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Base port for this run. Spec dist-init uses base; baseline "
-            "dist-init ports follow; verifier result and drafter control "
-            "endpoints are placed after the baseline slots."
+            "dist-init ports follow. Decoupled result/control endpoints are "
+            "bound dynamically by SGLang."
         ),
     )
     parser.add_argument(
@@ -221,9 +248,11 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Comma- or whitespace-separated list of pre-reserved local ports. "
             "When set, ports do not need to be contiguous. They are consumed in "
-            "order: spec dist-init, optional baseline dist-init, verifier result, "
-            "then drafter control endpoints. This cannot be combined with "
-            "--dist-init-addr or --dist-init-port."
+            "order: spec dist-init, then optional baseline dist-init. Decoupled "
+            "result/control endpoints are bound dynamically by SGLang. This "
+            "cannot be combined with --dist-init-addr or --dist-init-port. "
+            "With --target-enable-dp-attention, each dist-init allocation "
+            "consumes a contiguous 6-port block."
         ),
     )
     parser.add_argument(
@@ -342,10 +371,6 @@ def _port_from_dist_init_addr(addr: str | None) -> int | None:
         return None
 
 
-def _format_tcp_endpoint(port: int) -> str:
-    return f"tcp://{LOCAL_HOST}:{port}"
-
-
 def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
     if raw_ports is None:
         return []
@@ -363,13 +388,44 @@ def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
     return ports
 
 
+def _dist_init_port_stride(args: argparse.Namespace) -> int:
+    return DPA_DIST_INIT_PORT_BLOCK_SIZE if args.target_enable_dp_attention else 1
+
+
+def _reserved_port_block_bases(
+    reserved_ports: list[int],
+    *,
+    num_blocks: int,
+    block_size: int,
+) -> list[int]:
+    required_ports = num_blocks * block_size
+    if len(reserved_ports) < required_ports:
+        raise ValueError(
+            f"--reserved-ports provides {len(reserved_ports)} ports, but this "
+            f"run needs {required_ports}"
+        )
+    bases = []
+    for block_index in range(num_blocks):
+        start = block_index * block_size
+        block = reserved_ports[start : start + block_size]
+        expected = list(range(block[0], block[0] + block_size))
+        if block != expected:
+            raise ValueError(
+                "DP attention requires each reserved dist-init allocation to be "
+                f"a contiguous {block_size}-port block; block {block_index} is "
+                f"{block}, expected {expected}"
+            )
+        bases.append(block[0])
+    return bases
+
+
 def _allocate_local_ports(
     args: argparse.Namespace,
     *,
     num_verifiers: int,
-    num_drafters: int,
-) -> tuple[str, dict[str, str], str, list[str], list[int] | None]:
+) -> tuple[str, dict[str, str], list[int] | None]:
     baseline_modes = common.resolve_baseline_modes(args.baseline)
+    port_stride = _dist_init_port_stride(args)
     reserved_ports = _parse_reserved_ports(args.reserved_ports)
     if reserved_ports:
         if args.dist_init_addr is not None or args.dist_init_port is not None:
@@ -377,13 +433,44 @@ def _allocate_local_ports(
                 "--reserved-ports cannot be combined with --dist-init-addr or "
                 "--dist-init-port"
             )
-        required_ports = 1 + len(baseline_modes) + 1 + num_drafters
+        required_blocks = 1 + len(baseline_modes)
+        required_ports = required_blocks * port_stride
         if len(reserved_ports) < required_ports:
+            port_usage = "spec dist-init"
+            if baseline_modes:
+                port_usage += " and baseline dist-init"
+            if port_stride > 1:
+                port_usage += f" blocks of {port_stride} contiguous ports"
             raise ValueError(
                 f"--reserved-ports provides {len(reserved_ports)} ports, but this "
-                f"run needs {required_ports}: spec dist-init, "
-                f"{'baseline dist-init, ' if baseline_modes else ''}"
-                "verifier result, and drafter control endpoints"
+                f"run needs {required_ports}: {port_usage}"
+            )
+        if port_stride > 1:
+            block_bases = _reserved_port_block_bases(
+                reserved_ports,
+                num_blocks=required_blocks,
+                block_size=port_stride,
+            )
+            unavailable_ports = [
+                port
+                for base_port in block_bases
+                for port in range(base_port, base_port + port_stride)
+                if not _port_available(port)
+            ]
+            if unavailable_ports:
+                raise ValueError(
+                    f"--reserved-ports contains unavailable DPA block ports: "
+                    f"{unavailable_ports}"
+                )
+            port_iter = iter(block_bases)
+            spec_dist_init_addr = f"{LOCAL_HOST}:{next(port_iter)}"
+            baseline_dist_init_addrs = {
+                mode: f"{LOCAL_HOST}:{next(port_iter)}" for mode in baseline_modes
+            }
+            return (
+                spec_dist_init_addr,
+                baseline_dist_init_addrs,
+                reserved_ports,
             )
         usable_ports = [port for port in reserved_ports if _port_available(port)]
         skipped_ports = [port for port in reserved_ports if port not in usable_ports]
@@ -403,82 +490,55 @@ def _allocate_local_ports(
         baseline_dist_init_addrs = {
             mode: f"{LOCAL_HOST}:{next(port_iter)}" for mode in baseline_modes
         }
-        result_endpoint = _format_tcp_endpoint(next(port_iter))
-        control_endpoints = [
-            _format_tcp_endpoint(next(port_iter)) for _ in range(num_drafters)
-        ]
         return (
             spec_dist_init_addr,
             baseline_dist_init_addrs,
-            result_endpoint,
-            control_endpoints,
             reserved_ports,
         )
 
     explicit_dist_init_port = _port_from_dist_init_addr(args.dist_init_addr)
-    baseline_slot_count = max(1, len(baseline_modes))
+    baseline_slot_count = len(baseline_modes)
     base_port = args.dist_init_port or _pick_free_port_block(
-        2 + baseline_slot_count + num_drafters,
+        (1 + baseline_slot_count) * port_stride,
         avoid_ports=(
             {explicit_dist_init_port} if explicit_dist_init_port is not None else None
         ),
     )
     spec_dist_init_addr = args.dist_init_addr or f"{LOCAL_HOST}:{base_port}"
     baseline_dist_init_addrs = {
-        mode: f"{LOCAL_HOST}:{base_port + num_verifiers * (1 + mode_index)}"
+        mode: (
+            f"{LOCAL_HOST}:"
+            f"{base_port + num_verifiers * (1 + mode_index) * port_stride}"
+        )
         for mode_index, mode in enumerate(baseline_modes)
     }
-    result_endpoint = _format_tcp_endpoint(
-        base_port + num_verifiers * (1 + baseline_slot_count)
-    )
-    control_endpoints = [
-        _format_tcp_endpoint(
-            base_port + num_verifiers * (2 + baseline_slot_count) + index
-        )
-        for index in range(num_drafters)
-    ]
     return (
         spec_dist_init_addr,
         baseline_dist_init_addrs,
-        result_endpoint,
-        control_endpoints,
         None,
     )
 
 
-def _uses_bind_connect_endpoint_args() -> bool:
-    try:
-        from sglang.srt.server_args import ServerArgs
-    except Exception:
-        return True
-    return hasattr(ServerArgs, "decoupled_spec_bind_endpoint")
-
-
-def _add_decoupled_endpoint_kwargs(
-    engine_kwargs: dict[str, Any],
-    *,
-    bind_endpoint: str,
-    connect_endpoints: list[str],
-    control_endpoints: list[str],
-    result_endpoints: list[str],
-    rank: int,
-) -> None:
-    if _uses_bind_connect_endpoint_args():
-        engine_kwargs.update(
-            decoupled_spec_bind_endpoint=bind_endpoint,
-            decoupled_spec_connect_endpoints=connect_endpoints,
-            decoupled_spec_rank=rank,
-        )
-    else:
-        engine_kwargs.update(
-            decoupled_spec_control_endpoints=control_endpoints,
-            decoupled_spec_result_endpoints=result_endpoints,
-        )
+def get_target_engine_tp_size(args: argparse.Namespace) -> int:
+    if args.target_enable_dp_attention:
+        return args.target_tp_size * args.target_dp_size
+    return args.target_tp_size
 
 
 def validate_single_node_args(args: argparse.Namespace) -> None:
     if args.target_tp_size <= 0:
         raise ValueError("target-tp-size must be positive")
+    if args.target_dp_size <= 0:
+        raise ValueError("target-dp-size must be positive")
+    if args.target_enable_dp_attention and args.target_dp_size <= 1:
+        raise ValueError(
+            "target-dp-size must be greater than 1 when DP attention is enabled"
+        )
+    if args.target_dp_size > 1 and not args.target_enable_dp_attention:
+        raise ValueError(
+            "target-dp-size > 1 is only supported with --target-enable-dp-attention "
+            "in this single-node example"
+        )
     if args.target_ep_size is not None and args.target_ep_size <= 0:
         raise ValueError("target-ep-size must be positive when set")
     if args.draft_tp_size <= 0:
@@ -508,12 +568,14 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         )
     args.num_draft_replicas = derived_num_draft_replicas
 
+    target_engine_tp_size = get_target_engine_tp_size(args)
     if args.verify_ngpus is None:
-        args.verify_ngpus = args.target_tp_size
-    if args.verify_ngpus != args.target_tp_size:
+        args.verify_ngpus = target_engine_tp_size
+    if args.verify_ngpus != target_engine_tp_size:
         raise ValueError(
             "single-node.py currently supports one verifier replica, so "
-            "verify-ngpus must equal target-tp-size"
+            f"verify-ngpus must equal target verifier world size "
+            f"({target_engine_tp_size})"
         )
 
     if args.n_gpu_per_node is None:
@@ -550,12 +612,10 @@ def run_draft_engine_process(
     model_path: str,
     tp_size: int,
     speculative_num_steps: int,
-    bind_endpoint: str,
-    connect_endpoints: list[str],
     deterministic: bool,
     spec_trace_dir: str | None,
     ready_queue,
-    stop_reader,
+    control_reader,
 ) -> None:
     os.environ.update(_child_env_for_gpus(gpu_ids))
     try:
@@ -571,28 +631,41 @@ def run_draft_engine_process(
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
             spec_trace_dir=spec_trace_dir,
-        )
-        _add_decoupled_endpoint_kwargs(
-            engine_kwargs,
-            bind_endpoint=bind_endpoint,
-            connect_endpoints=connect_endpoints,
-            control_endpoints=[bind_endpoint],
-            result_endpoints=connect_endpoints,
-            rank=rank,
+            decoupled_spec_rank_base=rank,
         )
         engine = sgl.Engine(**engine_kwargs)
+        endpoint_infos = engine.get_decoupled_spec_endpoint_infos()
         ready_queue.put(
             {
                 "rank": rank,
                 "pid": os.getpid(),
                 "gpus": gpu_ids,
-                "bind_endpoint": bind_endpoint,
+                "endpoint_infos": endpoint_infos,
             }
         )
-        try:
-            stop_reader.recv()
-        except EOFError:
-            pass
+        while True:
+            try:
+                command = control_reader.recv()
+            except EOFError:
+                break
+            if command == "stop":
+                break
+            if isinstance(command, dict) and command.get("type") == "configure":
+                success, message = engine.configure_decoupled_spec_peers(
+                    command["connect_endpoints"]
+                )
+                ready_queue.put(
+                    {
+                        "rank": rank,
+                        "pid": os.getpid(),
+                        "configured": bool(success),
+                        "message": message,
+                    }
+                )
+                if not success:
+                    raise RuntimeError(message)
+                continue
+            raise RuntimeError(f"unknown draft control command: {command!r}")
     except Exception:
         ready_queue.put(
             {
@@ -605,7 +678,7 @@ def run_draft_engine_process(
         raise
     finally:
         try:
-            stop_reader.close()
+            control_reader.close()
         except Exception:
             pass
         if "engine" in locals():
@@ -643,32 +716,71 @@ def wait_for_drafts(
         if rank in pending:
             pending.remove(rank)
             ready.append(message)
+            endpoints = ",".join(
+                info["bind_endpoint"] for info in message["endpoint_infos"]
+            )
             print(
                 "draft_ready: "
                 f"rank={rank} pid={message['pid']} "
                 f"gpus={','.join(message['gpus'])} "
-                f"endpoint={message['bind_endpoint']}",
+                f"endpoints={endpoints}",
                 flush=True,
             )
     ready.sort(key=lambda item: int(item["rank"]))
     return ready
 
 
+def wait_for_draft_configure(
+    processes: list[mp.Process],
+    ready_queue,
+    timeout_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    pending = {index for index in range(len(processes))}
+    while pending:
+        for index in list(pending):
+            process = processes[index]
+            if not process.is_alive() and process.exitcode is not None:
+                raise RuntimeError(
+                    f"draft process index={index} exited during configure with "
+                    f"exitcode={process.exitcode}"
+                )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"timed out configuring draft engines: {pending}")
+        try:
+            message = ready_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        rank = int(message.get("rank", -1))
+        if "error" in message:
+            raise RuntimeError(
+                f"draft rank {rank} failed during configure:\n{message['error']}"
+            )
+        if "configured" not in message:
+            continue
+        if not message["configured"]:
+            raise RuntimeError(
+                f"draft rank {rank} failed to configure: {message.get('message', '')}"
+            )
+        if rank in pending:
+            pending.remove(rank)
+            print(f"draft_configured: rank={rank}", flush=True)
+
+
 def start_draft_engines(
     args: argparse.Namespace,
-    control_endpoints: list[str],
-    result_endpoints: list[str],
-) -> tuple[list[mp.Process], list[Any]]:
+) -> tuple[list[mp.Process], list[Any], Any, list[dict[str, Any]]]:
     ctx = mp.get_context("spawn")
     ready_queue = ctx.Queue()
     stop_senders = []
     processes: list[mp.Process] = []
     try:
-        for rank, endpoint in enumerate(control_endpoints):
+        for rank in range(args.num_draft_replicas):
             start = rank * args.draft_tp_size
             end = start + args.draft_tp_size
             gpu_ids = args.draft_gpus[start:end]
-            stop_reader, stop_sender = ctx.Pipe(duplex=False)
+            control_reader, control_sender = ctx.Pipe(duplex=False)
             process = ctx.Process(
                 target=run_draft_engine_process,
                 kwargs=dict(
@@ -677,24 +789,65 @@ def start_draft_engines(
                     model_path=args.draft_model_path,
                     tp_size=args.draft_tp_size,
                     speculative_num_steps=args.num_speculative_steps,
-                    bind_endpoint=endpoint,
-                    connect_endpoints=result_endpoints,
                     deterministic=args.deterministic,
                     spec_trace_dir=args.spec_trace_dir,
                     ready_queue=ready_queue,
-                    stop_reader=stop_reader,
+                    control_reader=control_reader,
                 ),
                 name=f"decoupled-draft-rank-{rank}",
             )
             process.start()
-            stop_reader.close()
-            stop_senders.append(stop_sender)
+            control_reader.close()
+            stop_senders.append(control_sender)
             processes.append(process)
-        wait_for_drafts(processes, ready_queue, args.draft_ready_timeout_s)
-        return processes, stop_senders
+        draft_infos = wait_for_drafts(
+            processes, ready_queue, args.draft_ready_timeout_s
+        )
+        return processes, stop_senders, ready_queue, draft_infos
     except Exception:
         shutdown_draft_engines(processes, stop_senders)
         raise
+
+
+def _flatten_endpoint_infos(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    endpoint_infos = []
+    for message in messages:
+        endpoint_infos.extend(message.get("endpoint_infos", []))
+    return endpoint_infos
+
+
+def _sorted_bind_endpoints(
+    endpoint_infos: list[dict[str, Any]], *, role: str
+) -> list[str]:
+    role_infos = [info for info in endpoint_infos if info.get("role") == role]
+    if not role_infos:
+        raise RuntimeError(f"no decoupled-spec {role} endpoints were published")
+    role_infos.sort(key=lambda info: int(info["rank"]))
+    ranks = [int(info["rank"]) for info in role_infos]
+    expected = list(range(len(ranks)))
+    if ranks != expected:
+        raise RuntimeError(
+            f"decoupled-spec {role} ranks must be zero-based and contiguous: "
+            f"got {ranks}"
+        )
+    return [str(info["bind_endpoint"]) for info in role_infos]
+
+
+def configure_draft_engines(
+    control_senders,
+    ready_queue,
+    verifier_result_endpoints: list[str],
+    timeout_s: float,
+    processes: list[mp.Process],
+) -> None:
+    for control_sender in control_senders:
+        control_sender.send(
+            {
+                "type": "configure",
+                "connect_endpoints": verifier_result_endpoints,
+            }
+        )
+    wait_for_draft_configure(processes, ready_queue, timeout_s)
 
 
 def shutdown_draft_engines(processes: list[mp.Process], stop_senders) -> None:
@@ -736,8 +889,6 @@ def shutdown_draft_engines(processes: list[mp.Process], stop_senders) -> None:
 def create_verifier_engine(
     args: argparse.Namespace,
     *,
-    result_endpoint: str,
-    control_endpoints: list[str],
     dist_init_addr: str,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(args.target_gpus)
@@ -748,7 +899,8 @@ def create_verifier_engine(
 
     engine_kwargs: dict[str, Any] = dict(
         model_path=args.target_model_path,
-        tp_size=args.target_tp_size,
+        tp_size=get_target_engine_tp_size(args),
+        dp_size=args.target_dp_size,
         dist_init_addr=dist_init_addr,
         speculative_algorithm="DECOUPLED_VERIFY",
         speculative_num_steps=args.num_speculative_steps,
@@ -757,15 +909,10 @@ def create_verifier_engine(
         enable_deterministic_inference=args.deterministic,
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
+        decoupled_spec_rank_base=0,
     )
-    _add_decoupled_endpoint_kwargs(
-        engine_kwargs,
-        bind_endpoint=result_endpoint,
-        connect_endpoints=control_endpoints,
-        control_endpoints=control_endpoints,
-        result_endpoints=[result_endpoint],
-        rank=0,
-    )
+    if args.target_enable_dp_attention:
+        engine_kwargs["enable_dp_attention"] = True
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -780,13 +927,16 @@ def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
 
     engine_kwargs: dict[str, Any] = dict(
         model_path=args.target_model_path,
-        tp_size=args.target_tp_size,
+        tp_size=get_target_engine_tp_size(args),
+        dp_size=args.target_dp_size,
         dist_init_addr=dist_init_addr,
         enable_deterministic_inference=args.deterministic,
         disable_overlap_schedule=True,
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.target_enable_dp_attention:
+        engine_kwargs["enable_dp_attention"] = True
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -801,7 +951,8 @@ def create_mtp_engine(args: argparse.Namespace, *, dist_init_addr: str):
 
     engine_kwargs: dict[str, Any] = dict(
         model_path=args.target_model_path,
-        tp_size=args.target_tp_size,
+        tp_size=get_target_engine_tp_size(args),
+        dp_size=args.target_dp_size,
         dist_init_addr=dist_init_addr,
         speculative_algorithm="EAGLE",
         speculative_num_steps=args.num_speculative_steps,
@@ -814,6 +965,8 @@ def create_mtp_engine(args: argparse.Namespace, *, dist_init_addr: str):
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.target_enable_dp_attention:
+        engine_kwargs["enable_dp_attention"] = True
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -860,6 +1013,7 @@ def _write_summary_json(result: dict[str, Any], output_dir: str) -> Path:
 def main() -> None:
     args = parse_args()
     validate_single_node_args(args)
+    target_engine_tp_size = get_target_engine_tp_size(args)
 
     prompt_column, prompt_samples, total_rows = common.load_prompt_samples(args)
     prompt_input_ids = [list(sample.prompt_input_ids) for sample in prompt_samples]
@@ -870,46 +1024,64 @@ def main() -> None:
     }
 
     num_verifiers = args.num_verifier_replicas
-    num_drafters = args.num_draft_replicas
     (
         spec_dist_init_addr,
         baseline_dist_init_addrs,
-        result_endpoint,
-        control_endpoints,
         reserved_ports,
     ) = _allocate_local_ports(
         args,
         num_verifiers=num_verifiers,
-        num_drafters=num_drafters,
     )
 
     print("local_decoupled_spec_topology:", flush=True)
     print(f"  target_gpus: {args.target_gpus}", flush=True)
+    print(f"  target_tp_size: {args.target_tp_size}", flush=True)
+    print(f"  target_dp_size: {args.target_dp_size}", flush=True)
+    print(
+        f"  target_enable_dp_attention: {args.target_enable_dp_attention}",
+        flush=True,
+    )
+    print(f"  target_engine_tp_size: {target_engine_tp_size}", flush=True)
     print(f"  draft_gpus: {args.draft_gpus}", flush=True)
     if reserved_ports is not None:
         print(f"  reserved_ports: {reserved_ports}", flush=True)
-    print(f"  verifier_result_endpoint: {result_endpoint}", flush=True)
-    print(f"  draft_control_endpoints: {control_endpoints}", flush=True)
     print(f"  verifier_dist_init_addr: {spec_dist_init_addr}", flush=True)
     if baseline_dist_init_addrs:
         print(f"  baseline_dist_init_addrs: {baseline_dist_init_addrs}", flush=True)
 
     draft_processes: list[mp.Process] = []
     draft_stop_senders = None
+    draft_ready_queue = None
     verifier_engine = None
     baseline_engine = None
     try:
-        draft_processes, draft_stop_senders = start_draft_engines(
-            args,
-            control_endpoints=control_endpoints,
-            result_endpoints=[result_endpoint],
+        draft_processes, draft_stop_senders, draft_ready_queue, draft_infos = (
+            start_draft_engines(args)
+        )
+        draft_control_endpoints = _sorted_bind_endpoints(
+            _flatten_endpoint_infos(draft_infos), role="drafter"
         )
         print("creating_verifier_engine...", flush=True)
         verifier_engine = create_verifier_engine(
             args,
-            result_endpoint=result_endpoint,
-            control_endpoints=control_endpoints,
             dist_init_addr=spec_dist_init_addr,
+        )
+        verifier_result_endpoints = _sorted_bind_endpoints(
+            verifier_engine.get_decoupled_spec_endpoint_infos(), role="verifier"
+        )
+        print(f"  verifier_result_endpoints: {verifier_result_endpoints}", flush=True)
+        print(f"  draft_control_endpoints: {draft_control_endpoints}", flush=True)
+        success, message = verifier_engine.configure_decoupled_spec_peers(
+            draft_control_endpoints
+        )
+        if not success:
+            raise RuntimeError(f"failed to configure verifier peers: {message}")
+        configure_draft_engines(
+            draft_stop_senders,
+            draft_ready_queue,
+            verifier_result_endpoints,
+            args.draft_ready_timeout_s,
+            draft_processes,
         )
         print("running_decoupled_spec_generate...", flush=True)
         spec_outputs = run_engine_generate(
@@ -966,7 +1138,7 @@ def main() -> None:
         result = common.build_result(
             args=args,
             target_nnodes=1,
-            target_gpus_per_node=args.target_tp_size,
+            target_gpus_per_node=target_engine_tp_size,
             prompt_column=prompt_column,
             total_rows=total_rows,
             prompt_samples=prompt_samples,
@@ -976,8 +1148,8 @@ def main() -> None:
         result["config"]["runner"] = "single_node_no_ray"
         result["config"]["target_gpus"] = args.target_gpus
         result["config"]["draft_gpus"] = args.draft_gpus
-        result["config"]["verifier_result_endpoint"] = result_endpoint
-        result["config"]["draft_control_endpoints"] = control_endpoints
+        result["config"]["verifier_result_endpoints"] = verifier_result_endpoints
+        result["config"]["draft_control_endpoints"] = draft_control_endpoints
         result["config"]["verifier_dist_init_addr"] = spec_dist_init_addr
         if baseline_dist_init_addrs:
             result["config"]["baseline_dist_init_addrs"] = baseline_dist_init_addrs

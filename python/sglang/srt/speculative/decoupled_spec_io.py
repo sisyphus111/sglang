@@ -367,10 +367,3 @@ class DraftMeshMessage:
             message_type=DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH,
             tail_stream_output_batch=message,
         )
-
-
-@dataclass(frozen=True)
-class DecoupledSpecIpcConfig:
-    bind_endpoint: str
-    connect_endpoints: tuple[str, ...]
-    rank: int

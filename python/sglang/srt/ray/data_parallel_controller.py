@@ -70,7 +70,7 @@ class RayDataParallelController(DataParallelController):
         dp_port_args_list = []
 
         for dp_rank in range(server_args.dp_size):
-            tmp_port_args = PortArgs.init_new(server_args)
+            tmp_port_args = PortArgs.init_new(server_args, dp_rank)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
 
@@ -103,13 +103,25 @@ class RayDataParallelController(DataParallelController):
         # rank-0 node IP instead of tcp://* to avoid exposing unauthenticated
         # ZMQ sockets (CVE-2026-3060).
         worker_ports = []
+        logger.info(
+            "Pre-allocating Ray DP-attention scheduler input ports: "
+            "bind_host=%s dp_size=%s dist_init_addr=%s",
+            self.rank0_node_ip,
+            server_args.dp_size,
+            server_args.dist_init_addr,
+        )
         for dp_rank in range(server_args.dp_size):
             worker_port, worker_socket = get_zmq_socket_on_host(
                 self.context, zmq.PUSH, host=self.rank0_node_ip
             )
             worker_ports.append(worker_port)
             self.workers[dp_rank] = worker_socket
-            logger.debug(f"Assigned port {worker_port} to worker {dp_rank}")
+        logger.info(
+            "Pre-allocated Ray DP-attention scheduler input ports: "
+            "bind_host=%s worker_ports=%s",
+            self.rank0_node_ip,
+            worker_ports,
+        )
 
         # Skip _broadcast_worker_ports — Ray creates all actors centrally,
         # so there's no need for the inter-node handshake protocol.
@@ -225,6 +237,8 @@ class RayDataParallelController(DataParallelController):
         if scheduler_infos:
             self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
             self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+            with self.scheduler_infos_lock:
+                self.scheduler_infos.extend(scheduler_infos)
 
         # Start event loops (non-blocking — runs until actor is killed)
         self.event_loop_refs.extend(

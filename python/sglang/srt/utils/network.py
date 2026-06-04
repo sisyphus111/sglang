@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import os
 import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -40,6 +41,8 @@ def is_valid_ipv6_address(address: str) -> bool:
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
     for conn in psutil.net_connections(kind="inet"):
         if conn.laddr.port == port:
+            if conn.pid is None:
+                continue
             try:
                 return psutil.Process(conn.pid)
             except psutil.NoSuchProcess:
@@ -52,6 +55,7 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
 def wait_port_available(
     port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
 ) -> bool:
+    error_message = f"{port_name} is not available."
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -62,14 +66,18 @@ def wait_port_available(
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+                error_message = (
+                    f"{port_name} is used by an unknown process or connection."
+                )
+            else:
+                pid = process.pid
+                error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
             logger.info(
                 f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
             )
         time.sleep(0.1)
 
+    _log_tcp_port_owner(port, f"{port_name} did not become available")
     if raise_exception:
         raise ValueError(
             f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
@@ -177,6 +185,112 @@ def get_free_port():
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     return try_bind_socket(port=port, listen=True)
+
+
+def _extract_tcp_port(endpoint: str) -> Optional[int]:
+    if not endpoint.startswith("tcp://"):
+        return None
+    try:
+        return int(endpoint.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _log_tcp_port_owner(port: int, reason: str) -> None:
+    def run_and_log(command: list[str], *, filter_by_port: bool = True) -> None:
+        command_str = " ".join(command)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "Cannot inspect TCP port %s for %s with `%s`: command not found",
+                port,
+                reason,
+                command_str,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "Failed to run `%s` while inspecting TCP port %s for %s",
+                command_str,
+                port,
+                reason,
+            )
+            return
+
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        if not filter_by_port:
+            if output:
+                logger.error(
+                    "`%s` output for TCP port %s (%s):\n%s",
+                    command_str,
+                    port,
+                    reason,
+                    output,
+                )
+            else:
+                logger.error(
+                    "`%s` produced no output for TCP port %s (%s) "
+                    "(exit_code=%s).",
+                    command_str,
+                    port,
+                    reason,
+                    result.returncode,
+                )
+            return
+
+        matches = [
+            line
+            for line in output.splitlines()
+            if (
+                f":{port} " in line
+                or f":{port}\t" in line
+                or line.rstrip().endswith(f":{port}")
+                or f":{port}->" in line
+            )
+        ]
+        if matches:
+            logger.error(
+                "`%s` entries for TCP port %s (%s):\n%s",
+                command_str,
+                port,
+                reason,
+                "\n".join(matches),
+            )
+        else:
+            logger.error(
+                "`%s` found no entry for TCP port %s (%s) "
+                "(port=%s, exit_code=%s). Raw stderr: %s",
+                command_str,
+                port,
+                reason,
+                port,
+                result.returncode,
+                result.stderr.strip(),
+            )
+
+    run_and_log(["ss", "-ltnp"])
+    run_and_log(["ss", "-tanp"])
+    run_and_log(["lsof", "-nP", f"-iTCP:{port}"])
+
+    process = find_process_using_port(port)
+    if process is not None:
+        run_and_log(["ps", "-fp", str(process.pid)], filter_by_port=False)
+
+
+def _log_ss_port_owner(endpoint: str) -> None:
+    port = _extract_tcp_port(endpoint)
+    if port is None:
+        logger.error("Cannot extract TCP port from failed bind endpoint: %s", endpoint)
+        return
+
+    _log_tcp_port_owner(port, f"failed bind endpoint {endpoint}")
 
 
 def get_zmq_socket_on_host(
@@ -381,7 +495,11 @@ def get_zmq_socket(
         config_socket(socket, socket_type)
 
         if bind:
-            socket.bind(endpoint)
+            try:
+                socket.bind(endpoint)
+            except Exception:
+                _log_ss_port_owner(endpoint)
+                raise
         else:
             socket.connect(endpoint)
 

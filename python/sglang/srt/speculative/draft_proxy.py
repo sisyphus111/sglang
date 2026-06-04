@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Any
@@ -18,7 +19,14 @@ from sglang.srt.speculative.tracer import (
     trace_speculative,
 )
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_zmq_socket,
+    get_zmq_socket_on_host,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class DraftProxyThread:
@@ -35,29 +43,26 @@ class DraftProxyThread:
         *,
         context: zmq.Context,
         verifier_rank: int,
-        result_bind_endpoint: str,
-        drafter_control_endpoints: list[str] | tuple[str, ...],
         draft_tail_buffer: DraftTailBuffer,
         tracer: Any = None,
     ) -> None:
+        self.context = context
         self.verifier_rank = int(verifier_rank)
         self.draft_tail_buffer = draft_tail_buffer
         self.tracer = tracer or NullSpecTracer()
         # verifier -> drafter send control messages
-        self.control_send_sockets: dict[int, zmq.Socket] = {
-            drafter_rank: get_zmq_socket(
-                context,
-                zmq.PUSH,
-                endpoint,
-                False,
-            )
-            for drafter_rank, endpoint in enumerate(drafter_control_endpoints)
-        }
-        self.result_recv_socket = get_zmq_socket(
-            context,
-            zmq.PULL,
-            result_bind_endpoint,
-            True,
+        self.control_send_sockets: dict[int, zmq.Socket] = {}
+        self.drafter_control_endpoints: list[str] = []
+        bind_host = get_local_ip_auto("127.0.0.1")
+        port, self.result_recv_socket = get_zmq_socket_on_host(
+            context, zmq.PULL, host=bind_host
+        )
+        self.result_bind_endpoint = NetworkAddress(bind_host, port).to_tcp()
+        logger.info(
+            "Bound decoupled-spec verifier result endpoint: "
+            "verifier_rank=%s endpoint=%s",
+            self.verifier_rank,
+            self.result_bind_endpoint,
         )
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
         self._closed = threading.Event()
@@ -68,7 +73,10 @@ class DraftProxyThread:
         )
 
     def start(self) -> None:
-        self._thread.start()
+        if not self.control_send_sockets:
+            return
+        if not self._thread.is_alive():
+            self._thread.start()
 
     def close(self) -> None:
         self._closed.set()
@@ -79,7 +87,36 @@ class DraftProxyThread:
             socket.close(linger=0)
         self.result_recv_socket.close(linger=0)
 
+    def configure_peer_endpoints(self, drafter_control_endpoints: list[str]) -> None:
+        endpoints = list(drafter_control_endpoints)
+        if not endpoints:
+            raise RuntimeError(
+                "Decoupled verify requires at least one drafter control endpoint"
+            )
+        if self.control_send_sockets:
+            if endpoints == self.drafter_control_endpoints:
+                return
+            raise RuntimeError("Decoupled verify peer endpoints are already configured")
+        self.control_send_sockets = {
+            drafter_rank: get_zmq_socket(
+                self.context,
+                zmq.PUSH,
+                endpoint,
+                False,
+            )
+            for drafter_rank, endpoint in enumerate(endpoints)
+        }
+        self.drafter_control_endpoints = endpoints
+        logger.info(
+            "Configured decoupled-spec verifier peers: "
+            "verifier_rank=%s drafter_control_endpoints=%s",
+            self.verifier_rank,
+            endpoints,
+        )
+
     def submit_control_batch(self, batch: DraftControlBatch) -> None:
+        if not self.control_send_sockets:
+            raise RuntimeError("Decoupled verify peer endpoints are not configured")
         self._apply_control_batch(batch)
         self._send_queue.put(batch)
 

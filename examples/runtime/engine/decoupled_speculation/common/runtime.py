@@ -10,7 +10,6 @@ try:
     import ray
     from ray.util.scheduling_strategies import (
         NodeAffinitySchedulingStrategy,
-        PlacementGroupSchedulingStrategy,
     )
 except ImportError:
 
@@ -27,7 +26,6 @@ except ImportError:
 
     ray = _MissingRay()
     NodeAffinitySchedulingStrategy = None
-    PlacementGroupSchedulingStrategy = None
 
 try:
     import sglang as sgl
@@ -48,7 +46,7 @@ except ImportError:
         except ValueError:
             return False
 
-from .types import DecoupledSpecEndpointConfig, DecoupledSpecTopology
+from .types import DecoupledSpecEndpointInfo, DecoupledSpecTopology
 
 
 def format_host_port(ip: str, port: int | str) -> str:
@@ -171,22 +169,70 @@ def reserve_tcp_port(
     raise RuntimeError("failed to reserve a TCP port")
 
 
-def _iter_candidate_ports(
-    preferred_port: int | None,
-    fallback_ports: list[int] | None = None,
-):
-    """Yield candidate ports in priority order, without duplicates."""
-    seen_ports = set()
-    if preferred_port is not None:
-        seen_ports.add(preferred_port)
-        yield preferred_port
-    for port in fallback_ports or ():
-        if port in seen_ports:
+def reserve_tcp_port_block(
+    preferred_base_port: int | None = None,
+    *,
+    num_ports: int,
+    avoid_ports: set[int] | None = None,
+    bind_host: str | None = None,
+) -> tuple[int, list[socket.socket]]:
+    """Bind and hold a contiguous TCP port block."""
+    if num_ports <= 0:
+        raise ValueError("num_ports must be positive")
+    avoid_ports = set(avoid_ports or ())
+
+    def reserve_from_base(base_port: int) -> list[socket.socket]:
+        if base_port <= 0 or base_port + num_ports - 1 > 65535:
+            raise RuntimeError(
+                f"port block out of range: {base_port}.."
+                f"{base_port + num_ports - 1}"
+            )
+        block_ports = {base_port + offset for offset in range(num_ports)}
+        if block_ports & avoid_ports:
+            raise RuntimeError(
+                f"port block {base_port}..{base_port + num_ports - 1} "
+                f"conflicts with avoided ports {sorted(block_ports & avoid_ports)}"
+            )
+        sockets = []
+        try:
+            for offset in range(num_ports):
+                _, sock = reserve_tcp_port(
+                    base_port + offset,
+                    bind_host=bind_host,
+                )
+                sockets.append(sock)
+        except Exception:
+            for sock in sockets:
+                sock.close()
+            raise
+        return sockets
+
+    if preferred_base_port is not None:
+        return preferred_base_port, reserve_from_base(preferred_base_port)
+
+    for _ in range(256):
+        base_port, first_socket = reserve_tcp_port(bind_host=bind_host)
+        if base_port + num_ports - 1 > 65535:
+            first_socket.close()
             continue
-        seen_ports.add(port)
-        yield port
-    if preferred_port is None and not seen_ports:
-        yield None
+        block_ports = {base_port + offset for offset in range(num_ports)}
+        if block_ports & avoid_ports:
+            first_socket.close()
+            continue
+        sockets = [first_socket]
+        try:
+            for offset in range(1, num_ports):
+                _, sock = reserve_tcp_port(
+                    base_port + offset,
+                    bind_host=bind_host,
+                )
+                sockets.append(sock)
+            return base_port, sockets
+        except Exception:
+            for sock in sockets:
+                sock.close()
+
+    raise RuntimeError(f"failed to reserve a TCP block of {num_ports} ports")
 
 
 def _get_alive_gpu_nodes() -> list[dict[str, Any]]:
@@ -255,7 +301,7 @@ class PortActor:
 
     def __init__(self):
         """Initialize without a reservation; callers reserve ports explicitly."""
-        self._reserved_socket: socket.socket | None = None
+        self._reserved_sockets: list[socket.socket] = []
 
     def reserve_port(
         self,
@@ -270,17 +316,39 @@ class PortActor:
             avoid_ports=set(avoid_ports or ()),
             bind_host=bind_host,
         )
-        self._reserved_socket = sock
+        self._reserved_sockets = [sock]
         return {
             "host": bind_host,
             "port": port,
+            "size": 1,
+        }
+
+    def reserve_port_block(
+        self,
+        preferred_base_port: int | None = None,
+        num_ports: int = 1,
+        avoid_ports: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Reserve a contiguous TCP port block on this actor's node."""
+        self.release_port()
+        bind_host = ray.util.get_node_ip_address()
+        base_port, sockets = reserve_tcp_port_block(
+            preferred_base_port,
+            num_ports=num_ports,
+            avoid_ports=set(avoid_ports or ()),
+            bind_host=bind_host,
+        )
+        self._reserved_sockets = sockets
+        return {
+            "host": bind_host,
+            "port": base_port,
+            "size": num_ports,
         }
 
     def release_port(self) -> bool:
         """Release any port reservation currently held by this actor."""
-        if self._reserved_socket is not None:
-            self._reserved_socket.close()
-            self._reserved_socket = None
+        while self._reserved_sockets:
+            self._reserved_sockets.pop().close()
         return True
 
     def get_node_info(self) -> dict[str, Any]:
@@ -288,102 +356,6 @@ class PortActor:
         return {
             "host": ray.util.get_node_ip_address(),
         }
-
-
-def create_result_endpoint_from_pg(
-    pg,
-    *,
-    avoid_port: int | None = None,
-    avoid_ports: set[int] | None = None,
-    preferred_port: int | None = None,
-    fallback_ports: list[int] | None = None,
-) -> str:
-    """Reserve a verifier result endpoint on target placement-group rank 0."""
-    avoid_ports = set(avoid_ports or ())
-    if avoid_port is not None:
-        avoid_ports.add(avoid_port)
-    scheduling_strategy = PlacementGroupSchedulingStrategy(
-        placement_group=pg,
-        placement_group_bundle_index=0,
-    )
-    last_error: Exception | None = None
-    for candidate_port in _iter_candidate_ports(preferred_port, fallback_ports):
-        if candidate_port is not None and candidate_port in avoid_ports:
-            continue
-        actor = PortActor.options(
-            num_cpus=0,
-            scheduling_strategy=scheduling_strategy,
-        ).remote()
-        try:
-            try:
-                reservation = ray.get(
-                    actor.reserve_port.remote(candidate_port, sorted(avoid_ports))
-                )
-            except Exception as exc:
-                last_error = exc
-                continue
-            host = reservation["host"]
-            port = int(reservation["port"])
-            ray.get(actor.release_port.remote())
-        finally:
-            ray.kill(actor, no_restart=True)
-
-        if port not in avoid_ports:
-            return format_tcp_address(host, port)
-
-    candidate_ports = list(_iter_candidate_ports(preferred_port, fallback_ports))
-    message = (
-        "failed to reserve a result endpoint port from candidates "
-        f"{candidate_ports} with avoid_ports {sorted(avoid_ports)}"
-    )
-    if last_error is not None:
-        raise RuntimeError(message) from last_error
-    raise RuntimeError(message)
-
-
-def create_endpoint_on_node(
-    node_id: str,
-    *,
-    avoid_ports: set[int] | None = None,
-    preferred_port: int | None = None,
-    fallback_ports: list[int] | None = None,
-) -> str:
-    """Reserve an endpoint on the requested Ray node."""
-    avoid_ports = set(avoid_ports or ())
-    scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-    last_error: Exception | None = None
-    for candidate_port in _iter_candidate_ports(preferred_port, fallback_ports):
-        if candidate_port is not None and candidate_port in avoid_ports:
-            continue
-        actor = PortActor.options(
-            num_cpus=0,
-            scheduling_strategy=scheduling_strategy,
-        ).remote()
-        try:
-            try:
-                reservation = ray.get(
-                    actor.reserve_port.remote(candidate_port, sorted(avoid_ports))
-                )
-            except Exception as exc:
-                last_error = exc
-                continue
-            host = reservation["host"]
-            port = int(reservation["port"])
-            ray.get(actor.release_port.remote())
-        finally:
-            ray.kill(actor, no_restart=True)
-
-        if port not in avoid_ports:
-            return format_tcp_address(host, port)
-
-    candidate_ports = list(_iter_candidate_ports(preferred_port, fallback_ports))
-    message = (
-        "failed to reserve an endpoint port from candidates "
-        f"{candidate_ports} with avoid_ports {sorted(avoid_ports)}"
-    )
-    if last_error is not None:
-        raise RuntimeError(message) from last_error
-    raise RuntimeError(message)
 
 
 @ray.remote
@@ -396,36 +368,37 @@ class DraftActor:
         model_path: str,
         tp_size: int,
         speculative_num_steps: int,
-        bind_endpoint: str,
-        connect_endpoints: list[str],
-        rank: int,
+        rank_base: int,
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
     ):
-        """Pin GPUs and create the draft engine with a preplanned endpoint."""
+        """Pin GPUs and create the draft engine."""
         self.assigned_gpu_ids = pin_actor_to_assigned_gpus(tp_size)
-        self.engine = sgl.Engine(
+        engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
             tp_size=tp_size,
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
-            decoupled_spec_bind_endpoint=bind_endpoint,
-            decoupled_spec_connect_endpoints=connect_endpoints,
-            decoupled_spec_rank=rank,
+            decoupled_spec_rank_base=rank_base,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
             spec_trace_dir=spec_trace_dir,
         )
-        self.control_endpoint = bind_endpoint
+        self.engine = sgl.Engine(**engine_kwargs)
+        self.endpoint_infos = self.engine.get_decoupled_spec_endpoint_infos()
 
     def ready(self) -> dict[str, Any]:
         """Return actor metadata once the remote draft engine is ready."""
         return {
+            "node_host": ray.util.get_node_ip_address(),
             "assigned_gpu_ids": self.assigned_gpu_ids,
-            "control_endpoint": self.control_endpoint,
+            "endpoint_infos": self.endpoint_infos,
         }
+
+    def configure_peers(self, connect_endpoints: list[str]) -> tuple[bool, str]:
+        return self.engine.configure_decoupled_spec_peers(connect_endpoints)
 
     def shutdown(self) -> bool:
         """Shutdown the remote draft engine owned by this actor."""
@@ -436,27 +409,17 @@ class DraftActor:
 def launch_draft_actors(
     args: argparse.Namespace,
     node_assignments: list[str],
-    endpoint_configs: list[DecoupledSpecEndpointConfig],
-) -> list[Any]:
-    """Launch draft actors at planned nodes with planned endpoint configs."""
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Launch draft actors at planned nodes and collect their published endpoints."""
     if len(node_assignments) != args.num_draft_replicas:
         raise ValueError(
             f"node_assignments has {len(node_assignments)} entries, expected "
             f"{args.num_draft_replicas}"
         )
-    if len(endpoint_configs) != args.num_draft_replicas:
-        raise ValueError(
-            f"endpoint_configs has {len(endpoint_configs)} entries, expected "
-            f"{args.num_draft_replicas}"
-        )
 
     actors = []
     actor_env_vars = get_decoupled_spec_actor_env_vars()
-    for node_id, endpoint_config in zip(
-        node_assignments,
-        endpoint_configs,
-        strict=True,
-    ):
+    for rank, node_id in enumerate(node_assignments):
         actor_options: dict[str, Any] = dict(
             num_gpus=args.draft_tp_size,
             num_cpus=1,
@@ -472,108 +435,56 @@ def launch_draft_actors(
             model_path=args.draft_model_path,
             tp_size=args.draft_tp_size,
             speculative_num_steps=args.num_speculative_steps,
-            bind_endpoint=endpoint_config.bind_endpoint,
-            connect_endpoints=endpoint_config.connect_endpoints,
-            rank=endpoint_config.rank,
+            rank_base=rank,
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,
         )
         actors.append(actor)
-    ray.get([actor.ready.remote() for actor in actors])
-    return actors
+    ready_infos = ray.get([actor.ready.remote() for actor in actors])
+    endpoint_infos = []
+    for ready_info in ready_infos:
+        node_host = ready_info.get("node_host")
+        for endpoint_info in ready_info.get("endpoint_infos", []):
+            endpoint_info = dict(endpoint_info)
+            if node_host is not None:
+                endpoint_info["node_host"] = str(node_host)
+            endpoint_infos.append(endpoint_info)
+    return actors, endpoint_infos
+
+
+def to_endpoint_infos(
+    raw_infos: list[dict[str, Any]]
+) -> list[DecoupledSpecEndpointInfo]:
+    return [
+        DecoupledSpecEndpointInfo(
+            role=str(info["role"]),
+            rank=int(info["rank"]),
+            local_dp_rank=int(info.get("local_dp_rank", 0)),
+            bind_endpoint=str(info["bind_endpoint"]),
+            node_host=(
+                str(info["node_host"]) if info.get("node_host") is not None else None
+            ),
+        )
+        for info in raw_infos
+    ]
 
 
 def create_remote_decoupled_spec_topology(
     args: argparse.Namespace,
     verifier_pgs,
-    *,
-    avoid_ports: set[int] | None = None,
-    preferred_result_ports: list[int | None] | None = None,
-    preferred_control_ports: list[int | None] | None = None,
-    fallback_ports: list[int] | None = None,
 ) -> DecoupledSpecTopology:
-    """Create Ray/multi-node decoupled-spec endpoints and draft actors."""
+    """Launch Ray/multi-node draft actors and collect their published endpoints."""
     if not isinstance(verifier_pgs, list):
         verifier_pgs = [verifier_pgs]
     if not verifier_pgs:
         raise ValueError("at least one verifier placement group is required")
-    if preferred_result_ports is not None and len(preferred_result_ports) != len(
-        verifier_pgs
-    ):
-        raise ValueError(
-            f"preferred_result_ports has {len(preferred_result_ports)} entries, "
-            f"expected {len(verifier_pgs)}"
-        )
-    if (
-        preferred_control_ports is not None
-        and len(preferred_control_ports) != args.num_draft_replicas
-    ):
-        raise ValueError(
-            f"preferred_control_ports has {len(preferred_control_ports)} entries, "
-            f"expected {args.num_draft_replicas}"
-        )
-
-    used_ports = set(avoid_ports or ())
     node_assignments = plan_draft_placement(args)
-
-    result_endpoints = []
-    for verifier_rank, pg in enumerate(verifier_pgs):
-        preferred_result_port = (
-            preferred_result_ports[verifier_rank]
-            if preferred_result_ports is not None
-            else None
-        )
-        result_endpoint = create_result_endpoint_from_pg(
-            pg,
-            avoid_ports=used_ports,
-            preferred_port=preferred_result_port,
-            fallback_ports=fallback_ports,
-        )
-        result_endpoints.append(result_endpoint)
-        try:
-            used_ports.add(int(result_endpoint.rsplit(":", 1)[1]))
-        except ValueError:
-            pass
-
-    control_endpoints = []
-    for draft_rank, node_id in enumerate(node_assignments):
-        preferred_control_port = (
-            preferred_control_ports[draft_rank]
-            if preferred_control_ports is not None
-            else None
-        )
-        control_endpoint = create_endpoint_on_node(
-            node_id,
-            avoid_ports=used_ports,
-            preferred_port=preferred_control_port,
-            fallback_ports=fallback_ports,
-        )
-        control_endpoints.append(control_endpoint)
-        try:
-            used_ports.add(int(control_endpoint.rsplit(":", 1)[1]))
-        except ValueError:
-            pass
-
-    drafter_configs = [
-        DecoupledSpecEndpointConfig(
-            bind_endpoint=endpoint,
-            connect_endpoints=result_endpoints,
-            rank=rank,
-        )
-        for rank, endpoint in enumerate(control_endpoints)
-    ]
-    verifier_configs = [
-        DecoupledSpecEndpointConfig(
-            bind_endpoint=endpoint,
-            connect_endpoints=control_endpoints,
-            rank=rank,
-        )
-        for rank, endpoint in enumerate(result_endpoints)
-    ]
-    draft_actors = launch_draft_actors(args, node_assignments, drafter_configs)
+    draft_actors, drafter_endpoint_infos = launch_draft_actors(
+        args, node_assignments
+    )
     return DecoupledSpecTopology(
-        drafter_configs=drafter_configs,
-        verifier_configs=verifier_configs,
+        drafter_endpoint_infos=to_endpoint_infos(drafter_endpoint_infos),
+        verifier_endpoint_infos=[],
         draft_actors=draft_actors,
     )
 
@@ -588,18 +499,19 @@ class TargetActor:
         mode: str,
         model_path: str,
         tp_size: int,
+        dp_size: int = 1,
+        enable_dp_attention: bool = False,
         ep_size: int | None = None,
         moe_a2a_backend: str | None = None,
         nnodes: int,
         node_rank: int,
         dist_init_addr: str | None,
         speculative_num_steps: int | None = None,
-        bind_endpoint: str | None = None,
-        connect_endpoints: list[str] | None = None,
-        rank: int | None = None,
+        rank_base: int = 0,
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
         log_level: str | None = None,
+        dist_init_port_reservation_actor: Any | None = None,
     ):
         """Pin GPUs and initialize the target engine for one node rank."""
         self.mode = mode
@@ -611,6 +523,7 @@ class TargetActor:
         engine_kwargs: dict[str, Any] = dict(
             model_path=model_path,
             tp_size=tp_size,
+            dp_size=dp_size,
             nnodes=nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
@@ -623,14 +536,14 @@ class TargetActor:
             engine_kwargs["ep_size"] = ep_size
         if moe_a2a_backend is not None:
             engine_kwargs["moe_a2a_backend"] = moe_a2a_backend
+        if enable_dp_attention:
+            engine_kwargs["enable_dp_attention"] = True
         if mode == "decoupled_spec":
             engine_kwargs.update(
                 speculative_algorithm="DECOUPLED_VERIFY",
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
-                decoupled_spec_bind_endpoint=bind_endpoint,
-                decoupled_spec_connect_endpoints=connect_endpoints,
-                decoupled_spec_rank=rank,
+                decoupled_spec_rank_base=rank_base,
                 disable_radix_cache=True,
             )
         elif mode == "decode":
@@ -648,7 +561,14 @@ class TargetActor:
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
+        if dist_init_port_reservation_actor is not None:
+            ray.get(dist_init_port_reservation_actor.release_port.remote())
         self.engine = sgl.Engine(**engine_kwargs)
+        self.endpoint_infos = (
+            self.engine.get_decoupled_spec_endpoint_infos()
+            if mode == "decoupled_spec"
+            else []
+        )
 
     def ready(self) -> dict[str, Any]:
         """Return actor metadata once the target engine has initialized."""
@@ -656,7 +576,11 @@ class TargetActor:
             "mode": self.mode,
             "node_rank": self.node_rank,
             "assigned_gpu_ids": self.assigned_gpu_ids,
+            "endpoint_infos": self.endpoint_infos,
         }
+
+    def configure_peers(self, connect_endpoints: list[str]) -> tuple[bool, str]:
+        return self.engine.configure_decoupled_spec_peers(connect_endpoints)
 
     def generate_batch(
         self,

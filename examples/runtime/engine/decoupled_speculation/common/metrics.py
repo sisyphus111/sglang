@@ -414,6 +414,13 @@ def build_result(
         else ("all" if baseline_names else "none")
     )
     actor_env_vars = get_decoupled_spec_actor_env_vars()
+    target_dp_size = getattr(args, "target_dp_size", 1)
+    target_enable_dp_attention = getattr(args, "target_enable_dp_attention", False)
+    target_engine_tp_size = (
+        args.target_tp_size * target_dp_size
+        if target_enable_dp_attention
+        else args.target_tp_size
+    )
     result = {
         "config": {
             "dataset_path": args.dataset_path,
@@ -430,6 +437,9 @@ def build_result(
             "draft_model_path": args.draft_model_path,
             "tokenizer_path": args.tokenizer_path or args.target_model_path,
             "target_tp_size": args.target_tp_size,
+            "target_dp_size": target_dp_size,
+            "target_enable_dp_attention": target_enable_dp_attention,
+            "target_engine_tp_size": target_engine_tp_size,
             "target_ep_size": args.target_ep_size,
             "target_moe_a2a_backend": args.target_moe_a2a_backend,
             "num_verifier_replicas": args.num_verifier_replicas,
@@ -707,6 +717,13 @@ def print_summary(result: dict[str, Any]) -> None:
     print(f"batch_size: {result['config']['batch_size']}")
     print(f"verify_ngpus: {result['config']['verify_ngpus']}")
     print(f"draft_ngpus: {result['config']['draft_ngpus']}")
+    print(f"target_tp_size: {result['config']['target_tp_size']}")
+    print(f"target_dp_size: {result['config']['target_dp_size']}")
+    print(
+        "target_enable_dp_attention: "
+        f"{result['config']['target_enable_dp_attention']}"
+    )
+    print(f"target_engine_tp_size: {result['config']['target_engine_tp_size']}")
     print(f"num_verifier_replicas: {result['config']['num_verifier_replicas']}")
     print(f"num_draft_replicas: {result['config']['num_draft_replicas']}")
     print(f"max_new_tokens: {result['config']['max_new_tokens']}")

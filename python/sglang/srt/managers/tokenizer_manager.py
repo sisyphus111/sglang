@@ -56,6 +56,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    ConfigureDecoupledSpecPeersReq,
+    ConfigureDecoupledSpecPeersReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
@@ -374,6 +376,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.decoupled_spec_configure_result: Optional[
+            Awaitable[ConfigureDecoupledSpecPeersReqOutput]
+        ] = None
+        self.decoupled_spec_configure_tmp = []
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -501,6 +507,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
+                ),
+                (
+                    ConfigureDecoupledSpecPeersReqOutput,
+                    self._handle_configure_decoupled_spec_peers_req_output,
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
@@ -1590,6 +1600,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
 
+    async def configure_decoupled_spec_peers(
+        self, connect_endpoints: List[str]
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        obj = ConfigureDecoupledSpecPeersReq(connect_endpoints=list(connect_endpoints))
+        self.decoupled_spec_configure_result = asyncio.Future()
+        self.decoupled_spec_configure_tmp = []
+        logger.info(
+            "Sending decoupled-spec configure request: connect_endpoints=%s",
+            obj.connect_endpoints,
+        )
+        self.send_to_scheduler.send_pyobj(obj)
+
+        result = await self.decoupled_spec_configure_result
+        if self.server_args.dp_size == 1:
+            return result.success, result.message
+
+        all_success = all(r.success for r in result)
+        all_message = " | ".join(r.message for r in result if r.message)
+        return all_success, all_message
+
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
         self.send_to_scheduler.send_pyobj(FreezeGCReq())
@@ -2561,6 +2592,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    def _handle_configure_decoupled_spec_peers_req_output(self, recv_obj):
+        if self.decoupled_spec_configure_result is None:
+            logger.warning("Decoupled-spec configure response arrived without waiter")
+            return
+        logger.info(
+            "Received decoupled-spec configure response: success=%s message=%s",
+            recv_obj.success,
+            recv_obj.message,
+        )
+        if self.server_args.dp_size == 1:
+            self.decoupled_spec_configure_result.set_result(recv_obj)
+        else:
+            self.decoupled_spec_configure_tmp.append(recv_obj)
+            if len(self.decoupled_spec_configure_tmp) == self.server_args.dp_size:
+                self.decoupled_spec_configure_result.set_result(
+                    self.decoupled_spec_configure_tmp
+                )
 
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

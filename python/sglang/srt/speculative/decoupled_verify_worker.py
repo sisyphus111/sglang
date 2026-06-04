@@ -222,6 +222,17 @@ class VerifyWorker:
                 "External draft verification requires at least one draft token per request."
             )
 
+        if batch.forward_mode.is_idle():
+            spec_info = EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                draft_token_num,
+            )
+            # Decoupled verify does not consume target hidden states. Keep idle
+            # companion ranks on the same NULL-hidden CUDA graph as active ranks.
+            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            return spec_info
+
         batch.maybe_evict_swa()
         for req in batch.reqs:
             req.decode_batch_idx += 1
@@ -412,10 +423,11 @@ class VerifyWorker:
         )
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        if (
-            batch.forward_mode.is_extend()
-            or batch.is_extend_in_batch
-            or batch.forward_mode.is_idle()
+        # When a peer DP rank is running prefill/extend, IDLE batches are just
+        # DP-attention companions. They must preserve the plain target-forward
+        # MLP sync shape instead of installing an idle verify spec_info.
+        if not batch.forward_mode.is_target_verify() and (
+            batch.forward_mode.is_extend() or batch.is_extend_in_batch
         ):
             model_worker_batch = batch.get_model_worker_batch()
             result = self.target_worker.forward_batch_generation(model_worker_batch)

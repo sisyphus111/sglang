@@ -276,6 +276,28 @@ class Engine(EngineScoreMixin, EngineBase):
         """Returns a list of all child process PIDs."""
         return self._scheduler_init_result.all_child_pids
 
+    def get_decoupled_spec_endpoint_infos(self) -> List[Dict[str, Any]]:
+        endpoint_infos = []
+        for info in self._scheduler_init_result.scheduler_infos:
+            endpoint_infos.extend(info.get("decoupled_spec_endpoint_infos", []))
+        return endpoint_infos
+
+    def configure_decoupled_spec_peers(
+        self, connect_endpoints: List[str]
+    ) -> Tuple[bool, str]:
+        return self.loop.run_until_complete(
+            self.async_configure_decoupled_spec_peers(connect_endpoints)
+        )
+
+    async def async_configure_decoupled_spec_peers(
+        self, connect_endpoints: List[str]
+    ) -> Tuple[bool, str]:
+        if self.tokenizer_manager is None:
+            raise RuntimeError("Tokenizer manager is not initialized")
+        return await self.tokenizer_manager.configure_decoupled_spec_peers(
+            connect_endpoints
+        )
+
     def _resolve_routed_dp_rank(
         self,
         routed_dp_rank: Optional[int],

@@ -9,6 +9,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    ConfigureDecoupledSpecPeersReq,
+    ConfigureDecoupledSpecPeersReqOutput,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -100,11 +104,41 @@ def _flush_draft_batch_metadata_updates_kernel(
 class SchedulerDecoupledSpecMixin:
     """Decoupled-spec scheduler hooks and request lifecycle helpers."""
 
+    def get_decoupled_spec_local_dp_rank(self: Scheduler) -> int:
+        local_dp_rank = (
+            self.attn_dp_rank if self.server_args.enable_dp_attention else self.dp_rank
+        )
+        return 0 if local_dp_rank is None else int(local_dp_rank)
+
     def get_decoupled_spec_rank(self: Scheduler) -> int:
-        rank = self.server_args.decoupled_spec_rank
-        if rank is None:
-            raise RuntimeError("decoupled_spec_rank is required for decoupled spec")
-        return int(rank)
+        return (
+            int(self.server_args.decoupled_spec_rank_base)
+            + self.get_decoupled_spec_local_dp_rank()
+        )
+
+    def get_decoupled_spec_endpoint_info(self: Scheduler) -> Optional[dict]:
+        if not (self.is_verify_entry_rank() or self.is_draft_entry_rank()):
+            return None
+        bind_endpoint = None
+        role = None
+        if self.is_verify_entry_rank():
+            role = "verifier"
+            bind_endpoint = getattr(
+                self.draft_proxy_thread, "result_bind_endpoint", None
+            )
+        elif self.is_draft_entry_rank():
+            role = "drafter"
+            bind_endpoint = getattr(
+                self.token_sync_thread, "control_bind_endpoint", None
+            )
+        if bind_endpoint is None:
+            return None
+        return {
+            "role": role,
+            "rank": self.get_decoupled_spec_rank(),
+            "local_dp_rank": self.get_decoupled_spec_local_dp_rank(),
+            "bind_endpoint": bind_endpoint,
+        }
 
     def is_draft_worker_batch(
         self: Scheduler, batch: Optional[ScheduleBatch] = None
@@ -136,20 +170,13 @@ class SchedulerDecoupledSpecMixin:
         self.draft_proxy_thread = None
         if not self.is_verify_entry_rank():
             return
-        ipc_config = self.port_args.decoupled_spec_ipc_config
-        if ipc_config is None:
-            raise RuntimeError(
-                "Decoupled spec IPC config is required on decoupled_verify entry rank"
-            )
         if self.draft_tail_buffer is None:
             raise RuntimeError(
                 "DraftTailBuffer is required on decoupled_verify entry rank"
             )
         self.draft_proxy_thread = DraftProxyThread(
             context=context,
-            verifier_rank=ipc_config.rank,
-            result_bind_endpoint=ipc_config.bind_endpoint,
-            drafter_control_endpoints=ipc_config.connect_endpoints,
+            verifier_rank=self.get_decoupled_spec_rank(),
             draft_tail_buffer=self.draft_tail_buffer,
             tracer=self.tracer,
         )
@@ -159,19 +186,20 @@ class SchedulerDecoupledSpecMixin:
         self.token_sync_thread = None
         if not self.is_draft_entry_rank():
             return
-        ipc_config = self.port_args.decoupled_spec_ipc_config
-        if ipc_config is None:
-            raise RuntimeError(
-                "Decoupled spec IPC config is required on decoupled_draft entry rank"
-            )
         self.token_sync_thread = TokenSyncThread(
             context=getattr(self, "zmq_context", None),
-            control_bind_endpoint=ipc_config.bind_endpoint,
-            verifier_result_endpoints=ipc_config.connect_endpoints,
-            drafter_rank=ipc_config.rank,
+            drafter_rank=self.get_decoupled_spec_rank(),
             tracer=self.tracer,
         )
         self.token_sync_thread.start()
+
+    def _reset_decoupled_verify_drafter_tables(
+        self: Scheduler, num_drafters: int
+    ) -> None:
+        self.decoupled_verify_drafter_ranks = list(range(num_drafters))
+        self.decoupled_verify_drafter_loads = {
+            rank: 0 for rank in self.decoupled_verify_drafter_ranks
+        }
 
     def init_draft_state_tables(self: Scheduler) -> None:
         self.draft_req_table: Dict[DraftReqKey, DraftReqState] = {}
@@ -179,23 +207,38 @@ class SchedulerDecoupledSpecMixin:
         self.decoupled_verify_drafter_ranks: list[int] = []
         self.decoupled_verify_req_to_drafter_rank: Dict[str, int] = {}
         self.decoupled_verify_drafter_loads: Dict[int, int] = {}
-        if not self.is_verify_entry_rank():
-            return
-        ipc_config = self.port_args.decoupled_spec_ipc_config
-        if ipc_config is None:
-            raise RuntimeError(
-                "Decoupled spec IPC config is required on decoupled_verify entry rank"
+
+    def configure_decoupled_spec_peers(
+        self: Scheduler, req: ConfigureDecoupledSpecPeersReq
+    ) -> ConfigureDecoupledSpecPeersReqOutput:
+        try:
+            if self.is_verify_entry_rank():
+                if self.draft_proxy_thread is None:
+                    raise RuntimeError("Decoupled verify proxy is not initialized")
+                self.draft_proxy_thread.configure_peer_endpoints(req.connect_endpoints)
+                self._reset_decoupled_verify_drafter_tables(
+                    len(req.connect_endpoints)
+                )
+                self.draft_proxy_thread.start()
+            elif self.is_draft_entry_rank():
+                if self.token_sync_thread is None:
+                    raise RuntimeError("Decoupled token sync thread is not initialized")
+                self.token_sync_thread.configure_peer_endpoints(req.connect_endpoints)
+                self.token_sync_thread.start()
+            logger.info(
+                "Handled decoupled-spec configure request: rank=%s endpoints=%s",
+                self.get_decoupled_spec_rank(),
+                req.connect_endpoints,
             )
-        self.decoupled_verify_drafter_ranks = list(
-            range(len(ipc_config.connect_endpoints))
-        )
-        if not self.decoupled_verify_drafter_ranks:
-            raise RuntimeError(
-                "Decoupled verify requires at least one drafter control endpoint"
+            return ConfigureDecoupledSpecPeersReqOutput(success=True)
+        except Exception as exc:
+            logger.exception(
+                "Failed to handle decoupled-spec configure request: endpoints=%s",
+                req.connect_endpoints,
             )
-        self.decoupled_verify_drafter_loads = {
-            rank: 0 for rank in self.decoupled_verify_drafter_ranks
-        }
+            return ConfigureDecoupledSpecPeersReqOutput(
+                success=False, message=str(exc)
+            )
 
     def start_forward_timer(self: Scheduler, batch: ScheduleBatch) -> Optional[int]:
         if (

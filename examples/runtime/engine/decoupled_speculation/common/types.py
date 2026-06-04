@@ -49,20 +49,22 @@ def resolve_baseline_modes(baseline: str) -> list[str]:
 
 
 @dataclass
-class DecoupledSpecEndpointConfig:
-    """Bind/connect endpoint config for one decoupled-spec instance."""
+class DecoupledSpecEndpointInfo:
+    """Published endpoint for one decoupled-spec entry scheduler."""
 
-    bind_endpoint: str
-    connect_endpoints: list[str]
+    role: str
     rank: int
+    local_dp_rank: int
+    bind_endpoint: str
+    node_host: str | None = None
 
 
 @dataclass
 class DecoupledSpecTopology:
-    """Endpoint topology and actor handles for a decoupled-spec run."""
+    """Published endpoints and actor handles for a decoupled-spec run."""
 
-    drafter_configs: list[DecoupledSpecEndpointConfig]
-    verifier_configs: list[DecoupledSpecEndpointConfig]
+    drafter_endpoint_infos: list[DecoupledSpecEndpointInfo]
+    verifier_endpoint_infos: list[DecoupledSpecEndpointInfo]
     draft_actors: list[Any] | None = None
 
 

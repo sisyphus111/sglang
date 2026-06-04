@@ -27,6 +27,7 @@ except ImportError:
 
 DEFAULT_RAY_NAMESPACE = "dspec"
 DEFAULT_PROMPT_COLUMN_CANDIDATES = common.DEFAULT_PROMPT_COLUMN_CANDIDATES
+DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
 _RUNTIME_IMPORTS_READY = False
 
 
@@ -177,7 +178,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Tokenizer path used for prompt length filtering. Defaults to target model.",
     )
-    parser.add_argument("--target-tp-size", type=int, required=True)
+    parser.add_argument(
+        "--target-tp-size",
+        type=int,
+        required=True,
+        help=(
+            "Target/verifier TP size. When --target-enable-dp-attention is set, "
+            "this is the attention TP size per DP lane; the SGLang engine "
+            "tp_size is target_tp_size * target_dp_size."
+        ),
+    )
+    parser.add_argument(
+        "--target-dp-size",
+        type=int,
+        default=1,
+        help="Target/verifier DP size.",
+    )
+    parser.add_argument(
+        "--target-enable-dp-attention",
+        "--enable-dp-attention",
+        dest="target_enable_dp_attention",
+        action="store_true",
+        help=(
+            "Enable DP attention for the target/verifier engine. With this set, "
+            "--target-tp-size is interpreted per DP lane."
+        ),
+    )
     parser.add_argument(
         "--target-ep-size",
         type=int,
@@ -259,9 +285,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Base port for this run. With V verifier replicas, spec dist-init "
-            "uses the first V ports; baseline dist-init ports follow; verifier "
-            "result and drafter control endpoints are placed after the "
-            "baseline slots."
+            "uses the first V ports and baseline dist-init ports follow. "
+            "Decoupled result/control endpoints are bound dynamically by SGLang."
         ),
     )
     parser.add_argument(
@@ -271,8 +296,10 @@ def parse_args() -> argparse.Namespace:
             "Comma- or whitespace-separated list of pre-reserved ports, e.g. "
             "Merlin PORT1..PORT15. Ports do not need to be contiguous. They are "
             "consumed in order: spec dist-init ports, optional baseline dist-init "
-            "ports, verifier result endpoints, then drafter control endpoints. "
-            "This cannot be combined with --dist-init-addr or --dist-init-port."
+            "ports. Decoupled result/control endpoints are bound dynamically by "
+            "SGLang. This cannot be combined with --dist-init-addr or "
+            "--dist-init-port. With --target-enable-dp-attention, each dist-init "
+            "allocation consumes a contiguous 6-port block."
         ),
     )
     parser.add_argument(
@@ -382,19 +409,47 @@ def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
     return ports
 
 
+def _dist_init_port_stride(args: argparse.Namespace) -> int:
+    return DPA_DIST_INIT_PORT_BLOCK_SIZE if args.target_enable_dp_attention else 1
+
+
+def _reserved_port_block_bases(
+    reserved_ports: list[int],
+    *,
+    num_blocks: int,
+    block_size: int,
+) -> list[int]:
+    required_ports = num_blocks * block_size
+    if len(reserved_ports) < required_ports:
+        raise ValueError(
+            f"--reserved-ports provides {len(reserved_ports)} ports, but this "
+            f"run needs {required_ports}"
+        )
+    bases = []
+    for block_index in range(num_blocks):
+        start = block_index * block_size
+        block = reserved_ports[start : start + block_size]
+        expected = list(range(block[0], block[0] + block_size))
+        if block != expected:
+            raise ValueError(
+                "DP attention requires each reserved dist-init allocation to be "
+                f"a contiguous {block_size}-port block; block {block_index} is "
+                f"{block}, expected {expected}"
+            )
+        bases.append(block[0])
+    return bases
+
+
 def _split_reserved_ports(
     args: argparse.Namespace,
 ) -> tuple[
     list[int],
     dict[str, list[int]],
-    list[int],
-    list[int],
-    list[int],
     list[int] | None,
 ]:
     reserved_ports = _parse_reserved_ports(args.reserved_ports)
     if not reserved_ports:
-        return [], {}, [], [], [], None
+        return [], {}, None
 
     if args.dist_init_addr is not None or args.dist_init_port is not None:
         raise ValueError(
@@ -403,21 +458,42 @@ def _split_reserved_ports(
         )
 
     num_verifiers = args.num_verifier_replicas
-    num_drafters = args.num_draft_replicas
     baseline_modes = common.resolve_baseline_modes(args.baseline)
-    required_ports = (
-        num_verifiers
-        + len(baseline_modes) * num_verifiers
-        + num_verifiers
-        + num_drafters
-    )
+    port_stride = _dist_init_port_stride(args)
+    required_blocks = num_verifiers + len(baseline_modes) * num_verifiers
+    required_ports = required_blocks * port_stride
     if len(reserved_ports) < required_ports:
+        port_usage = f"{num_verifiers} spec dist-init"
+        if baseline_modes:
+            port_usage += (
+                f" and {len(baseline_modes) * num_verifiers} baseline dist-init"
+            )
+        if port_stride > 1:
+            port_usage += f" blocks of {port_stride} contiguous ports"
         raise ValueError(
             f"--reserved-ports provides {len(reserved_ports)} ports, but this "
-            f"run needs {required_ports}: {num_verifiers} spec dist-init, "
-            f"{len(baseline_modes) * num_verifiers} baseline "
-            f"dist-init, {num_verifiers} result endpoint, and {num_drafters} "
-            "drafter control ports"
+            f"run needs {required_ports}: {port_usage}"
+        )
+
+    if port_stride > 1:
+        block_bases = _reserved_port_block_bases(
+            reserved_ports,
+            num_blocks=required_blocks,
+            block_size=port_stride,
+        )
+        cursor = 0
+        spec_ports = block_bases[cursor : cursor + num_verifiers]
+        cursor += num_verifiers
+        baseline_ports_by_mode = {}
+        for baseline_mode in baseline_modes:
+            baseline_ports_by_mode[baseline_mode] = block_bases[
+                cursor : cursor + num_verifiers
+            ]
+            cursor += num_verifiers
+        return (
+            spec_ports,
+            baseline_ports_by_mode,
+            reserved_ports,
         )
 
     cursor = 0
@@ -429,17 +505,9 @@ def _split_reserved_ports(
             cursor : cursor + num_verifiers
         ]
         cursor += num_verifiers
-    result_ports = reserved_ports[cursor : cursor + num_verifiers]
-    cursor += num_verifiers
-    control_ports = reserved_ports[cursor : cursor + num_drafters]
-    cursor += num_drafters
-    extra_ports = reserved_ports[cursor:]
     return (
         spec_ports,
         baseline_ports_by_mode,
-        result_ports,
-        control_ports,
-        extra_ports,
         reserved_ports,
     )
 
@@ -450,11 +518,12 @@ def derive_dist_init_addr(
     port_offset: int = 0,
     preferred_port: int | None = None,
 ) -> str | None:
+    port_stride = _dist_init_port_stride(args)
     if args.nnodes == 1 and args.dist_init_addr is None:
         if preferred_port is not None:
             return f"127.0.0.1:{preferred_port}"
         if args.dist_init_port is not None:
-            return f"127.0.0.1:{args.dist_init_port + port_offset}"
+            return f"127.0.0.1:{args.dist_init_port + port_offset * port_stride}"
         return f"127.0.0.1:{_pick_free_local_port()}"
 
     if args.dist_init_addr is None:
@@ -467,19 +536,22 @@ def derive_dist_init_addr(
             "dist-init-addr must include a port or dist-init-port must be set"
         )
 
-    return common.format_host_port(host, base_port + port_offset)
+    return common.format_host_port(host, base_port + port_offset * port_stride)
 
 
-def derive_dist_init_addr_from_pg(
+def reserve_dist_init_addr_from_pg(
     args: argparse.Namespace,
     pg,
     *,
     port_offset: int = 0,
     preferred_port: int | None = None,
-) -> str | None:
-    if args.dist_init_addr is not None or args.nnodes == 1:
-        return derive_dist_init_addr(
-            args, port_offset=port_offset, preferred_port=preferred_port
+) -> tuple[str | None, Any | None]:
+    if args.dist_init_addr is not None:
+        return (
+            derive_dist_init_addr(
+                args, port_offset=port_offset, preferred_port=preferred_port
+            ),
+            None,
         )
 
     scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -490,21 +562,39 @@ def derive_dist_init_addr_from_pg(
         num_cpus=0,
         scheduling_strategy=scheduling_strategy,
     ).remote()
+    port_stride = _dist_init_port_stride(args)
     try:
         if preferred_port is not None:
             selected_port = preferred_port
         elif args.dist_init_port is not None:
-            selected_port = args.dist_init_port + port_offset
+            selected_port = args.dist_init_port + port_offset * port_stride
         else:
             selected_port = None
-        reservation = ray.get(actor.reserve_port.remote(selected_port))
+        if port_stride > 1:
+            reservation = ray.get(
+                actor.reserve_port_block.remote(selected_port, port_stride)
+            )
+        else:
+            reservation = ray.get(actor.reserve_port.remote(selected_port))
         host = reservation["host"]
         port = int(reservation["port"])
-        ray.get(actor.release_port.remote())
-    finally:
+    except Exception:
         ray.kill(actor, no_restart=True)
+        raise
 
-    return common.format_host_port(host, port)
+    return common.format_host_port(host, port), actor
+
+
+def shutdown_port_reservation_actors(actors: list[Any]) -> None:
+    for actor in actors:
+        try:
+            ray.get(actor.release_port.remote(), timeout=10)
+        except Exception:
+            pass
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
 
 
 def init_ray(address: str, namespace: str, nnodes: int) -> None:
@@ -528,17 +618,25 @@ def init_ray(address: str, namespace: str, nnodes: int) -> None:
         )
 
 
+def get_target_engine_tp_size(args: argparse.Namespace) -> int:
+    if args.target_enable_dp_attention:
+        return args.target_tp_size * args.target_dp_size
+    return args.target_tp_size
+
+
 def derive_target_layout(args: argparse.Namespace) -> tuple[int, int]:
+    target_engine_tp_size = get_target_engine_tp_size(args)
     for candidate_nnodes in range(1, args.nnodes + 1):
-        if args.target_tp_size % candidate_nnodes != 0:
+        if target_engine_tp_size % candidate_nnodes != 0:
             continue
-        target_gpus_per_node = args.target_tp_size // candidate_nnodes
+        target_gpus_per_node = target_engine_tp_size // candidate_nnodes
         if target_gpus_per_node <= args.n_gpu_per_node:
             return candidate_nnodes, target_gpus_per_node
 
     raise ValueError(
-        f"target-tp-size ({args.target_tp_size}) cannot be packed evenly across up to "
-        f"{args.nnodes} nodes with {args.n_gpu_per_node} GPUs per node"
+        f"target verifier world size ({target_engine_tp_size}) cannot be packed "
+        f"evenly across up to {args.nnodes} nodes with "
+        f"{args.n_gpu_per_node} GPUs per node"
     )
 
 
@@ -547,6 +645,17 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("nnodes must be positive")
     if args.target_tp_size <= 0:
         raise ValueError("target-tp-size must be positive")
+    if args.target_dp_size <= 0:
+        raise ValueError("target-dp-size must be positive")
+    if args.target_enable_dp_attention and args.target_dp_size <= 1:
+        raise ValueError(
+            "target-dp-size must be greater than 1 when DP attention is enabled"
+        )
+    if args.target_dp_size > 1 and not args.target_enable_dp_attention:
+        raise ValueError(
+            "target-dp-size > 1 is only supported with --target-enable-dp-attention "
+            "in this multi-node example"
+        )
     if args.target_ep_size is not None and args.target_ep_size <= 0:
         raise ValueError("target-ep-size must be positive when set")
     if args.draft_tp_size <= 0:
@@ -574,17 +683,21 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
             f"({derived_num_draft_replicas}) when --draft-ngpus is set"
         )
     args.num_draft_replicas = derived_num_draft_replicas
-    if args.verify_ngpus is not None and args.verify_ngpus % args.target_tp_size != 0:
+    target_engine_tp_size = get_target_engine_tp_size(args)
+    if (
+        args.verify_ngpus is not None
+        and args.verify_ngpus % target_engine_tp_size != 0
+    ):
         raise ValueError(
             f"verify-ngpus ({args.verify_ngpus}) must be divisible by "
-            f"target-tp-size ({args.target_tp_size})"
+            f"target verifier world size ({target_engine_tp_size})"
         )
 
     if args.n_gpu_per_node is None:
         if args.nnodes != 1:
             raise ValueError("n-gpu-per-node is required when nnodes > 1")
         args.n_gpu_per_node = (
-            args.verify_ngpus or args.target_tp_size
+            args.verify_ngpus or target_engine_tp_size
         ) + args.draft_ngpus
     if args.n_gpu_per_node <= 0:
         raise ValueError("n-gpu-per-node must be positive")
@@ -603,12 +716,12 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
             f"draft-ngpus ({args.draft_ngpus}) must leave GPUs for at least "
             "one verifier replica"
         )
-    if args.verify_ngpus % args.target_tp_size != 0:
+    if args.verify_ngpus % target_engine_tp_size != 0:
         raise ValueError(
             f"verify-ngpus ({args.verify_ngpus}) must be divisible by "
-            f"target-tp-size ({args.target_tp_size})"
+            f"target verifier world size ({target_engine_tp_size})"
         )
-    args.num_verifier_replicas = args.verify_ngpus // args.target_tp_size
+    args.num_verifier_replicas = args.verify_ngpus // target_engine_tp_size
 
     target_nnodes, target_gpus_per_node = derive_target_layout(args)
 
@@ -777,6 +890,7 @@ def print_decoupled_spec_layout(
         }
     )
     node_layout: dict[str, list[str]] = {host: [] for host in node_hosts}
+    target_engine_tp_size = get_target_engine_tp_size(args)
 
     for verifier_rank, pg in enumerate(verifier_pgs):
         bundle_hosts = _get_pg_bundle_hosts(pg, target_nnodes)
@@ -784,13 +898,21 @@ def print_decoupled_spec_layout(
             host = _normalize_layout_host(raw_host)
             node_layout.setdefault(host, [])
             label = f"verifier{verifier_rank}(tp={args.target_tp_size}"
+            if args.target_enable_dp_attention:
+                label += (
+                    f", dp={args.target_dp_size}, "
+                    f"engine_tp={target_engine_tp_size}"
+                )
             if target_nnodes > 1:
                 label += f", bundle={bundle_index}"
             label += f", gpus={target_gpus_per_node})"
             node_layout[host].append(label)
 
-    for drafter_rank, config in enumerate(topology.drafter_configs):
-        host = _host_from_endpoint(config.bind_endpoint)
+    for drafter_rank, endpoint_info in enumerate(topology.drafter_endpoint_infos):
+        host = endpoint_info.node_host or _host_from_endpoint(
+            endpoint_info.bind_endpoint
+        )
+        host = _normalize_layout_host(host)
         node_layout.setdefault(host, [])
         node_layout[host].append(f"drafter{drafter_rank}(tp={args.draft_tp_size})")
 
@@ -799,6 +921,9 @@ def print_decoupled_spec_layout(
     print(
         f"nverifier={args.num_verifier_replicas}, "
         f"tp_size={args.target_tp_size}, "
+        f"dp_size={args.target_dp_size}, "
+        f"enable_dp_attention={args.target_enable_dp_attention}, "
+        f"engine_tp_size={target_engine_tp_size}, "
         f"target_nnodes={target_nnodes}, "
         f"target_gpus_per_node={target_gpus_per_node}"
     )
@@ -813,15 +938,15 @@ def launch_target_actors(
     args: argparse.Namespace,
     mode: str,
     dist_init_addr: str | None,
+    dist_init_port_reservation_actor: Any | None,
     target_nnodes: int,
     target_gpus_per_node: int,
     pg,
-    bind_endpoint: str | None = None,
-    connect_endpoints: list[str] | None = None,
-    rank: int | None = None,
+    rank_base: int = 0,
 ) -> list[Any]:
     actor_env_vars = get_decoupled_spec_actor_env_vars()
     actors = []
+    target_engine_tp_size = get_target_engine_tp_size(args)
     for node_rank in range(target_nnodes):
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=pg,
@@ -837,19 +962,22 @@ def launch_target_actors(
         actor = TargetActor.options(**actor_options).remote(
             mode=mode,
             model_path=args.target_model_path,
-            tp_size=args.target_tp_size,
+            tp_size=target_engine_tp_size,
+            dp_size=args.target_dp_size,
+            enable_dp_attention=args.target_enable_dp_attention,
             ep_size=args.target_ep_size,
             moe_a2a_backend=args.target_moe_a2a_backend,
             nnodes=target_nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
             speculative_num_steps=args.num_speculative_steps,
-            bind_endpoint=bind_endpoint,
-            connect_endpoints=connect_endpoints,
-            rank=rank,
+            rank_base=rank_base,
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,
             log_level="info",
+            dist_init_port_reservation_actor=(
+                dist_init_port_reservation_actor if node_rank == 0 else None
+            ),
         )
         actors.append(actor)
 
@@ -888,6 +1016,29 @@ def _split_indices(num_items: int, num_shards: int) -> list[list[int]]:
     return shards
 
 
+def _endpoint_field(info: Any, field: str) -> Any:
+    if isinstance(info, dict):
+        return info[field]
+    return getattr(info, field)
+
+
+def _sorted_bind_endpoints(endpoint_infos: list[Any], *, role: str) -> list[str]:
+    role_infos = [
+        info for info in endpoint_infos if _endpoint_field(info, "role") == role
+    ]
+    if not role_infos:
+        raise RuntimeError(f"no decoupled-spec {role} endpoints were published")
+    role_infos.sort(key=lambda info: int(_endpoint_field(info, "rank")))
+    ranks = [int(_endpoint_field(info, "rank")) for info in role_infos]
+    expected = list(range(len(ranks)))
+    if ranks != expected:
+        raise RuntimeError(
+            f"decoupled-spec {role} ranks must be zero-based and contiguous: "
+            f"got {ranks}"
+        )
+    return [str(_endpoint_field(info, "bind_endpoint")) for info in role_infos]
+
+
 def run_mode(
     *,
     args: argparse.Namespace,
@@ -898,15 +1049,14 @@ def run_mode(
     dist_init_addrs: list[str | None],
     target_nnodes: int,
     target_gpus_per_node: int,
+    dist_init_port_reservation_actors: list[Any | None] | None = None,
     pgs: list[Any] | None = None,
-    endpoint_configs: list[Any] | None = None,
+    topology: Any | None = None,
     include_output_text: bool = True,
 ) -> ModeMetrics:
     target_actor_groups: list[list[Any]] = []
     owns_pgs = pgs is None
-    num_replicas = (
-        len(endpoint_configs) if endpoint_configs is not None else len(dist_init_addrs)
-    )
+    num_replicas = len(dist_init_addrs)
     if num_replicas <= 0:
         raise ValueError("run_mode requires at least one target replica")
     if len(dist_init_addrs) != num_replicas:
@@ -915,6 +1065,14 @@ def run_mode(
         )
     if pgs is not None and len(pgs) != num_replicas:
         raise ValueError(f"pgs has {len(pgs)} entries, expected {num_replicas}")
+    if dist_init_port_reservation_actors is None:
+        dist_init_port_reservation_actors = [None] * num_replicas
+    if len(dist_init_port_reservation_actors) != num_replicas:
+        raise ValueError(
+            "dist_init_port_reservation_actors has "
+            f"{len(dist_init_port_reservation_actors)} entries, "
+            f"expected {num_replicas}"
+        )
 
     replica_indices = _split_indices(len(prompt_samples), num_replicas)
     verifier_assignments = [0] * len(prompt_samples)
@@ -931,31 +1089,59 @@ def run_mode(
             )
 
         for replica_index in range(num_replicas):
-            endpoint_config = (
-                endpoint_configs[replica_index]
-                if endpoint_configs is not None
-                else None
-            )
             actors = launch_target_actors(
                 args=args,
                 mode=mode,
                 dist_init_addr=dist_init_addrs[replica_index],
+                dist_init_port_reservation_actor=(
+                    dist_init_port_reservation_actors[replica_index]
+                ),
                 target_nnodes=target_nnodes,
                 target_gpus_per_node=target_gpus_per_node,
                 pg=pgs[replica_index],
-                bind_endpoint=(
-                    endpoint_config.bind_endpoint
-                    if endpoint_config is not None
-                    else None
-                ),
-                connect_endpoints=(
-                    endpoint_config.connect_endpoints
-                    if endpoint_config is not None
-                    else None
-                ),
-                rank=endpoint_config.rank if endpoint_config is not None else None,
+                rank_base=replica_index * args.target_dp_size,
             )
             target_actor_groups.append(actors)
+
+        if mode == "decoupled_spec":
+            if topology is None or topology.draft_actors is None:
+                raise RuntimeError("decoupled_spec run requires draft topology")
+            verifier_raw_infos = []
+            for actors in target_actor_groups:
+                ready_infos = ray.get([actor.ready.remote() for actor in actors])
+                for ready_info in ready_infos:
+                    verifier_raw_infos.extend(ready_info.get("endpoint_infos", []))
+            topology.verifier_endpoint_infos = common.to_endpoint_infos(
+                verifier_raw_infos
+            )
+            draft_control_endpoints = _sorted_bind_endpoints(
+                topology.drafter_endpoint_infos, role="drafter"
+            )
+            verifier_result_endpoints = _sorted_bind_endpoints(
+                topology.verifier_endpoint_infos, role="verifier"
+            )
+            verifier_results = ray.get(
+                [
+                    actors[0].configure_peers.remote(draft_control_endpoints)
+                    for actors in target_actor_groups
+                ]
+            )
+            draft_results = ray.get(
+                [
+                    actor.configure_peers.remote(verifier_result_endpoints)
+                    for actor in topology.draft_actors
+                ]
+            )
+            failures = [
+                message
+                for success, message in [*verifier_results, *draft_results]
+                if not success
+            ]
+            if failures:
+                raise RuntimeError(
+                    "failed to configure decoupled-spec peers: "
+                    + " | ".join(failures)
+                )
 
         result_refs = []
         for replica_index, indices in enumerate(replica_indices):
@@ -1021,6 +1207,7 @@ def main() -> None:
     }
 
     draft_actors: list[Any] = []
+    dist_init_port_reservation_actors: list[Any] = []
     spec_pgs = []
     try:
         init_ray(args.ray_address, args.ray_namespace, args.nnodes)
@@ -1035,15 +1222,12 @@ def main() -> None:
         (
             spec_reserved_ports,
             baseline_reserved_ports,
-            result_reserved_ports,
-            control_reserved_ports,
-            extra_reserved_ports,
             reserved_ports,
         ) = _split_reserved_ports(args)
         if reserved_ports is not None:
             print(f"reserved_ports: {reserved_ports}", flush=True)
-        spec_dist_init_addrs = [
-            derive_dist_init_addr_from_pg(
+        spec_dist_init_reservations = [
+            reserve_dist_init_addr_from_pg(
                 args,
                 pg,
                 port_offset=replica_index,
@@ -1055,70 +1239,20 @@ def main() -> None:
             )
             for replica_index, pg in enumerate(spec_pgs)
         ]
-        spec_dist_init_ports = {
-            port
-            for addr in spec_dist_init_addrs
-            if addr is not None
-            for _, port in [_parse_host_port(addr)]
-            if port is not None
-        }
-        num_verifiers = args.num_verifier_replicas
-        reserved_dist_init_ports = set(spec_dist_init_ports)
-        baseline_slot_count = max(1, len(baseline_modes))
-        for baseline_index, baseline_mode in enumerate(baseline_modes):
-            if baseline_mode in baseline_reserved_ports:
-                reserved_dist_init_ports.update(
-                    baseline_reserved_ports[baseline_mode]
-                )
-            elif args.dist_init_port is not None:
-                baseline_offset = num_verifiers * (1 + baseline_index)
-                reserved_dist_init_ports.update(
-                    args.dist_init_port + baseline_offset + replica_index
-                    for replica_index in range(num_verifiers)
-                )
-            elif args.dist_init_addr is not None:
-                _, base_port = _parse_host_port(args.dist_init_addr)
-                if base_port is not None:
-                    baseline_offset = num_verifiers * (1 + baseline_index)
-                    reserved_dist_init_ports.update(
-                        base_port + baseline_offset + replica_index
-                        for replica_index in range(num_verifiers)
-                    )
-        preferred_result_ports = (
-            result_reserved_ports
-            if result_reserved_ports
-            else (
-                [
-                    args.dist_init_port
-                    + num_verifiers * (1 + baseline_slot_count)
-                    + i
-                    for i in range(num_verifiers)
-                ]
-                if args.dist_init_port is not None
-                else None
-            )
-        )
-        preferred_control_ports = (
-            control_reserved_ports
-            if control_reserved_ports
-            else (
-                [
-                    args.dist_init_port
-                    + num_verifiers * (2 + baseline_slot_count)
-                    + i
-                    for i in range(args.num_draft_replicas)
-                ]
-                if args.dist_init_port is not None
-                else None
-            )
+        spec_dist_init_addrs = [
+            reservation[0] for reservation in spec_dist_init_reservations
+        ]
+        spec_dist_init_port_reservation_actors = [
+            reservation[1] for reservation in spec_dist_init_reservations
+        ]
+        dist_init_port_reservation_actors.extend(
+            actor
+            for actor in spec_dist_init_port_reservation_actors
+            if actor is not None
         )
         topology = create_remote_decoupled_spec_topology(
             args,
             spec_pgs,
-            avoid_ports=reserved_dist_init_ports,
-            preferred_result_ports=preferred_result_ports,
-            preferred_control_ports=preferred_control_ports,
-            fallback_ports=extra_reserved_ports,
         )
         print_decoupled_spec_layout(
             args=args,
@@ -1137,8 +1271,9 @@ def main() -> None:
             dist_init_addrs=spec_dist_init_addrs,
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
+            dist_init_port_reservation_actors=spec_dist_init_port_reservation_actors,
             pgs=spec_pgs,
-            endpoint_configs=topology.verifier_configs,
+            topology=topology,
             include_output_text=True,
         )
         shutdown_actors(draft_actors)
@@ -1148,8 +1283,8 @@ def main() -> None:
         baseline_dist_init_addrs_by_mode = {}
         for baseline_index, baseline_mode in enumerate(baseline_modes):
             baseline_offset = args.num_verifier_replicas * (1 + baseline_index)
-            baseline_dist_init_addrs = [
-                derive_dist_init_addr_from_pg(
+            baseline_dist_init_reservations = [
+                reserve_dist_init_addr_from_pg(
                     args,
                     pg,
                     port_offset=baseline_offset + replica_index,
@@ -1161,6 +1296,17 @@ def main() -> None:
                 )
                 for replica_index, pg in enumerate(spec_pgs)
             ]
+            baseline_dist_init_addrs = [
+                reservation[0] for reservation in baseline_dist_init_reservations
+            ]
+            baseline_dist_init_port_reservation_actors = [
+                reservation[1] for reservation in baseline_dist_init_reservations
+            ]
+            dist_init_port_reservation_actors.extend(
+                actor
+                for actor in baseline_dist_init_port_reservation_actors
+                if actor is not None
+            )
             baseline_dist_init_addrs_by_mode[baseline_mode] = baseline_dist_init_addrs
             baseline_metrics.append(
                 run_mode(
@@ -1172,6 +1318,9 @@ def main() -> None:
                     dist_init_addrs=baseline_dist_init_addrs,
                     target_nnodes=target_nnodes,
                     target_gpus_per_node=target_gpus_per_node,
+                    dist_init_port_reservation_actors=(
+                        baseline_dist_init_port_reservation_actors
+                    ),
                     pgs=spec_pgs,
                     include_output_text=True,
                 )
@@ -1190,6 +1339,12 @@ def main() -> None:
         if reserved_ports is not None:
             result["config"]["reserved_ports"] = reserved_ports
             result["config"]["spec_dist_init_addrs"] = spec_dist_init_addrs
+        result["config"]["verifier_result_endpoints"] = _sorted_bind_endpoints(
+            topology.verifier_endpoint_infos, role="verifier"
+        )
+        result["config"]["draft_control_endpoints"] = _sorted_bind_endpoints(
+            topology.drafter_endpoint_infos, role="drafter"
+        )
         if len(baseline_dist_init_addrs_by_mode) == 1:
             result["config"]["baseline_dist_init_addrs"] = next(
                 iter(baseline_dist_init_addrs_by_mode.values())
@@ -1205,6 +1360,7 @@ def main() -> None:
                 print(f"  {output_path}")
     finally:
         shutdown_actors(draft_actors)
+        shutdown_port_reservation_actors(dist_init_port_reservation_actors)
         for pg in spec_pgs:
             remove_placement_group(pg)
         if ray.is_initialized():

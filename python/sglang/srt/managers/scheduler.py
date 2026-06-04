@@ -96,6 +96,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ConfigureDecoupledSpecPeersReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
@@ -358,6 +359,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.port_args = port_args
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
@@ -1481,6 +1483,10 @@ class Scheduler(
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
+                (
+                    ConfigureDecoupledSpecPeersReq,
+                    self.configure_decoupled_spec_peers,
+                ),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -1534,6 +1540,11 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
         }
+        endpoint_info = self.get_decoupled_spec_endpoint_info()
+        if endpoint_info is not None:
+            result_dict["decoupled_spec_endpoint_infos"] = [endpoint_info]
+        else:
+            result_dict["decoupled_spec_endpoint_infos"] = []
 
         return result_dict
 

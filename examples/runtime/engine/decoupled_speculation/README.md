@@ -6,15 +6,27 @@ This directory has two CLI entrypoints for decoupled speculative decoding:
 - `single-node.py`: run the local-process single-node benchmark without Ray.
 - `common/`: shared helpers split by function: runtime/Ray topology, prompt loading, metrics/output, and shared types.
 
-Decoupled-spec engines use static bind/connect endpoint configuration. Each
-verifier or drafter instance receives one local bind endpoint, an ordered list
-of peer connect endpoints, and a role-local rank. The helper builds a full mesh:
-every verifier connects to every drafter control endpoint, and every drafter
-connects to every verifier result endpoint. The script first chooses verifier
-placement groups and drafter nodes, then reserves bind endpoints on those nodes,
-and finally launches engines with the completed endpoint configs. When multiple
-verifier replicas are used, `--batch-size` must be divisible by the verifier
-replica count; each verifier receives one equal contiguous slice of the batch.
+Decoupled-spec engines use a two-stage runtime rendezvous. Verifier and drafter
+instances start first, bind free ZMQ endpoints locally, and publish the bound
+endpoints through engine init metadata. The helper then builds the full mesh and
+configures peers before generation starts: every verifier connects to every
+drafter control endpoint, and every drafter connects to every verifier result
+endpoint. Users no longer need to reserve decoupled result/control ports in
+advance; for multi-node runs, make sure each node's automatically detected
+local IP is mutually reachable, or override it with `SGLANG_HOST_IP`/`HOST_IP`.
+When multiple verifier replicas are used,
+`--batch-size` must be divisible by the verifier replica count; each verifier
+receives one equal contiguous slice of the batch.
+
+For verifier DP attention in either script, set `--target-dp-size` and
+`--target-enable-dp-attention` (or `--enable-dp-attention`). In that mode,
+`--target-tp-size` is interpreted as the attention TP size per DP lane, and the
+SGLang engine `tp_size` becomes `target_tp_size * target_dp_size`. For example,
+`--target-tp-size 8 --target-dp-size 4 --enable-dp-attention --target-ep-size
+32` launches a 32-GPU verifier engine with DP attention.
+DP attention uses TCP for internal SGLang IPC. When manually supplying
+`--dist-init-port` or `--reserved-ports`, leave a contiguous 6-port block for
+each verifier or baseline engine instance.
 
 Common modes:
 
