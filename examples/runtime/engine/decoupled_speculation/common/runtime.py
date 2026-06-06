@@ -121,6 +121,38 @@ def pin_actor_to_assigned_gpus(expected_num_gpus: int) -> list[str]:
     return gpu_ids
 
 
+def is_tcp_port_available(port: int) -> bool:
+    """Return whether a TCP port can be bound on this host."""
+    try:
+        infos = socket.getaddrinfo(
+            None,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+            0,
+            socket.AI_ADDRCONFIG | socket.AI_PASSIVE,
+        )
+    except socket.gaierror:
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("0.0.0.0", port))]
+
+    seen_families: set[int] = set()
+    for family, socktype, proto, _, sockaddr in infos:
+        if family in seen_families:
+            continue
+        seen_families.add(family)
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(sockaddr)
+        except (OSError, OverflowError):
+            return False
+        finally:
+            sock.close()
+    return True
+
+
 def reserve_tcp_port(
     preferred_port: int | None = None,
     avoid_ports: set[int] | None = None,
@@ -357,6 +389,57 @@ class PortActor:
             "host": ray.util.get_node_ip_address(),
         }
 
+    def get_numbered_env_ports(
+        self,
+        *,
+        prefix: str = "PORT",
+        max_count: int = 30,
+    ) -> list[int]:
+        """Return numbered platform ports from this actor's node environment."""
+        ports: list[int] = []
+        for index in range(1, max_count + 1):
+            env_name = f"{prefix}{index}"
+            env_value = os.environ.get(env_name)
+            if not env_value:
+                continue
+            try:
+                port = int(env_value)
+            except ValueError as exc:
+                raise ValueError(f"invalid {env_name}: {env_value!r}") from exc
+            if port <= 0 or port > 65535:
+                raise ValueError(f"{env_name} out of range: {port}")
+            ports.append(port)
+        if len(set(ports)) != len(ports):
+            raise ValueError(f"{prefix} environment ports must be unique: {ports}")
+        return ports
+
+    def get_available_numbered_env_port_info(
+        self,
+        *,
+        prefix: str = "PORT",
+        max_count: int = 30,
+        avoid_ports: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Return available numbered platform ports from this actor's node."""
+        env_ports = self.get_numbered_env_ports(prefix=prefix, max_count=max_count)
+        avoid_port_set = set(avoid_ports or ())
+        skipped_avoided_ports = [port for port in env_ports if port in avoid_port_set]
+        candidate_ports = [port for port in env_ports if port not in avoid_port_set]
+        available_ports = []
+        skipped_unavailable_ports = []
+        for port in candidate_ports:
+            if is_tcp_port_available(port):
+                available_ports.append(port)
+            else:
+                skipped_unavailable_ports.append(port)
+        return {
+            "host": ray.util.get_node_ip_address(),
+            "env_ports": env_ports,
+            "available_ports": available_ports,
+            "skipped_avoided_ports": skipped_avoided_ports,
+            "skipped_unavailable_ports": skipped_unavailable_ports,
+        }
+
 
 @ray.remote
 class DraftActor:
@@ -511,6 +594,7 @@ class TargetActor:
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
         log_level: str | None = None,
+        available_ports: list[int] | None = None,
         dist_init_port_reservation_actor: Any | None = None,
     ):
         """Pin GPUs and initialize the target engine for one node rank."""
@@ -538,6 +622,8 @@ class TargetActor:
             engine_kwargs["moe_a2a_backend"] = moe_a2a_backend
         if enable_dp_attention:
             engine_kwargs["enable_dp_attention"] = True
+            if available_ports is not None:
+                engine_kwargs["available_ports"] = available_ports
         if mode == "decoupled_spec":
             engine_kwargs.update(
                 speculative_algorithm="DECOUPLED_VERIFY",

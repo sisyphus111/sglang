@@ -715,6 +715,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    available_ports: Optional[List[int]] = None
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
@@ -6414,6 +6415,17 @@ class ServerArgs:
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
+            "--available-ports",
+            type=json_list_type,
+            default=ServerArgs.available_ports,
+            help=(
+                "Optional JSON list of available TCP ports for derived runtime "
+                "control endpoints. When DP attention is enabled, the first six "
+                "ports map to tokenizer, detokenizer, rpc, metrics, top-level "
+                "scheduler input, and DP-attention worker-port broadcast."
+            ),
+        )
+        parser.add_argument(
             "--enable-dp-attention-local-control-broadcast",
             action="store_true",
             help="With DP-attention, send control messages to every DP group leader "
@@ -7125,6 +7137,9 @@ class ServerArgs:
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
 
+        if self.available_ports is not None:
+            _parse_available_port_list(self.available_ports)
+
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
@@ -7634,6 +7649,92 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+DP_ATTENTION_FIXED_PORT_COUNT = 6
+
+
+@dataclasses.dataclass(frozen=True)
+class DPAttentionPortLayout:
+    tokenizer_port: int
+    detokenizer_port: int
+    rpc_port: int
+    metrics_port: int
+    scheduler_input_port: int
+    worker_port_broadcast_port: int
+
+
+def _parse_available_port_list(raw_ports: Any) -> List[int]:
+    if not isinstance(raw_ports, (list, tuple)):
+        raise ValueError(
+            "available_ports must be a JSON/list value, "
+            f"got {type(raw_ports).__name__}"
+        )
+    ports = []
+    for raw_port in raw_ports:
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid available port: {raw_port!r}") from exc
+        if port <= 0 or port > 65535:
+            raise ValueError(f"available port out of range: {port}")
+        ports.append(port)
+    if len(set(ports)) != len(ports):
+        raise ValueError(f"available_ports must be unique: {ports}")
+    return ports
+
+
+def _dp_attention_base_address(server_args: ServerArgs) -> NetworkAddress:
+    if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+        return NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
+    return NetworkAddress.parse(server_args.dist_init_addr)
+
+
+def _dp_attention_available_port_layout(
+    server_args: ServerArgs,
+) -> DPAttentionPortLayout:
+    ports = _parse_available_port_list(server_args.available_ports)
+    if len(ports) < DP_ATTENTION_FIXED_PORT_COUNT:
+        raise ValueError(
+            "--available-ports requires at least "
+            f"{DP_ATTENTION_FIXED_PORT_COUNT} ports when DP attention is enabled; "
+            f"got {len(ports)}"
+        )
+    selected_ports = ports[:DP_ATTENTION_FIXED_PORT_COUNT]
+    return DPAttentionPortLayout(*selected_ports)
+
+
+def get_dp_attention_base_address(server_args: ServerArgs) -> NetworkAddress:
+    return _dp_attention_base_address(server_args)
+
+
+def get_dp_attention_port_layout(server_args: ServerArgs) -> DPAttentionPortLayout:
+    na = _dp_attention_base_address(server_args)
+    if server_args.available_ports is not None:
+        layout = _dp_attention_available_port_layout(server_args)
+        selected_ports = dataclasses.astuple(layout)
+        if na.port in selected_ports:
+            raise ValueError(
+                "--available-ports selected a port that conflicts "
+                f"with dist_init_addr port {na.port}: {list(selected_ports)}"
+            )
+        return layout
+
+    port_base = na.port + 1
+    return DPAttentionPortLayout(
+        tokenizer_port=port_base,
+        detokenizer_port=port_base + 1,
+        rpc_port=port_base + 2,
+        metrics_port=port_base + 3,
+        scheduler_input_port=port_base + 4,
+        worker_port_broadcast_port=na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    )
+
+
+def get_dp_attention_worker_port_broadcast_addr(
+    server_args: ServerArgs,
+) -> NetworkAddress:
+    na = _dp_attention_base_address(server_args)
+    layout = get_dp_attention_port_layout(server_args)
+    return NetworkAddress(na.host, layout.worker_port_broadcast_port)
 
 
 @dataclasses.dataclass
@@ -7688,20 +7789,13 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
-            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
-            else:
-                na = NetworkAddress.parse(server_args.dist_init_addr)
-
+            na = get_dp_attention_base_address(server_args)
+            port_layout = get_dp_attention_port_layout(server_args)
             dist_init_host = na.host
             dist_init_port = na.port
-            port_base = dist_init_port + 1
-            detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
-            metrics_port = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_layout.scheduler_input_port
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
@@ -7709,11 +7803,15 @@ class PortArgs:
             try:
                 if dp_rank is None and server_args.node_rank == 0:
                     wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
+                    wait_port_available(
+                        port_layout.tokenizer_port, "tokenizer_port"
+                    )
+                    wait_port_available(
+                        port_layout.detokenizer_port, "detokenizer_port"
+                    )
                     wait_port_available(nccl_port, "nccl_port")
-                    wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_port, "metrics_port")
+                    wait_port_available(port_layout.rpc_port, "rpc_port")
+                    wait_port_available(port_layout.metrics_port, "metrics_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if (
@@ -7723,21 +7821,29 @@ class PortArgs:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
-                    f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
+                    "Port is already in use. "
+                    f"{dist_init_port=} {port_layout=} {nccl_port=} "
+                    f"{scheduler_input_port=}"
                 )
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, port_layout.tokenizer_port
+                ).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
                 detokenizer_ipc_name=NetworkAddress(
-                    dist_init_host, detokenizer_port
+                    dist_init_host, port_layout.detokenizer_port
                 ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
-                metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
+                rpc_ipc_name=NetworkAddress(
+                    dist_init_host, port_layout.rpc_port
+                ).to_tcp(),
+                metrics_ipc_name=NetworkAddress(
+                    dist_init_host, port_layout.metrics_port
+                ).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
 

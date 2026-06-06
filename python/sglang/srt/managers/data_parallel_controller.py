@@ -48,6 +48,7 @@ from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
+    get_dp_attention_worker_port_broadcast_addr,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -321,18 +322,12 @@ class DataParallelController:
             List of worker ports (same on all nodes after broadcast).
         """
         # Determine the endpoint for inter-node communication
-        if server_args.dist_init_addr is None:
-            na = NetworkAddress(
-                server_args.host or "127.0.0.1",
-                server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
-            )
-        else:
-            na = NetworkAddress.parse(server_args.dist_init_addr)
-            na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
+        na = get_dp_attention_worker_port_broadcast_addr(server_args)
         endpoint = na.to_tcp()
         logger.info(
             "DP-attention worker-port broadcast endpoint: "
-            "node_rank=%s nnodes=%s dist_init_addr=%s endpoint=%s worker_ports=%s",
+            "node_rank=%s nnodes=%s dist_init_addr=%s "
+            "endpoint=%s worker_ports=%s",
             server_args.node_rank,
             server_args.nnodes,
             server_args.dist_init_addr,

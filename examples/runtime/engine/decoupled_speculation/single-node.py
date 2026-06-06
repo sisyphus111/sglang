@@ -29,6 +29,7 @@ except ImportError:
 
 LOCAL_HOST = "127.0.0.1"
 DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
+DPA_ENV_FIXED_PORT_COUNT = 6
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,6 +166,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--target-use-env-ports",
+        action="store_true",
+        help=(
+            "Use PORT1..PORT30 as the target engine's available port pool. "
+            "If unset, the legacy dist-init-derived ports are used."
+        ),
+    )
+    parser.add_argument(
         "--target-ep-size",
         type=int,
         default=None,
@@ -252,7 +261,10 @@ def parse_args() -> argparse.Namespace:
             "result/control endpoints are bound dynamically by SGLang. This "
             "cannot be combined with --dist-init-addr or --dist-init-port. "
             "With --target-enable-dp-attention, each dist-init allocation "
-            "consumes a contiguous 6-port block."
+            "consumes a contiguous 6-port block in the legacy "
+            "dist-init-derived port mode; with --target-use-env-ports, only "
+            "the dist-init ports are consumed here and the fixed DP-attention "
+            "ports come from PORT1..PORT30."
         ),
     )
     parser.add_argument(
@@ -388,8 +400,25 @@ def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
     return ports
 
 
+def _target_uses_env_available_ports(args: argparse.Namespace) -> bool:
+    return args.target_use_env_ports
+
+
+def _target_dp_attention_uses_dist_init_derived_ports(
+    args: argparse.Namespace,
+) -> bool:
+    return (
+        args.target_enable_dp_attention
+        and not args.target_use_env_ports
+    )
+
+
 def _dist_init_port_stride(args: argparse.Namespace) -> int:
-    return DPA_DIST_INIT_PORT_BLOCK_SIZE if args.target_enable_dp_attention else 1
+    return (
+        DPA_DIST_INIT_PORT_BLOCK_SIZE
+        if _target_dp_attention_uses_dist_init_derived_ports(args)
+        else 1
+    )
 
 
 def _reserved_port_block_bases(
@@ -517,6 +546,102 @@ def _allocate_local_ports(
         baseline_dist_init_addrs,
         None,
     )
+
+
+def _ports_from_dist_init_addrs(addrs: list[str]) -> set[int]:
+    ports: set[int] = set()
+    for addr in addrs:
+        port = _port_from_dist_init_addr(addr)
+        if port is not None:
+            ports.add(port)
+    return ports
+
+
+def _known_dist_init_ports(
+    args: argparse.Namespace,
+    *,
+    spec_dist_init_addr: str,
+    baseline_dist_init_addrs: dict[str, str],
+) -> set[int]:
+    ports = _ports_from_dist_init_addrs(
+        [spec_dist_init_addr, *baseline_dist_init_addrs.values()]
+    )
+    if ports:
+        return ports
+
+    base_port = args.dist_init_port
+    if base_port is None:
+        return ports
+
+    baseline_modes = common.resolve_baseline_modes(args.baseline)
+    port_stride = _dist_init_port_stride(args)
+    return {
+        base_port + slot * port_stride
+        for slot in range(1 + len(baseline_modes))
+    }
+
+
+def _numbered_env_ports(
+    *,
+    prefix: str = "PORT",
+    max_count: int = 30,
+) -> list[int]:
+    ports: list[int] = []
+    for index in range(1, max_count + 1):
+        env_name = f"{prefix}{index}"
+        env_value = os.environ.get(env_name)
+        if not env_value:
+            continue
+        try:
+            port = int(env_value)
+        except ValueError as exc:
+            raise ValueError(f"invalid {env_name}: {env_value!r}") from exc
+        if port <= 0 or port > 65535:
+            raise ValueError(f"{env_name} out of range: {port}")
+        ports.append(port)
+    if len(set(ports)) != len(ports):
+        raise ValueError(f"{prefix} environment ports must be unique: {ports}")
+    return ports
+
+
+def _select_target_available_ports(
+    args: argparse.Namespace,
+    *,
+    engine_slot: int,
+    avoid_ports: set[int],
+) -> list[int] | None:
+    if not (
+        args.target_enable_dp_attention and _target_uses_env_available_ports(args)
+    ):
+        return None
+    env_ports = _numbered_env_ports(prefix="PORT", max_count=30)
+    skipped_avoided_ports = [port for port in env_ports if port in avoid_ports]
+    candidate_ports = [port for port in env_ports if port not in avoid_ports]
+    usable_ports = [
+        port for port in candidate_ports if common.is_tcp_port_available(port)
+    ]
+    skipped_unavailable_ports = [
+        port for port in candidate_ports if port not in usable_ports
+    ]
+    if skipped_unavailable_ports or skipped_avoided_ports:
+        print(
+            "target_env_ports_skipped: "
+            f"unavailable={skipped_unavailable_ports} "
+            f"reserved={skipped_avoided_ports}",
+            flush=True,
+        )
+    start = engine_slot * DPA_ENV_FIXED_PORT_COUNT
+    selected_ports = usable_ports[start : start + DPA_ENV_FIXED_PORT_COUNT]
+    if len(selected_ports) != DPA_ENV_FIXED_PORT_COUNT:
+        raise ValueError(
+            "--target-use-env-ports needs "
+            f"{DPA_ENV_FIXED_PORT_COUNT} PORT env ports for engine slot "
+            f"{engine_slot}; env_ports={env_ports} "
+            f"available_ports={usable_ports} "
+            f"unavailable={skipped_unavailable_ports} "
+            f"reserved={skipped_avoided_ports}"
+        )
+    return selected_ports
 
 
 def get_target_engine_tp_size(args: argparse.Namespace) -> int:
@@ -890,6 +1015,7 @@ def create_verifier_engine(
     args: argparse.Namespace,
     *,
     dist_init_addr: str,
+    available_ports: list[int] | None = None,
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(args.target_gpus)
     for name, value in get_decoupled_spec_actor_env_vars().items():
@@ -913,6 +1039,8 @@ def create_verifier_engine(
     )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
+        if available_ports is not None:
+            engine_kwargs["available_ports"] = available_ports
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -920,7 +1048,12 @@ def create_verifier_engine(
     return sgl.Engine(**engine_kwargs)
 
 
-def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
+def create_decode_engine(
+    args: argparse.Namespace,
+    *,
+    dist_init_addr: str,
+    available_ports: list[int] | None = None,
+):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(args.target_gpus)
 
     import sglang as sgl
@@ -937,6 +1070,8 @@ def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
     )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
+        if available_ports is not None:
+            engine_kwargs["available_ports"] = available_ports
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -944,7 +1079,12 @@ def create_decode_engine(args: argparse.Namespace, *, dist_init_addr: str):
     return sgl.Engine(**engine_kwargs)
 
 
-def create_mtp_engine(args: argparse.Namespace, *, dist_init_addr: str):
+def create_mtp_engine(
+    args: argparse.Namespace,
+    *,
+    dist_init_addr: str,
+    available_ports: list[int] | None = None,
+):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(args.target_gpus)
 
     import sglang as sgl
@@ -967,6 +1107,8 @@ def create_mtp_engine(args: argparse.Namespace, *, dist_init_addr: str):
     )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
+        if available_ports is not None:
+            engine_kwargs["available_ports"] = available_ports
     if args.target_ep_size is not None:
         engine_kwargs["ep_size"] = args.target_ep_size
     if args.target_moe_a2a_backend is not None:
@@ -1032,6 +1174,24 @@ def main() -> None:
         args,
         num_verifiers=num_verifiers,
     )
+    available_port_avoid_ports = _known_dist_init_ports(
+        args,
+        spec_dist_init_addr=spec_dist_init_addr,
+        baseline_dist_init_addrs=baseline_dist_init_addrs,
+    )
+    spec_available_ports = _select_target_available_ports(
+        args,
+        engine_slot=0,
+        avoid_ports=available_port_avoid_ports,
+    )
+    baseline_available_ports = {
+        mode: _select_target_available_ports(
+            args,
+            engine_slot=1 + mode_index,
+            avoid_ports=available_port_avoid_ports,
+        )
+        for mode_index, mode in enumerate(common.resolve_baseline_modes(args.baseline))
+    }
 
     print("local_decoupled_spec_topology:", flush=True)
     print(f"  target_gpus: {args.target_gpus}", flush=True)
@@ -1048,6 +1208,16 @@ def main() -> None:
     print(f"  verifier_dist_init_addr: {spec_dist_init_addr}", flush=True)
     if baseline_dist_init_addrs:
         print(f"  baseline_dist_init_addrs: {baseline_dist_init_addrs}", flush=True)
+    if spec_available_ports is not None:
+        print(
+            f"  verifier_available_ports: {spec_available_ports}",
+            flush=True,
+        )
+    if any(ports is not None for ports in baseline_available_ports.values()):
+        print(
+            f"  baseline_available_ports: {baseline_available_ports}",
+            flush=True,
+        )
 
     draft_processes: list[mp.Process] = []
     draft_stop_senders = None
@@ -1065,6 +1235,7 @@ def main() -> None:
         verifier_engine = create_verifier_engine(
             args,
             dist_init_addr=spec_dist_init_addr,
+            available_ports=spec_available_ports,
         )
         verifier_result_endpoints = _sorted_bind_endpoints(
             verifier_engine.get_decoupled_spec_endpoint_infos(), role="verifier"
@@ -1110,11 +1281,13 @@ def main() -> None:
                 baseline_engine = create_decode_engine(
                     args,
                     dist_init_addr=baseline_dist_init_addr,
+                    available_ports=baseline_available_ports[baseline_mode],
                 )
             elif baseline_mode == "mtp":
                 baseline_engine = create_mtp_engine(
                     args,
                     dist_init_addr=baseline_dist_init_addr,
+                    available_ports=baseline_available_ports[baseline_mode],
                 )
             else:
                 raise ValueError(f"Unsupported baseline: {baseline_mode}")

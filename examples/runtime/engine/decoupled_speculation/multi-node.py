@@ -28,6 +28,7 @@ except ImportError:
 DEFAULT_RAY_NAMESPACE = "dspec"
 DEFAULT_PROMPT_COLUMN_CANDIDATES = common.DEFAULT_PROMPT_COLUMN_CANDIDATES
 DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
+DPA_ENV_FIXED_PORT_COUNT = 6
 _RUNTIME_IMPORTS_READY = False
 
 
@@ -205,6 +206,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--target-use-env-ports",
+        action="store_true",
+        help=(
+            "Use PORT1..PORT30 from each verifier replica's rank-0 node as "
+            "the target engine's available port pool. If unset, the legacy "
+            "dist-init-derived ports are used."
+        ),
+    )
+    parser.add_argument(
         "--target-ep-size",
         type=int,
         default=None,
@@ -299,7 +309,11 @@ def parse_args() -> argparse.Namespace:
             "ports. Decoupled result/control endpoints are bound dynamically by "
             "SGLang. This cannot be combined with --dist-init-addr or "
             "--dist-init-port. With --target-enable-dp-attention, each dist-init "
-            "allocation consumes a contiguous 6-port block."
+            "allocation consumes a contiguous 6-port block in the legacy "
+            "dist-init-derived port mode; with --target-use-env-ports, only "
+            "the dist-init ports "
+            "are consumed here and the fixed DP-attention ports come from "
+            "PORT1..PORT30 on the verifier rank-0 node."
         ),
     )
     parser.add_argument(
@@ -409,8 +423,25 @@ def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
     return ports
 
 
+def _target_uses_env_available_ports(args: argparse.Namespace) -> bool:
+    return args.target_use_env_ports
+
+
+def _target_dp_attention_uses_dist_init_derived_ports(
+    args: argparse.Namespace,
+) -> bool:
+    return (
+        args.target_enable_dp_attention
+        and not args.target_use_env_ports
+    )
+
+
 def _dist_init_port_stride(args: argparse.Namespace) -> int:
-    return DPA_DIST_INIT_PORT_BLOCK_SIZE if args.target_enable_dp_attention else 1
+    return (
+        DPA_DIST_INIT_PORT_BLOCK_SIZE
+        if _target_dp_attention_uses_dist_init_derived_ports(args)
+        else 1
+    )
 
 
 def _reserved_port_block_bases(
@@ -874,6 +905,102 @@ def _get_pg_bundle_hosts(pg, num_bundles: int) -> list[str]:
     return hosts
 
 
+def _ports_from_dist_init_addrs(addrs: list[str | None]) -> set[int]:
+    ports: set[int] = set()
+    for addr in addrs:
+        if addr is None:
+            continue
+        _, port = _parse_host_port(addr)
+        if port is not None:
+            ports.add(port)
+    return ports
+
+
+def _known_dist_init_ports(
+    args: argparse.Namespace,
+    *,
+    spec_reserved_ports: list[int],
+    baseline_reserved_ports: dict[str, list[int]],
+) -> set[int]:
+    ports = set(spec_reserved_ports)
+    for mode_ports in baseline_reserved_ports.values():
+        ports.update(mode_ports)
+    if ports:
+        return ports
+
+    host, parsed_port = (
+        _parse_host_port(args.dist_init_addr)
+        if args.dist_init_addr is not None
+        else ("", None)
+    )
+    del host
+    base_port = args.dist_init_port if args.dist_init_port is not None else parsed_port
+    if base_port is None:
+        return ports
+
+    baseline_modes = common.resolve_baseline_modes(args.baseline)
+    num_slots = args.num_verifier_replicas * (1 + len(baseline_modes))
+    port_stride = _dist_init_port_stride(args)
+    return {base_port + slot * port_stride for slot in range(num_slots)}
+
+
+def _get_target_available_ports_from_pg(
+    args: argparse.Namespace,
+    pg,
+    *,
+    engine_slot: int,
+    avoid_ports: set[int],
+) -> list[int] | None:
+    if not (
+        args.target_enable_dp_attention and _target_uses_env_available_ports(args)
+    ):
+        return None
+
+    scheduling_strategy = PlacementGroupSchedulingStrategy(
+        placement_group=pg,
+        placement_group_bundle_index=0,
+    )
+    actor = PortActor.options(
+        num_cpus=0,
+        scheduling_strategy=scheduling_strategy,
+    ).remote()
+    try:
+        port_info = ray.get(
+            actor.get_available_numbered_env_port_info.remote(
+                prefix="PORT",
+                max_count=30,
+                avoid_ports=sorted(avoid_ports),
+            )
+        )
+    finally:
+        ray.kill(actor, no_restart=True)
+
+    env_ports = port_info["env_ports"]
+    usable_ports = port_info["available_ports"]
+    skipped_unavailable_ports = port_info["skipped_unavailable_ports"]
+    skipped_avoided_ports = port_info["skipped_avoided_ports"]
+    if skipped_unavailable_ports or skipped_avoided_ports:
+        print(
+            "target_env_ports_skipped: "
+            f"node={port_info['host']} "
+            f"unavailable={skipped_unavailable_ports} "
+            f"reserved={skipped_avoided_ports}",
+            flush=True,
+        )
+    start = engine_slot * DPA_ENV_FIXED_PORT_COUNT
+    selected_ports = usable_ports[start : start + DPA_ENV_FIXED_PORT_COUNT]
+    if len(selected_ports) != DPA_ENV_FIXED_PORT_COUNT:
+        raise ValueError(
+            "--target-use-env-ports needs "
+            f"{DPA_ENV_FIXED_PORT_COUNT} PORT env ports for engine slot "
+            f"{engine_slot} on rank-0 node {port_info['host']}; "
+            f"env_ports={env_ports} available_ports={usable_ports} "
+            f"unavailable={skipped_unavailable_ports} "
+            f"reserved={skipped_avoided_ports}"
+        )
+    return selected_ports
+
+
 def print_decoupled_spec_layout(
     *,
     args: argparse.Namespace,
@@ -943,6 +1070,7 @@ def launch_target_actors(
     target_gpus_per_node: int,
     pg,
     rank_base: int = 0,
+    available_ports: list[int] | None = None,
 ) -> list[Any]:
     actor_env_vars = get_decoupled_spec_actor_env_vars()
     actors = []
@@ -975,6 +1103,7 @@ def launch_target_actors(
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,
             log_level="info",
+            available_ports=available_ports,
             dist_init_port_reservation_actor=(
                 dist_init_port_reservation_actor if node_rank == 0 else None
             ),
@@ -1053,6 +1182,8 @@ def run_mode(
     pgs: list[Any] | None = None,
     topology: Any | None = None,
     include_output_text: bool = True,
+    available_port_slot_base: int = 0,
+    available_port_avoid_ports: set[int] | None = None,
 ) -> ModeMetrics:
     target_actor_groups: list[list[Any]] = []
     owns_pgs = pgs is None
@@ -1088,7 +1219,30 @@ def run_mode(
                 target_gpus_per_node,
             )
 
+        available_port_avoid_ports = set(available_port_avoid_ports or ())
+        available_port_avoid_ports.update(
+            _ports_from_dist_init_addrs(dist_init_addrs)
+        )
+        available_ports_by_replica = []
         for replica_index in range(num_replicas):
+            available_ports_by_replica.append(
+                _get_target_available_ports_from_pg(
+                    args,
+                    pgs[replica_index],
+                    engine_slot=available_port_slot_base + replica_index,
+                    avoid_ports=available_port_avoid_ports,
+                )
+            )
+
+        for replica_index in range(num_replicas):
+            available_ports = available_ports_by_replica[replica_index]
+            if available_ports is not None:
+                print(
+                    "target_available_ports: "
+                    f"mode={mode} replica={replica_index} "
+                    f"ports={available_ports}",
+                    flush=True,
+                )
             actors = launch_target_actors(
                 args=args,
                 mode=mode,
@@ -1100,6 +1254,7 @@ def run_mode(
                 target_gpus_per_node=target_gpus_per_node,
                 pg=pgs[replica_index],
                 rank_base=replica_index * args.target_dp_size,
+                available_ports=available_ports,
             )
             target_actor_groups.append(actors)
 
@@ -1226,6 +1381,17 @@ def main() -> None:
         ) = _split_reserved_ports(args)
         if reserved_ports is not None:
             print(f"reserved_ports: {reserved_ports}", flush=True)
+        available_port_avoid_ports = _known_dist_init_ports(
+            args,
+            spec_reserved_ports=spec_reserved_ports,
+            baseline_reserved_ports=baseline_reserved_ports,
+        )
+        if args.target_enable_dp_attention and _target_uses_env_available_ports(args):
+            print(
+                "target_use_env_ports: true "
+                f"avoid_dist_init_ports={sorted(available_port_avoid_ports)}",
+                flush=True,
+            )
         spec_dist_init_reservations = [
             reserve_dist_init_addr_from_pg(
                 args,
@@ -1275,6 +1441,8 @@ def main() -> None:
             pgs=spec_pgs,
             topology=topology,
             include_output_text=True,
+            available_port_slot_base=0,
+            available_port_avoid_ports=available_port_avoid_ports,
         )
         shutdown_actors(draft_actors)
         draft_actors = []
@@ -1323,6 +1491,8 @@ def main() -> None:
                     ),
                     pgs=spec_pgs,
                     include_output_text=True,
+                    available_port_slot_base=baseline_offset,
+                    available_port_avoid_ports=available_port_avoid_ports,
                 )
             )
 

@@ -24,9 +24,15 @@ For verifier DP attention in either script, set `--target-dp-size` and
 SGLang engine `tp_size` becomes `target_tp_size * target_dp_size`. For example,
 `--target-tp-size 8 --target-dp-size 4 --enable-dp-attention --target-ep-size
 32` launches a 32-GPU verifier engine with DP attention.
-DP attention uses TCP for internal SGLang IPC. When manually supplying
-`--dist-init-port` or `--reserved-ports`, leave a contiguous 6-port block for
-each verifier or baseline engine instance.
+DP attention uses TCP for internal SGLang IPC. Without an available port pool,
+the legacy path derives those TCP ports from `dist-init`, so manually supplied
+`--dist-init-port` or `--reserved-ports` values should leave a contiguous
+6-port block for each verifier or baseline engine instance. On platforms that
+expose usable ports as `PORT1`, `PORT2`, and so on, pass `--target-use-env-ports`;
+the launcher reads those non-contiguous
+ports from each verifier rank-0 node and passes them to SGLang as the target
+engine's available port pool. Ports already bound by the local Ray runtime or
+reserved for dist-init are skipped before the pool is sliced for each engine.
 
 Common modes:
 
