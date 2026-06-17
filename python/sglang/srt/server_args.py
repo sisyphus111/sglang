@@ -3655,9 +3655,19 @@ class ServerArgs:
                 )
 
             if self.max_running_requests is None:
-                self.max_running_requests = 48
+                # Keep this at 64 rather than the older 48 for MTP-style
+                # EAGLE/NextN drafts on hybrid models such as Qwen3.5. With DP
+                # attention, max_running_requests is divided by dp_size when
+                # sizing the local req/mamba pools; 48 with dp_size=4 leaves 12
+                # local slots. CUDA graph capture then rounds the capture bs up
+                # to the attention-TP alignment (e.g. 16), while GDN/Mamba
+                # speculative intermediate-state buffers are still sized to 12,
+                # causing target-verify capture to go out of bounds in the fused
+                # GDN recurrent kernel. 64 gives 16 local slots for dp_size=4
+                # and keeps the captured bs within those buffers.
+                self.max_running_requests = 64
                 logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                    "Max running requests is reset to 64 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
             spec_v1_reason = None
