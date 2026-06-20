@@ -518,6 +518,8 @@ class SchedulerMetricsMixin:
             f"#queue-req: {len(self.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
+        if self.spec_algorithm.is_decoupled_draft():
+            msg += f"#sleeping-req: {len(self.draft_sleeping_reqs)}, "
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -673,6 +675,8 @@ class SchedulerMetricsMixin:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        if self.spec_algorithm.is_decoupled_draft():
+            msg += f"#sleeping-req: {len(self.draft_sleeping_reqs)}, "
 
         if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             spec_accept_length = 0
