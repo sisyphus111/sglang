@@ -226,6 +226,17 @@ def parse_args() -> argparse.Namespace:
         help="MoE A2A backend for the target/verifier engine, e.g. deepep.",
     )
     parser.add_argument("--draft-tp-size", type=int, default=1)
+    parser.add_argument(
+        "--max-running-requests",
+        "--max-running-reqs",
+        dest="max_running_requests",
+        type=int,
+        default=None,
+        help=(
+            "Override SGLang max_running_requests for the decoupled verifier, "
+            "drafters, and decode/MTP baseline engines."
+        ),
+    )
     parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
@@ -691,6 +702,8 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("target-ep-size must be positive when set")
     if args.draft_tp_size <= 0:
         raise ValueError("draft-tp-size must be positive")
+    if args.max_running_requests is not None and args.max_running_requests <= 0:
+        raise ValueError("max-running-requests must be positive when set")
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
     if args.draft_ngpus is not None and args.draft_ngpus <= 0:
@@ -1104,6 +1117,7 @@ def launch_target_actors(
             spec_trace_dir=args.spec_trace_dir,
             log_level="info",
             available_ports=available_ports,
+            max_running_requests=args.max_running_requests,
             dist_init_port_reservation_actor=(
                 dist_init_port_reservation_actor if node_rank == 0 else None
             ),

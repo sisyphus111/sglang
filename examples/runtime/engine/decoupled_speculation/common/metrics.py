@@ -433,6 +433,7 @@ def build_result(
             "context_length": args.context_length,
             "max_new_tokens": args.context_length,
             "max_prompt_length": args.max_prompt_length,
+            "max_running_requests": getattr(args, "max_running_requests", None),
             "target_model_path": args.target_model_path,
             "draft_model_path": args.draft_model_path,
             "tokenizer_path": args.tokenizer_path or args.target_model_path,

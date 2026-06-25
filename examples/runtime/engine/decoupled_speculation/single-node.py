@@ -185,6 +185,17 @@ def parse_args() -> argparse.Namespace:
         help="MoE A2A backend for the target/verifier engine, e.g. deepep.",
     )
     parser.add_argument("--draft-tp-size", type=int, default=1)
+    parser.add_argument(
+        "--max-running-requests",
+        "--max-running-reqs",
+        dest="max_running_requests",
+        type=int,
+        default=None,
+        help=(
+            "Override SGLang max_running_requests for the decoupled verifier, "
+            "drafters, and decode/MTP baseline engines."
+        ),
+    )
     parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
@@ -668,6 +679,8 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("target-ep-size must be positive when set")
     if args.draft_tp_size <= 0:
         raise ValueError("draft-tp-size must be positive")
+    if args.max_running_requests is not None and args.max_running_requests <= 0:
+        raise ValueError("max-running-requests must be positive when set")
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
     if args.draft_ngpus is not None and args.draft_ngpus <= 0:
@@ -737,6 +750,7 @@ def run_draft_engine_process(
     model_path: str,
     tp_size: int,
     speculative_num_steps: int,
+    max_running_requests: int | None,
     deterministic: bool,
     spec_trace_dir: str | None,
     ready_queue,
@@ -758,6 +772,8 @@ def run_draft_engine_process(
             spec_trace_dir=spec_trace_dir,
             decoupled_spec_rank_base=rank,
         )
+        if max_running_requests is not None:
+            engine_kwargs["max_running_requests"] = max_running_requests
         engine = sgl.Engine(**engine_kwargs)
         endpoint_infos = engine.get_decoupled_spec_endpoint_infos()
         ready_queue.put(
@@ -914,6 +930,7 @@ def start_draft_engines(
                     model_path=args.draft_model_path,
                     tp_size=args.draft_tp_size,
                     speculative_num_steps=args.num_speculative_steps,
+                    max_running_requests=args.max_running_requests,
                     deterministic=args.deterministic,
                     spec_trace_dir=args.spec_trace_dir,
                     ready_queue=ready_queue,
@@ -1037,6 +1054,8 @@ def create_verifier_engine(
         log_level="info",
         decoupled_spec_rank_base=0,
     )
+    if args.max_running_requests is not None:
+        engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:
@@ -1068,6 +1087,8 @@ def create_decode_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.max_running_requests is not None:
+        engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:
@@ -1105,6 +1126,8 @@ def create_mtp_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.max_running_requests is not None:
+        engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:

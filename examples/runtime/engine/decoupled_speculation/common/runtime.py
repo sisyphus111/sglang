@@ -452,6 +452,7 @@ class DraftActor:
         tp_size: int,
         speculative_num_steps: int,
         rank_base: int,
+        max_running_requests: int | None = None,
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
     ):
@@ -469,6 +470,8 @@ class DraftActor:
             enable_deterministic_inference=deterministic,
             spec_trace_dir=spec_trace_dir,
         )
+        if max_running_requests is not None:
+            engine_kwargs["max_running_requests"] = max_running_requests
         self.engine = sgl.Engine(**engine_kwargs)
         self.endpoint_infos = self.engine.get_decoupled_spec_endpoint_infos()
 
@@ -519,6 +522,7 @@ def launch_draft_actors(
             tp_size=args.draft_tp_size,
             speculative_num_steps=args.num_speculative_steps,
             rank_base=rank,
+            max_running_requests=getattr(args, "max_running_requests", None),
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,
         )
@@ -595,6 +599,7 @@ class TargetActor:
         spec_trace_dir: str | None = None,
         log_level: str | None = None,
         available_ports: list[int] | None = None,
+        max_running_requests: int | None = None,
         dist_init_port_reservation_actor: Any | None = None,
     ):
         """Pin GPUs and initialize the target engine for one node rank."""
@@ -616,6 +621,8 @@ class TargetActor:
         )
         if log_level is not None:
             engine_kwargs["log_level"] = log_level
+        if max_running_requests is not None:
+            engine_kwargs["max_running_requests"] = max_running_requests
         if ep_size is not None:
             engine_kwargs["ep_size"] = ep_size
         if moe_a2a_backend is not None:
