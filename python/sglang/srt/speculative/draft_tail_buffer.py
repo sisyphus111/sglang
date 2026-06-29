@@ -353,12 +353,6 @@ class DraftTailBuffer:
         token_id = int(output.new_token_id)
         src_drafter_rank = int(output.src_drafter_rank)
         dst_verifier_rank = int(output.dst_verifier_rank)
-        batch_request_ids = [item.request_id for item in batch.outputs]
-        batch_base_committed_lens = [
-            int(item.base_committed_len) for item in batch.outputs
-        ]
-        batch_new_token_pos = [int(item.new_token_pos) for item in batch.outputs]
-        batch_new_token_id = [int(item.new_token_id) for item in batch.outputs]
 
         if dst_verifier_rank != self.verifier_rank:
             raise RuntimeError(
@@ -370,10 +364,7 @@ class DraftTailBuffer:
                 f"base_committed_len={base_committed_len} "
                 f"token_pos={token_pos} "
                 f"token_id={token_id} "
-                f"batch_request_ids={batch_request_ids} "
-                f"batch_base_committed_lens={batch_base_committed_lens} "
-                f"batch_new_token_pos={batch_new_token_pos} "
-                f"batch_new_token_id={batch_new_token_id}"
+                f"{self._format_batch_debug_fields(batch)}"
             )
 
         state = self._states.get(request_id)
@@ -404,10 +395,7 @@ class DraftTailBuffer:
                 f"tail_len_before={tail_len_before} "
                 f"buffer_end_len={buffer_end_len} "
                 f"tail_tokens={list(state.tail_tokens)} "
-                f"batch_request_ids={batch_request_ids} "
-                f"batch_base_committed_lens={batch_base_committed_lens} "
-                f"batch_new_token_pos={batch_new_token_pos} "
-                f"batch_new_token_id={batch_new_token_id}"
+                f"{self._format_batch_debug_fields(batch)}"
             )
 
         pending_expected_len = len(state.pending_expected_tokens)
@@ -455,10 +443,7 @@ class DraftTailBuffer:
                 f"tail_len_before={tail_len_before} "
                 f"buffer_end_len={buffer_end_len} "
                 f"tail_tokens={list(state.tail_tokens)} "
-                f"batch_request_ids={batch_request_ids} "
-                f"batch_base_committed_lens={batch_base_committed_lens} "
-                f"batch_new_token_pos={batch_new_token_pos} "
-                f"batch_new_token_id={batch_new_token_id}"
+                f"{self._format_batch_debug_fields(batch)}"
             )
 
         if base_committed_len < can_accept_prefix_len:
@@ -485,10 +470,7 @@ class DraftTailBuffer:
                     f"tail_len_before={tail_len_before} "
                     f"buffer_end_len={buffer_end_len} "
                     f"tail_tokens={list(state.tail_tokens)} "
-                    f"batch_request_ids={batch_request_ids} "
-                    f"batch_base_committed_lens={batch_base_committed_lens} "
-                    f"batch_new_token_pos={batch_new_token_pos} "
-                    f"batch_new_token_id={batch_new_token_id}"
+                    f"{self._format_batch_debug_fields(batch)}"
                 )
             return "duplicate"
 
@@ -508,15 +490,23 @@ class DraftTailBuffer:
                     f"tail_len_before={tail_len_before} "
                     f"buffer_end_len={buffer_end_len} "
                     f"tail_tokens={list(state.tail_tokens)} "
-                    f"batch_request_ids={batch_request_ids} "
-                    f"batch_base_committed_lens={batch_base_committed_lens} "
-                    f"batch_new_token_pos={batch_new_token_pos} "
-                    f"batch_new_token_id={batch_new_token_id}"
+                    f"{self._format_batch_debug_fields(batch)}"
                 )
             return "stale_gap"
 
         state.tail_tokens.append(token_id)
         return "appended"
+
+    def _format_batch_debug_fields(self, batch: DraftTailStreamOutputBatch) -> str:
+        return (
+            f"batch_request_ids={[item.request_id for item in batch.outputs]} "
+            f"batch_base_committed_lens="
+            f"{[int(item.base_committed_len) for item in batch.outputs]} "
+            f"batch_new_token_pos="
+            f"{[int(item.new_token_pos) for item in batch.outputs]} "
+            f"batch_new_token_id="
+            f"{[int(item.new_token_id) for item in batch.outputs]}"
+        )
 
     def _new_append_stats(self, batch: DraftTailStreamOutputBatch) -> dict:
         request_ids: list[str] = []
