@@ -841,6 +841,13 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def maybe_run_spec_startup_profiling(self) -> None:
+        """Startup spec cost-table profiling (no-op unless worker overrides)."""
+        dw = getattr(self, "draft_worker", None)
+        run_startup_spec_profiling = getattr(dw, "run_startup_spec_profiling", None)
+        if run_startup_spec_profiling is not None:
+            run_startup_spec_profiling(self.tree_cache)
+
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
         if (
@@ -4306,6 +4313,8 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        scheduler.maybe_run_spec_startup_profiling()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
