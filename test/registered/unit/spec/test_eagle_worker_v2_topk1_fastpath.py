@@ -208,7 +208,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         new_extend_backend = object()
         worker, dw = self._make_adaptive_worker(object())
 
-        state = SpecRuntimeState(
+        state = SpecRuntimeState.for_eagle(
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             draft_attn_backend=object(),

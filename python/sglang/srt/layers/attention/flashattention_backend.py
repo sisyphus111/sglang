@@ -495,22 +495,18 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                draft_token_num = getattr(
-                    forward_batch.spec_info,
-                    "draft_token_num",
-                    self.speculative_num_draft_tokens,
-                )
                 metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + draft_token_num
+                    forward_batch.seq_lens + self.speculative_num_draft_tokens
                 ).to(torch.int32)
-                metadata.max_seq_len_q = draft_token_num
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item() + draft_token_num
+                    forward_batch.seq_lens_cpu.max().item()
+                    + self.speculative_num_draft_tokens
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    batch_size * draft_token_num + 1,
-                    draft_token_num,
+                    batch_size * self.speculative_num_draft_tokens + 1,
+                    self.speculative_num_draft_tokens,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1754,8 +1750,12 @@ class FlashAttentionBackend(AttentionBackend):
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
-                "cu_seqlens_q": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
+                "cu_seqlens_q": torch.arange(
+                    0,
+                    max_bs * self.speculative_num_draft_tokens + 1,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
                 "cu_seqlens_k": torch.zeros(
                     max_bs + 1, dtype=torch.int32, device=self.device
@@ -2004,23 +2004,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                num_tokens_per_bs = num_tokens // bs
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
                     : bs + 1
                 ]
-                metadata.cu_seqlens_q.copy_(
-                    torch.arange(
-                        0,
-                        bs * num_tokens_per_bs + 1,
-                        step=num_tokens_per_bs,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                )
                 metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                     : (bs + 1)
                 ]
@@ -2301,22 +2291,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
-                draft_token_num = getattr(
-                    spec_info, "draft_token_num", self.speculative_num_draft_tokens
-                )
                 metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_((seq_lens + draft_token_num))
+                metadata.cache_seqlens_int32.copy_(
+                    (seq_lens + self.speculative_num_draft_tokens)
+                )
 
-                metadata.max_seq_len_q = draft_token_num
-                metadata.max_seq_len_k = seq_lens_cpu.max().item() + draft_token_num
-                metadata.cu_seqlens_q.copy_(
-                    torch.arange(
-                        0,
-                        bs * draft_token_num + 1,
-                        step=draft_token_num,
-                        dtype=torch.int32,
-                        device=device,
-                    )
+                metadata.max_seq_len_k = (
+                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
                 )
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)

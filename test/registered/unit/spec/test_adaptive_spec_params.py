@@ -1,10 +1,13 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    build_decoupled_verify_adaptive_config,
+    resolve_decoupled_verify_adaptive_config_from_server_args,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
@@ -391,6 +394,21 @@ class TestBatchSizeRouting(unittest.TestCase):
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
 
+    def test_decoupled_auto_routes_static_steps_by_graph_bs(self):
+        config = build_decoupled_verify_adaptive_config(
+            max_running_requests=64,
+            target_verify_token_budget=65,
+            cuda_graph_bs=[1, 8, 32, 64],
+        )
+        params = AdaptiveSpeculativeParams(initial_steps=0, config=config)
+        params.set_cuda_graph_bs([1, 8, 32, 64])
+
+        self.assertEqual(params.get_steps_for_batch(1), 63)
+        self.assertEqual(params.get_steps_for_batch(2), 7)
+        self.assertEqual(params.get_steps_for_batch(17), 1)
+        self.assertEqual(params.get_steps_for_batch(33), 0)
+        self.assertEqual(params.cuda_graph_bs_for_step(63), [1])
+
 
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):
@@ -418,6 +436,40 @@ class TestResolveCandidateSteps(unittest.TestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
+
+    def test_decoupled_auto_config_from_budget(self):
+        config = build_decoupled_verify_adaptive_config(
+            max_running_requests=64,
+            target_verify_token_budget=65,
+            cuda_graph_bs=[1, 8, 32, 64],
+        )
+
+        self.assertEqual(config["1"]["candidate_steps"], [63])
+        self.assertEqual(config["8"]["candidate_steps"], [7])
+        self.assertEqual(config["32"]["candidate_steps"], [1])
+        self.assertEqual(config["64"]["candidate_steps"], [0])
+        self.assertEqual(
+            resolve_candidate_steps_from_config(config=config), [0, 1, 7, 63]
+        )
+
+    def test_decoupled_auto_server_args_filters_configured_graph_bs(self):
+        args = SimpleNamespace(
+            speculative_adaptive_config=None,
+            max_running_requests=64,
+            decoupled_spec_target_verify_token_budget=65,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[1, 8, 32, 128])
+            ),
+            cuda_graph_bs_decode=None,
+        )
+
+        config = resolve_decoupled_verify_adaptive_config_from_server_args(args)
+
+        self.assertEqual(sorted(config), ["1", "32", "64", "8"])
+        self.assertEqual(config["1"]["candidate_steps"], [63])
+        self.assertEqual(config["8"]["candidate_steps"], [7])
+        self.assertEqual(config["32"]["candidate_steps"], [1])
+        self.assertEqual(config["64"]["candidate_steps"], [0])
 
 
 if __name__ == "__main__":

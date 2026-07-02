@@ -49,10 +49,13 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
+    is_decoupled_verify = server_args.speculative_algorithm == "DECOUPLED_VERIFY"
+    if is_decoupled_verify:
+        return None
     if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DECOUPLED_VERIFY are supported)"
         )
     if (
         server_args.speculative_eagle_topk is not None
@@ -85,19 +88,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def _load_adaptive_config(
-    cfg_path: str | None,
-) -> tuple[dict, dict[int, dict]]:
-    """Load and validate adaptive config.
-
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
-    """
-    if cfg_path is not None:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-    else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
-
+def _validate_adaptive_config(cfg: dict) -> tuple[dict, dict[int, dict]]:
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
         if not key.isdigit():
@@ -124,15 +115,150 @@ def _load_adaptive_config(
     return cfg, bs_entries
 
 
+def _load_adaptive_config(cfg_path: str | None) -> tuple[dict, dict[int, dict]]:
+    """Load and validate adaptive config from a file, or the EAGLE default."""
+    if cfg_path is not None:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    else:
+        cfg = DEFAULT_ADAPTIVE_CONFIG
+    return _validate_adaptive_config(cfg)
+
+
+def _resolve_adaptive_config(
+    cfg_path: str | None = None,
+    config: dict | None = None,
+) -> tuple[dict, dict[int, dict]]:
+    if cfg_path is not None and config is not None:
+        raise ValueError("Only one of cfg_path or config can be provided.")
+    if config is not None:
+        return _validate_adaptive_config(config)
+    return _load_adaptive_config(cfg_path)
+
+
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
+    config: dict | None = None,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
-    _, bs_entries = _load_adaptive_config(cfg_path)
+    _, bs_entries = _resolve_adaptive_config(cfg_path=cfg_path, config=config)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
+
+
+def build_decoupled_verify_adaptive_config(
+    *,
+    max_running_requests: int,
+    target_verify_token_budget: int,
+    max_speculative_steps: int | None = None,
+    cuda_graph_bs: list[int] | None = None,
+) -> dict[str, dict]:
+    """Build static per-BS verify steps from the decoupled target budget."""
+    max_running_requests = int(max_running_requests)
+    if max_running_requests <= 0:
+        raise ValueError(
+            "max_running_requests must be positive for decoupled verifier "
+            f"adaptive config, got {max_running_requests}."
+        )
+
+    target_verify_token_budget = int(target_verify_token_budget)
+    if target_verify_token_budget <= 0:
+        raise ValueError(
+            "target_verify_token_budget must be positive for decoupled verifier "
+            f"adaptive config, got {target_verify_token_budget}."
+        )
+    if max_speculative_steps is not None:
+        max_speculative_steps = int(max_speculative_steps)
+        if max_speculative_steps < 0:
+            raise ValueError(
+                "max_speculative_steps must be non-negative for decoupled verifier "
+                f"adaptive config, got {max_speculative_steps}."
+            )
+
+    if cuda_graph_bs is None:
+        bs_values = [max_running_requests]
+    else:
+        bs_values = sorted({int(bs) for bs in cuda_graph_bs if int(bs) > 0})
+        if not bs_values:
+            raise ValueError(
+                "cuda_graph_bs must contain at least one positive batch size for "
+                "decoupled verifier adaptive config."
+            )
+
+    config: dict[str, dict] = {}
+    for bs in bs_values:
+        if target_verify_token_budget <= bs:
+            raise ValueError(
+                "decoupled verifier target verify token budget is too small: "
+                f"budget={target_verify_token_budget}, cuda_graph_bs={bs}. "
+                "Even zero-step verify requires budget > cuda_graph_bs."
+            )
+        budget_step_cap = max(0, (target_verify_token_budget - 1) // bs - 1)
+        max_step = (
+            budget_step_cap
+            if max_speculative_steps is None
+            else min(max_speculative_steps, budget_step_cap)
+        )
+        config[str(bs)] = {"candidate_steps": [max_step]}
+
+    return config
+
+
+def _resolve_server_args_decode_cuda_graph_bs(
+    server_args: ServerArgs,
+) -> list[int] | None:
+    cuda_graph_config = getattr(server_args, "cuda_graph_config", None)
+    decode_config = getattr(cuda_graph_config, "decode", None)
+    capture_bs = getattr(decode_config, "bs", None)
+    if not capture_bs:
+        capture_bs = getattr(server_args, "cuda_graph_bs_decode", None)
+    if not capture_bs:
+        return None
+
+    max_running_requests = int(getattr(server_args, "max_running_requests", 0) or 0)
+    if max_running_requests <= 0:
+        return sorted({int(bs) for bs in capture_bs if int(bs) > 0})
+
+    raw_bs = [int(bs) for bs in capture_bs if int(bs) > 0]
+    bs_values = [bs for bs in raw_bs if bs <= max_running_requests]
+    if raw_bs and max(raw_bs) > max_running_requests:
+        bs_values.append(max_running_requests)
+    return sorted(set(bs_values)) or [max_running_requests]
+
+
+def resolve_decoupled_verify_adaptive_config_from_server_args(
+    server_args: ServerArgs,
+    cuda_graph_bs: list[int] | None = None,
+) -> dict[str, dict]:
+    if getattr(server_args, "speculative_adaptive_config", None) is not None:
+        cfg, _ = _load_adaptive_config(server_args.speculative_adaptive_config)
+        return cfg
+
+    if cuda_graph_bs is None:
+        cuda_graph_bs = _resolve_server_args_decode_cuda_graph_bs(server_args)
+
+    return build_decoupled_verify_adaptive_config(
+        max_running_requests=server_args.max_running_requests,
+        target_verify_token_budget=server_args.decoupled_spec_target_verify_token_budget,
+        max_speculative_steps=getattr(
+            server_args,
+            "_decoupled_verify_max_speculative_steps",
+            getattr(server_args, "speculative_num_steps", None),
+        ),
+        cuda_graph_bs=cuda_graph_bs,
+    )
+
+
+def resolve_decoupled_verify_candidate_steps_from_server_args(
+    server_args: ServerArgs,
+    cuda_graph_bs: list[int] | None = None,
+) -> list[int]:
+    config = resolve_decoupled_verify_adaptive_config_from_server_args(
+        server_args, cuda_graph_bs=cuda_graph_bs
+    )
+    return resolve_candidate_steps_from_config(config=config)
 
 
 class AdaptiveStepSlot:
@@ -267,8 +393,9 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        config: dict | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = _resolve_adaptive_config(cfg_path=cfg_path, config=config)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None

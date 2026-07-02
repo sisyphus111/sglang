@@ -979,21 +979,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
-            strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
-            if strategy == "throughput_aware":
-                from sglang.srt.speculative.throughput_aware_controller import (
-                    ThroughputAwareAdaptiveController,
-                )
-
-                self.adaptive_controller = ThroughputAwareAdaptiveController(
-                    self,
-                    config_path=server_args.speculative_adaptive_config,
-                )
-            else:
-                self.adaptive_controller = AdaptiveController(
-                    self,
-                    config_path=server_args.speculative_adaptive_config,
-                )
+            self.adaptive_controller = AdaptiveController(
+                self,
+                config_path=server_args.speculative_adaptive_config,
+            )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1047,7 +1036,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
             ):
                 self.adaptive_controller.register(
-                    SpecRuntimeState(
+                    SpecRuntimeState.for_eagle(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
@@ -1073,10 +1062,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def draft_worker(self):
         return self._draft_worker
-
-    @property
-    def model_config(self):
-        return self._target_worker.model_runner.model_config
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
@@ -1312,7 +1297,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
 
-            state = SpecRuntimeState(
+            state = SpecRuntimeState.for_eagle(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
                 draft_attn_backend=self._draft_worker.draft_attn_backend,
@@ -1378,10 +1363,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.server_args.speculative_num_draft_tokens = (
             state.speculative_num_draft_tokens
         )
-
-    def run_startup_spec_profiling(self, tree_cache) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.run_profiling(tree_cache)
 
     @contextlib.contextmanager
     def _override_worker_state(

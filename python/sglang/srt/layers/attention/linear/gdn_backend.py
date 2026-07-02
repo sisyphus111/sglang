@@ -277,10 +277,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # Keep static device probes out of graph-captured forward paths.
+        # is_cpu() reaches platform.machine(), which TorchDynamo can fail to
+        # trace while capturing CUDA graphs:
+        # https://github.com/pytorch/pytorch/issues/186408
+        # No linked upstream PR was found when this workaround was added.
+        self.is_cpu_or_npu = is_cpu() or is_npu()
+        self.is_cuda_or_hip = is_cuda() or is_hip()
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        if not is_cpu() and not is_npu():
+        if not self.is_cpu_or_npu:
             assert (
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -321,7 +328,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_dst_indices = self.forward_metadata.mamba_cache_dst_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        if is_cpu() or is_npu():
+        if self.is_cpu_or_npu:
             if cache_src_indices is not cache_dst_indices and not torch.equal(
                 cache_src_indices, cache_dst_indices
             ):
@@ -473,7 +480,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if self.is_cuda_or_hip and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -523,7 +530,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if self.is_cpu_or_npu and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

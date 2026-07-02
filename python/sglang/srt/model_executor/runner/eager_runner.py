@@ -123,6 +123,10 @@ class EagerRunner(BaseRunner):
             enable_mamba_track=(
                 sa.enable_mamba_extra_buffer() and mr.spec_algorithm.is_none()
             ),
+            enable_mamba_cache_routing=(
+                mr.mambaish_config is not None
+                and mr.spec_algorithm.is_decoupled_draft()
+            ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
@@ -177,6 +181,14 @@ class EagerRunner(BaseRunner):
         raw_bs = forward_batch.batch_size
         raw_num_tokens = forward_batch.input_ids.shape[0]
         registry = self._eager_registry
+        if registry.has_slot("mamba_cache_src_indices") and (
+            forward_batch.mamba_cache_src_indices is None
+            or forward_batch.mamba_cache_dst_indices is None
+        ):
+            raise ValueError(
+                "Mamba cache routing buffers are enabled, but ForwardBatch is "
+                "missing `mamba_cache_src_indices` or `mamba_cache_dst_indices`."
+            )
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,

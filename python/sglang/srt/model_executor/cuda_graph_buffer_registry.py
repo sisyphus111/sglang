@@ -512,6 +512,7 @@ def build_decode_registry(
     seq_len_fill_value: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool = False,
+    enable_mamba_cache_routing: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     enable_num_token_non_padded: bool = False,
@@ -606,6 +607,27 @@ def build_decode_registry(
             padding_policy=PaddingPolicy.ZERO,
         ),
     ]
+    if enable_mamba_cache_routing:
+        slots.append(
+            GraphSlot(
+                "mamba_cache_src_indices",
+                _bs,
+                torch.int64,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
+                pad_value=-1,
+            )
+        )
+        slots.append(
+            GraphSlot(
+                "mamba_cache_dst_indices",
+                _bs,
+                torch.int64,
+                axis="bs",
+                padding_policy=PaddingPolicy.FILL_SENTINEL,
+                pad_value=-1,
+            )
+        )
     if enable_mamba_track:
         slots.append(
             GraphSlot(
@@ -896,6 +918,7 @@ def build_eager_registry(
     max_num_token: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool = False,
+    enable_mamba_cache_routing: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     dp_size: int = 1,
@@ -922,6 +945,7 @@ def build_eager_registry(
         seq_len_fill_value=0,
         cache_loc_dtype=cache_loc_dtype,
         enable_mamba_track=enable_mamba_track,
+        enable_mamba_cache_routing=enable_mamba_cache_routing,
         is_encoder_decoder=is_encoder_decoder,
         encoder_len_fill_value=encoder_len_fill_value,
         enable_num_token_non_padded=False,

@@ -169,8 +169,14 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler_decoupled_spec_mixin import (
-    SchedulerDecoupledSpecMixin,
+from sglang.srt.managers.scheduler_decoupled_draft_mixin import (
+    SchedulerDecoupledDraftMixin,
+)
+from sglang.srt.managers.scheduler_decoupled_spec_base_mixin import (
+    SchedulerDecoupledSpecBaseMixin,
+)
+from sglang.srt.managers.scheduler_decoupled_verify_mixin import (
+    SchedulerDecoupledVerifyMixin,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -294,7 +300,9 @@ _is_npu = is_npu()
 
 
 class Scheduler(
-    SchedulerDecoupledSpecMixin,
+    SchedulerDecoupledSpecBaseMixin,
+    SchedulerDecoupledDraftMixin,
+    SchedulerDecoupledVerifyMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -692,8 +700,6 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
-        if self.spec_algorithm.is_decoupled_verify() and not self.is_generation:
-            raise ValueError("decoupled_verify only supports generation models.")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -840,13 +846,6 @@ class Scheduler(
             )
         else:
             self.external_corpus_manager = None
-
-    def maybe_run_spec_startup_profiling(self) -> None:
-        """Startup spec cost-table profiling (no-op unless worker overrides)."""
-        dw = getattr(self, "draft_worker", None)
-        run_startup_spec_profiling = getattr(dw, "run_startup_spec_profiling", None)
-        if run_startup_spec_profiling is not None:
-            run_startup_spec_profiling(self.tree_cache)
 
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
@@ -1801,6 +1800,8 @@ class Scheduler(
             max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_draft_sleeping_reqs=lambda: getattr(self, "draft_sleeping_reqs", {}),
+            get_draft_req_table=lambda: getattr(self, "draft_req_table", {}),
         )
 
     def init_invariant_checker(self) -> None:
@@ -1819,6 +1820,8 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_draft_sleeping_reqs=lambda: getattr(self, "draft_sleeping_reqs", {}),
+            get_draft_req_table=lambda: getattr(self, "draft_req_table", {}),
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -3052,6 +3055,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        self._release_decoupled_verify_finished_reqs_before_filter(batch)
         batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
@@ -3145,6 +3149,25 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def _release_decoupled_verify_finished_reqs_before_filter(
+        self, batch: ScheduleBatch
+    ) -> None:
+        if not self.spec_algorithm.is_decoupled_verify():
+            return
+
+        for req in batch.reqs:
+            if not req.finished() or req.req_pool_idx is None:
+                continue
+            if req.kv_committed_freed or req.kv_overallocated_freed:
+                continue
+
+            prepare_release = getattr(
+                self.model_worker, "prepare_for_kv_cache_release", None
+            )
+            if callable(prepare_release):
+                prepare_release(req)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
@@ -3231,10 +3254,6 @@ class Scheduler(
             self.prepare_verify_inputs(batch)
         if self.spec_algorithm.is_decoupled_draft():
             self.prepare_draft_mamba_routing(batch)
-        is_spec_v2_batch = (
-            not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.is_decoupled_draft()
-        )
 
         decoupled_forward_start_ns = self.start_forward_timer(batch)
 
@@ -3265,7 +3284,7 @@ class Scheduler(
                                     self.future_map.publish, future_indices
                                 )
                             }
-                            if is_spec_v2_batch
+                            if not batch.spec_algorithm.is_none() and not batch.spec_algorithm.is_decoupled_draft()
                             else {}
                         )
 
@@ -3273,7 +3292,7 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if not is_spec_v2_batch:
+                        if batch.spec_algorithm.is_none() or batch.spec_algorithm.is_decoupled_draft():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -3287,7 +3306,7 @@ class Scheduler(
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
-                                if is_spec_v2_batch
+                                if not batch.spec_algorithm.is_none() and not batch.spec_algorithm.is_decoupled_draft()
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
@@ -3301,7 +3320,7 @@ class Scheduler(
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 
-                if is_spec_v2_batch:
+                if not batch.spec_algorithm.is_none() and not batch.spec_algorithm.is_decoupled_draft():
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
@@ -3312,7 +3331,7 @@ class Scheduler(
                         batch.req_pool_indices, batch_result.next_token_ids
                     )
                 batch.input_ids = None
-            elif is_spec_v2_batch:
+            elif not batch.spec_algorithm.is_none() and not batch.spec_algorithm.is_decoupled_draft():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
@@ -4313,8 +4332,6 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
-
-        scheduler.maybe_run_spec_startup_profiling()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

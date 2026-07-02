@@ -44,6 +44,8 @@ class _MiniForwardBatch:
     seq_lens_cpu: Optional[torch.Tensor] = None
     encoder_lens: Optional[torch.Tensor] = None
     mrope_positions: Optional[torch.Tensor] = None
+    mamba_cache_src_indices: Optional[torch.Tensor] = None
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -810,6 +812,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             "mrope_positions",
         ):
             self.assertTrue(reg.has_slot(name), name)
+        self.assertFalse(reg.has_slot("mamba_cache_src_indices"))
+        self.assertFalse(reg.has_slot("mamba_cache_dst_indices"))
         self.assertFalse(reg.has_slot("mamba_track_indices"))
 
         raw_bs, padded_bs, raw_nt, padded_nt = 2, 4, 2, 4
@@ -861,7 +865,6 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         # 2D mrope via slice_fn.
         mr = reg.get_slot("mrope_positions").buffer
         self.assertTrue(torch.equal(mr[:, :2], fb.mrope_positions))
-
         fb_view = reg.extract_buffer(
             padded_bs=padded_bs,
             padded_num_tokens=padded_nt,
@@ -896,11 +899,167 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             source=src,
         )
         # Registry slots share storage with the source's tensors.
-        for name in ("input_ids", "seq_lens", "seq_lens_cpu", "mrope_positions"):
+        for name in (
+            "input_ids",
+            "seq_lens",
+            "seq_lens_cpu",
+            "mrope_positions",
+        ):
             self.assertEqual(
                 reg.get_slot(name).buffer.data_ptr(),
                 getattr(src, name).data_ptr(),
                 name,
+            )
+        self.assertFalse(reg.has_slot("mamba_cache_src_indices"))
+        self.assertFalse(reg.has_slot("mamba_cache_dst_indices"))
+
+    def test_source_adopts_mamba_cache_routing_when_enabled(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            mamba_cache_src_indices=torch.full((4,), -1, dtype=torch.int64),
+            mamba_cache_dst_indices=torch.full((4,), -1, dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_cache_routing=True,
+            source=src,
+        )
+        for name in ("mamba_cache_src_indices", "mamba_cache_dst_indices"):
+            self.assertEqual(
+                reg.get_slot(name).buffer.data_ptr(),
+                getattr(src, name).data_ptr(),
+                name,
+            )
+
+    def test_mamba_cache_routing_copy(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_cache_routing=True,
+            share_pool=False,
+        )
+        src_slot = reg.get_slot("mamba_cache_src_indices").buffer
+        dst_slot = reg.get_slot("mamba_cache_dst_indices").buffer
+        src_slot.fill_(77)
+        dst_slot.fill_(88)
+
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            mamba_cache_src_indices=torch.tensor([3, 4], dtype=torch.int64),
+            mamba_cache_dst_indices=torch.tensor([5, 6], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        self.assertTrue(torch.equal(src_slot[:4], torch.tensor([3, 4, -1, -1])))
+        self.assertTrue(torch.equal(dst_slot[:4], torch.tensor([5, 6, -1, -1])))
+
+    def test_replay_view_preserves_missing_mamba_routing(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            build_replay_fb_view,
+        )
+
+        buffers = SimpleNamespace(
+            input_ids=torch.arange(8, dtype=torch.int64),
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            seq_lens=torch.arange(4, dtype=torch.int64),
+            seq_lens_cpu=torch.arange(4, dtype=torch.int64),
+            mamba_cache_src_indices=torch.tensor([10, 11, -1, -1], dtype=torch.int64),
+            mamba_cache_dst_indices=torch.tensor([20, 21, -1, -1], dtype=torch.int64),
+        )
+        fb_missing = SimpleNamespace(
+            seq_lens_sum=30,
+            forward_mode="runtime-decode",
+            spec_info=None,
+            mamba_cache_src_indices=None,
+            mamba_cache_dst_indices=None,
+        )
+
+        view = build_replay_fb_view(
+            fb_missing,
+            buffers,
+            bs=4,
+            raw_bs=2,
+            num_tokens=4,
+            seq_len_fill_value=5,
+            capture_forward_mode="capture-decode",
+            is_encoder_decoder=False,
+        )
+
+        self.assertIsNone(view.mamba_cache_src_indices)
+        self.assertIsNone(view.mamba_cache_dst_indices)
+        self.assertEqual(view.seq_lens_sum, 40)
+
+        fb_explicit = SimpleNamespace(
+            seq_lens_sum=30,
+            forward_mode="runtime-decode",
+            spec_info=None,
+            mamba_cache_src_indices=torch.tensor([1, 2], dtype=torch.int64),
+            mamba_cache_dst_indices=torch.tensor([3, 4], dtype=torch.int64),
+        )
+        view = build_replay_fb_view(
+            fb_explicit,
+            buffers,
+            bs=4,
+            raw_bs=2,
+            num_tokens=4,
+            seq_len_fill_value=5,
+            capture_forward_mode="capture-decode",
+            is_encoder_decoder=False,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                view.mamba_cache_src_indices,
+                torch.tensor([10, 11, -1, -1], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                view.mamba_cache_dst_indices,
+                torch.tensor([20, 21, -1, -1], dtype=torch.int64),
+            )
+        )
+
+        buffers_without_routing = SimpleNamespace(
+            input_ids=torch.arange(8, dtype=torch.int64),
+            req_pool_indices=torch.arange(4, dtype=torch.int64),
+            seq_lens=torch.arange(4, dtype=torch.int64),
+            seq_lens_cpu=torch.arange(4, dtype=torch.int64),
+            mamba_cache_src_indices=None,
+            mamba_cache_dst_indices=None,
+        )
+        with self.assertRaisesRegex(ValueError, "without Mamba cache routing slots"):
+            build_replay_fb_view(
+                fb_explicit,
+                buffers_without_routing,
+                bs=4,
+                raw_bs=2,
+                num_tokens=4,
+                seq_len_fill_value=5,
+                capture_forward_mode="capture-decode",
+                is_encoder_decoder=False,
             )
 
     def test_num_token_non_padded_gathered_dp_branch(self):
@@ -919,6 +1078,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens=torch.full((4,), 5, dtype=torch.int64),
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            mamba_cache_src_indices=torch.full((4,), -1, dtype=torch.int64),
+            mamba_cache_dst_indices=torch.full((4,), -1, dtype=torch.int64),
             num_token_non_padded=ntnp,
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
@@ -1016,6 +1177,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens=torch.full((4,), 5, dtype=torch.int64),
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            mamba_cache_src_indices=torch.full((4,), -1, dtype=torch.int64),
+            mamba_cache_dst_indices=torch.full((4,), -1, dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
             ngram_embedding_info=SimpleNamespace(column_starts=col, req_lens=req),
@@ -1064,6 +1227,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens=torch.full((4,), 5, dtype=torch.int64),
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            mamba_cache_src_indices=torch.full((4,), -1, dtype=torch.int64),
+            mamba_cache_dst_indices=torch.full((4,), -1, dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
             pp_proxy_tensors={"hidden_states": hs},
@@ -1112,6 +1277,8 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             seq_lens=torch.full((4,), 5, dtype=torch.int64),
             seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            mamba_cache_src_indices=torch.full((4,), -1, dtype=torch.int64),
+            mamba_cache_dst_indices=torch.full((4,), -1, dtype=torch.int64),
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
             rids_int=rids,

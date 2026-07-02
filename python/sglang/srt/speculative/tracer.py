@@ -638,21 +638,40 @@ def _scheduler_forward_fields(
         output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
     )
     if worker_role == "verifier":
-        runtime_state = getattr(batch, "decoupled_verify_runtime_state", None)
-        shape = (
-            runtime_state.shape
-            if runtime_state is not None
-            else getattr(batch, "decoupled_verify_shape", None)
+        dynamic_verify_length = bool(
+            getattr(owner.server_args, "speculative_adaptive", False)
+            and owner.spec_algorithm.is_decoupled_verify()
         )
-        if shape is not None:
+        if dynamic_verify_length:
+            model_worker = getattr(owner, "model_worker", None)
+            num_speculative_steps = int(
+                getattr(
+                    model_worker,
+                    "speculative_num_steps",
+                    getattr(owner.server_args, "speculative_num_steps", 0),
+                )
+                or 0
+            )
+            verify_tokens_per_req = int(
+                getattr(
+                    model_worker,
+                    "speculative_num_draft_tokens",
+                    getattr(owner.server_args, "speculative_num_draft_tokens", 0),
+                )
+                or 0
+            )
             event_fields.update(
                 dynamic_verify_length=True,
-                captured_batch_size=int(shape.captured_batch_size),
-                target_verify_token_budget=int(shape.budget),
-                num_speculative_steps=int(shape.num_speculative_steps),
-                verify_tokens_per_req=int(shape.verify_tokens_per_req),
-                raw_verify_tokens=int(shape.raw_verify_tokens),
-                padded_verify_tokens=int(shape.padded_verify_tokens),
+                captured_batch_size="",
+                target_verify_token_budget=getattr(
+                    owner.server_args,
+                    "decoupled_spec_target_verify_token_budget",
+                    "",
+                ),
+                num_speculative_steps=num_speculative_steps,
+                verify_tokens_per_req=verify_tokens_per_req,
+                raw_verify_tokens=len(batch.reqs) * verify_tokens_per_req,
+                padded_verify_tokens="",
             )
         elif batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify():
             num_speculative_steps = int(

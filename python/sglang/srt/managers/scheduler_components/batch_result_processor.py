@@ -576,10 +576,7 @@ class SchedulerBatchResultProcessor:
                 # reset_for_retract() already zeroes committed/allocated KV.
                 pass
             elif req.finished():
-                if (
-                    not batch.spec_algorithm.is_dflash()
-                    and not batch.spec_algorithm.is_decoupled_verify()
-                ):
+                if not batch.spec_algorithm.is_dflash():
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len -= 1
             else:
@@ -591,17 +588,12 @@ class SchedulerBatchResultProcessor:
                     accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
                 num_accept_tokens = len(accept_tokens)
-                if (
-                    batch.spec_algorithm.is_dflash()
-                    or batch.spec_algorithm.is_decoupled_verify()
-                ):
+                if batch.spec_algorithm.is_dflash():
                     # DFLASH materialized accepted draft tokens plus the bonus token.
                     req.kv_committed_len += num_accept_tokens
                 else:
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len += num_accept_tokens - 1
-                if batch.spec_algorithm.is_decoupled_verify():
-                    req.kv_allocated_len = req.kv_committed_len
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -611,20 +603,6 @@ class SchedulerBatchResultProcessor:
             predict_tokens.append(accept_tokens)
 
         return predict_tokens
-
-    def _is_spec_decode_output(
-        self,
-        batch: ScheduleBatch,
-        result: Optional[GenerationBatchResult] = None,
-    ) -> bool:
-        if batch.spec_algorithm.is_none() or batch.spec_algorithm.is_decoupled_draft():
-            return False
-        if result is None:
-            return True
-        return (
-            result.accept_lens is not None
-            and result.speculative_num_draft_tokens is not None
-        )
 
     def _accept_grammar_tokens(
         self, req: Req, tokens: Union[int, List[int]]
@@ -697,8 +675,10 @@ class SchedulerBatchResultProcessor:
         )
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
-        is_spec_output = self._is_spec_decode_output(batch, result)
-        if is_spec_output:
+        if (
+            not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.is_decoupled_draft()
+        ):
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(), result.num_correct_drafts
             )
@@ -721,7 +701,10 @@ class SchedulerBatchResultProcessor:
 
             # Non-spec and Spec V2: full post-processing.
             next_token_id = next_token_ids[i]
-            is_spec = self._is_spec_decode_output(batch, result)
+            is_spec = (
+                not batch.spec_algorithm.is_none()
+                and not batch.spec_algorithm.is_decoupled_draft()
+            )
 
             if not is_spec:
                 # Normal decode: a single sampled token.
@@ -748,7 +731,6 @@ class SchedulerBatchResultProcessor:
                     next_token_id=next_token_id,
                     next_token_logprobs=next_token_logprobs,
                     logits_output=logits_output,
-                    is_spec_output=is_spec,
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
@@ -800,8 +782,10 @@ class SchedulerBatchResultProcessor:
         next_token_ids: Union[torch.Tensor, List[int]],
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
-        is_spec_output = self._is_spec_decode_output(batch, result)
-        if is_spec_output:
+        if (
+            not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.is_decoupled_draft()
+        ):
             next_token_ids = self._resolve_spec_v2_tokens(result, batch)
         elif isinstance(next_token_ids, list):
             pass  # MLX path: already a list[int], skip torch round-trip
@@ -833,10 +817,12 @@ class SchedulerBatchResultProcessor:
         next_token_id: Union[int, List[int]],
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
-        is_spec_output: bool,
     ) -> None:
         # Normalize: non-spec has 1 token, spec decoding has multiple.
-        if is_spec_output:
+        if (
+            not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.is_decoupled_draft()
+        ):
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
             max_accept = len(accepted_logprobs)

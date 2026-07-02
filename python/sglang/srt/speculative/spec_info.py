@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import bisect
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple, Type, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
-import msgspec
 import torch
 
 from sglang.srt.speculative.spec_registry import (
@@ -31,248 +28,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class DecoupledVerifyShape(msgspec.Struct, frozen=True, kw_only=True):
-    raw_batch_size: int
-    captured_batch_size: int
-    budget: int
-    max_speculative_num_steps: int
-    num_speculative_steps: int
-    verify_tokens_per_req: int
-
-    @property
-    def padded_verify_tokens(self) -> int:
-        return self.captured_batch_size * self.verify_tokens_per_req
-
-    @property
-    def raw_verify_tokens(self) -> int:
-        return self.raw_batch_size * self.verify_tokens_per_req
-
-    @property
-    def uses_decode_graph(self) -> bool:
-        return self.num_speculative_steps == 0
-
-    def validate(self) -> None:
-        if self.raw_batch_size <= 0:
-            raise ValueError(f"raw_batch_size must be positive: {self.raw_batch_size}")
-        if self.captured_batch_size < self.raw_batch_size:
-            raise ValueError(
-                "captured_batch_size must be >= raw_batch_size: "
-                f"captured={self.captured_batch_size}, raw={self.raw_batch_size}"
-            )
-        if self.verify_tokens_per_req != self.num_speculative_steps + 1:
-            raise ValueError(
-                "verify_tokens_per_req must equal num_speculative_steps + 1: "
-                f"tokens={self.verify_tokens_per_req}, "
-                f"steps={self.num_speculative_steps}"
-            )
-        if self.num_speculative_steps < 0:
-            raise ValueError(
-                f"num_speculative_steps must be non-negative: {self.num_speculative_steps}"
-            )
-        if self.num_speculative_steps > self.max_speculative_num_steps:
-            raise ValueError(
-                "num_speculative_steps exceeds max_speculative_num_steps: "
-                f"steps={self.num_speculative_steps}, "
-                f"max={self.max_speculative_num_steps}"
-            )
-        if self.padded_verify_tokens >= self.budget:
-            raise ValueError(
-                "decoupled verifier target verify budget violated after CUDA graph "
-                "batch padding: "
-                f"captured_bs={self.captured_batch_size}, "
-                f"verify_tokens_per_req={self.verify_tokens_per_req}, "
-                f"padded_verify_tokens={self.padded_verify_tokens}, "
-                f"budget={self.budget}"
-            )
-
-
-@dataclass(frozen=True)
-class DecoupledVerifyRuntimeState:
-    """Runtime resources selected for one decoupled verifier target-verify pass.
-
-    This is the decoupled-verifier analogue of ``SpecRuntimeState``.  It is
-    scoped to a single verify batch and only describes target-side resources;
-    the decoupled drafter and draft-extend paths live in separate workers.
-    """
-
-    shape: DecoupledVerifyShape
-    target_attn_backend: object | None = None
-    target_graph_runner: object | None = None
-
-    def __post_init__(self) -> None:
-        self.validate()
-
-    @property
-    def raw_batch_size(self) -> int:
-        return self.shape.raw_batch_size
-
-    @property
-    def captured_batch_size(self) -> int:
-        return self.shape.captured_batch_size
-
-    @property
-    def budget(self) -> int:
-        return self.shape.budget
-
-    @property
-    def max_speculative_num_steps(self) -> int:
-        return self.shape.max_speculative_num_steps
-
-    @property
-    def num_speculative_steps(self) -> int:
-        return self.shape.num_speculative_steps
-
-    @property
-    def verify_tokens_per_req(self) -> int:
-        return self.shape.verify_tokens_per_req
-
-    @property
-    def padded_verify_tokens(self) -> int:
-        return self.shape.padded_verify_tokens
-
-    @property
-    def raw_verify_tokens(self) -> int:
-        return self.shape.raw_verify_tokens
-
-    @property
-    def uses_decode_graph(self) -> bool:
-        return self.shape.uses_decode_graph
-
-    def validate(self) -> None:
-        self.shape.validate()
-
-
-def dynamic_verify_enabled(server_args) -> bool:
-    return bool(getattr(server_args, "decoupled_spec_dynamic_verify_length", False))
-
-
-def select_captured_batch_size(
-    *,
-    raw_batch_size: int,
-    capture_bs: Sequence[int],
-) -> int:
-    if raw_batch_size <= 0:
-        raise ValueError(f"raw_batch_size must be positive: {raw_batch_size}")
-    if not capture_bs:
-        raise ValueError("No CUDA graph batch sizes are available for target verify.")
-    ordered_bs = sorted(int(bs) for bs in capture_bs)
-    index = bisect.bisect_left(ordered_bs, int(raw_batch_size))
-    if index >= len(ordered_bs):
-        raise ValueError(
-            "No captured CUDA graph batch size can cover decoupled verifier batch: "
-            f"raw_batch_size={raw_batch_size}, max_captured_bs={ordered_bs[-1]}"
-        )
-    return ordered_bs[index]
-
-
-def compute_decoupled_verify_shape(
-    *,
-    raw_batch_size: int,
-    captured_batch_size: int,
-    budget: int,
-    max_speculative_num_steps: int,
-) -> DecoupledVerifyShape:
-    raw_batch_size = int(raw_batch_size)
-    captured_batch_size = int(captured_batch_size)
-    budget = int(budget)
-    max_speculative_num_steps = int(max_speculative_num_steps)
-    if raw_batch_size <= 0:
-        raise ValueError(f"raw_batch_size must be positive: {raw_batch_size}")
-    if captured_batch_size < raw_batch_size:
-        raise ValueError(
-            "captured_batch_size must cover raw_batch_size: "
-            f"captured={captured_batch_size}, raw={raw_batch_size}"
-        )
-    if budget <= 0:
-        raise ValueError(f"target verify token budget must be positive: {budget}")
-    if max_speculative_num_steps < 0:
-        raise ValueError(
-            "max_speculative_num_steps must be non-negative: "
-            f"{max_speculative_num_steps}"
-        )
-
-    budget_step_cap = (budget - 1) // captured_batch_size - 1
-    if budget_step_cap < 0:
-        raise ValueError(
-            "No legal decoupled verifier target verify length fits the token "
-            "budget after CUDA graph batch padding: "
-            f"captured_bs={captured_batch_size}, budget={budget}. "
-            "Need budget > captured_bs to verify at least one token per request."
-        )
-    num_speculative_steps = min(max_speculative_num_steps, budget_step_cap)
-    shape = DecoupledVerifyShape(
-        raw_batch_size=raw_batch_size,
-        captured_batch_size=captured_batch_size,
-        budget=budget,
-        max_speculative_num_steps=max_speculative_num_steps,
-        num_speculative_steps=num_speculative_steps,
-        verify_tokens_per_req=num_speculative_steps + 1,
-    )
-    shape.validate()
-    return shape
-
-
-def compute_shape_from_capture_bs(
-    *,
-    raw_batch_size: int,
-    capture_bs: Sequence[int],
-    budget: int,
-    max_speculative_num_steps: int,
-) -> DecoupledVerifyShape:
-    captured_batch_size = select_captured_batch_size(
-        raw_batch_size=raw_batch_size,
-        capture_bs=capture_bs,
-    )
-    return compute_decoupled_verify_shape(
-        raw_batch_size=raw_batch_size,
-        captured_batch_size=captured_batch_size,
-        budget=budget,
-        max_speculative_num_steps=max_speculative_num_steps,
-    )
-
-
-def compute_decoupled_verify_runtime_state(
-    *,
-    raw_batch_size: int,
-    captured_batch_size: int,
-    budget: int,
-    max_speculative_num_steps: int,
-    target_attn_backend: object | None = None,
-    target_graph_runner: object | None = None,
-) -> DecoupledVerifyRuntimeState:
-    shape = compute_decoupled_verify_shape(
-        raw_batch_size=raw_batch_size,
-        captured_batch_size=captured_batch_size,
-        budget=budget,
-        max_speculative_num_steps=max_speculative_num_steps,
-    )
-    return DecoupledVerifyRuntimeState(
-        shape=shape,
-        target_attn_backend=target_attn_backend,
-        target_graph_runner=target_graph_runner,
-    )
-
-
-def compute_runtime_state_from_capture_bs(
-    *,
-    raw_batch_size: int,
-    capture_bs: Sequence[int],
-    budget: int,
-    max_speculative_num_steps: int,
-    target_attn_backend: object | None = None,
-    target_graph_runner: object | None = None,
-) -> DecoupledVerifyRuntimeState:
-    captured_batch_size = select_captured_batch_size(
-        raw_batch_size=raw_batch_size,
-        capture_bs=capture_bs,
-    )
-    return compute_decoupled_verify_runtime_state(
-        raw_batch_size=raw_batch_size,
-        captured_batch_size=captured_batch_size,
-        budget=budget,
-        max_speculative_num_steps=max_speculative_num_steps,
-        target_attn_backend=target_attn_backend,
-        target_graph_runner=target_graph_runner,
+def dynamic_verify_enabled(server_args: ServerArgs) -> bool:
+    return (
+        server_args.speculative_adaptive
+        and server_args.speculative_algorithm == "DECOUPLED_VERIFY"
     )
 
 
@@ -505,7 +264,7 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
         return True
 
     def supports_spec_v2(self) -> bool:
-        return False
+        return True
 
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
@@ -534,10 +293,27 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
                 "Overlap scheduler is disabled for decoupled speculative decoding."
             )
 
+        if not server_args.disable_radix_cache:
+            server_args.disable_radix_cache = True
+            logger.warning("Radix cache is disabled for decoupled verifier.")
+
+        if server_args.mamba_radix_cache_strategy != "no_buffer":
+            server_args.mamba_radix_cache_strategy = "no_buffer"
+            logger.warning(
+                "Mamba extra buffer is disabled for decoupled verifier engine. "
+                "Falling back to --mamba-radix-cache-strategy no_buffer."
+            )
+
         if server_args.enable_mixed_chunk:
             server_args.enable_mixed_chunk = False
             logger.warning(
                 "Mixed chunked prefill is disabled for decoupled speculative decoding."
+            )
+
+        if getattr(server_args, "speculative_use_rejection_sampling", False):
+            server_args.speculative_use_rejection_sampling = False
+            logger.warning(
+                "Rejection sampling is disabled for decoupled speculative decoding."
             )
 
         if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
@@ -547,7 +323,10 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
             )
         server_args.disable_piecewise_cuda_graph = True
 
-        if server_args.speculative_num_steps is None:
+        if (
+            server_args.speculative_num_steps is None
+            and not server_args.speculative_adaptive
+        ):
             raise ValueError(
                 "decoupled speculative decoding requires speculative_num_steps to be set."
             )
@@ -562,23 +341,24 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
             )
         server_args.speculative_eagle_topk = 1
 
-        expected_num_draft_tokens = int(server_args.speculative_num_steps) + 1
-        if server_args.speculative_num_draft_tokens != expected_num_draft_tokens:
-            logger.warning(
-                "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
-                "for decoupled speculative decoding."
-            )
-            server_args.speculative_num_draft_tokens = expected_num_draft_tokens
+        if server_args.speculative_num_steps is not None:
+            expected_num_draft_tokens = int(server_args.speculative_num_steps) + 1
+            if server_args.speculative_num_draft_tokens != expected_num_draft_tokens:
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                    "for decoupled speculative decoding."
+                )
+                server_args.speculative_num_draft_tokens = expected_num_draft_tokens
 
-        if getattr(server_args, "decoupled_spec_dynamic_verify_length", False):
+        if dynamic_verify_enabled(server_args):
             budget = getattr(
                 server_args, "decoupled_spec_target_verify_token_budget", None
             )
             if budget is None or int(budget) <= 0:
                 raise ValueError(
                     "--decoupled-spec-target-verify-token-budget must be a "
-                    "positive integer when "
-                    "--decoupled-spec-dynamic-verify-length is enabled."
+                    "positive integer when adaptive DECOUPLED_VERIFY dynamic "
+                    "verify length is enabled."
                 )
             server_args.decoupled_spec_target_verify_token_budget = int(budget)
             if server_args.cuda_graph_config.decode.backend == Backend.DISABLED:
@@ -634,6 +414,12 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
                 "Mixed chunked prefill is disabled for decoupled speculative decoding."
             )
 
+        if getattr(server_args, "speculative_use_rejection_sampling", False):
+            server_args.speculative_use_rejection_sampling = False
+            logger.warning(
+                "Rejection sampling is disabled for decoupled speculative decoding."
+            )
+
         if server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
             server_args.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
@@ -663,11 +449,6 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
                 "for decoupled speculative decoding."
             )
             server_args.speculative_num_draft_tokens = expected_num_draft_tokens
-        if getattr(server_args, "decoupled_spec_dynamic_verify_length", False):
-            raise ValueError(
-                "--decoupled-spec-dynamic-verify-length is only supported on "
-                "DECOUPLED_VERIFY target workers, not DECOUPLED_DRAFT."
-            )
 
     def create_worker(self, server_args: ServerArgs) -> Type:
         raise ValueError(

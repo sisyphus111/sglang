@@ -28,8 +28,6 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-import math
-import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -92,15 +90,9 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.speculative.spec_info import (
-    DecoupledVerifyRuntimeState,
-    compute_decoupled_verify_shape,
-    dynamic_verify_enabled,
-)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -147,6 +139,25 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    mamba_cache_src_indices = forward_batch.mamba_cache_src_indices
+    mamba_cache_dst_indices = forward_batch.mamba_cache_dst_indices
+    if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
+        raise ValueError(
+            "`mamba_cache_src_indices` and `mamba_cache_dst_indices` "
+            "must be passed together."
+        )
+    if mamba_cache_src_indices is not None:
+        if (
+            buffers.mamba_cache_src_indices is None
+            or buffers.mamba_cache_dst_indices is None
+        ):
+            raise ValueError(
+                "Mamba cache routing metadata was provided, but decode input "
+                "buffers were created without Mamba cache routing slots."
+            )
+        mamba_cache_src_indices = buffers.mamba_cache_src_indices[:bs]
+        mamba_cache_dst_indices = buffers.mamba_cache_dst_indices[:bs]
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -162,6 +173,8 @@ def build_replay_fb_view(
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        mamba_cache_src_indices=mamba_cache_src_indices,
+        mamba_cache_dst_indices=mamba_cache_dst_indices,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
@@ -234,13 +247,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
-        self.decoupled_verify_dynamic = (
-            model_runner.spec_algorithm.is_decoupled_verify()
-            and dynamic_verify_enabled(model_runner.server_args)
-        )
-        self._capture_bs_by_num_tokens_per_bs: dict[int, list[int]] = {}
-        self._compile_bs_by_num_tokens_per_bs: dict[int, list[int]] = {}
-        self._last_decoupled_dynamic_replay_log_key = None
 
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
@@ -265,15 +271,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.num_tokens_per_bs = self.dllm_config.block_size
 
         # --- bucket sizes ---------------------------------------------
-        if self.decoupled_verify_dynamic:
-            self.capture_bs, self.compile_bs = (
-                self._init_decoupled_verify_dynamic_capture_config()
-            )
-            self.num_tokens_per_bs = max(self._capture_bs_by_num_tokens_per_bs)
-        else:
-            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-                model_runner, self.num_tokens_per_bs
-            )
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, self.num_tokens_per_bs
+        )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -283,16 +283,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        if self.decoupled_verify_dynamic:
-            self.max_num_token = max(
-                bs * num_tokens_per_bs
-                for num_tokens_per_bs, capture_bs in (
-                    self._capture_bs_by_num_tokens_per_bs.items()
-                )
-                for bs in capture_bs
-            )
-        else:
-            self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -326,6 +317,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
         )
+        # Decoupled drafter uses the src/dst fields for explicit Mamba checkpoint
+        # routing; decoupled verifier no-buffer stays disabled here.
+        enable_mamba_cache_routing = (
+            self.model_runner.mambaish_config is not None
+            and self.model_runner.spec_algorithm.is_decoupled_draft()
+        )
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -347,6 +344,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_mamba_cache_routing=enable_mamba_cache_routing,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -367,6 +365,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_mamba_cache_routing=enable_mamba_cache_routing,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
             enable_num_token_non_padded=enable_num_token_non_padded(),
@@ -412,290 +411,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _init_decoupled_verify_dynamic_capture_config(self):
-        budget = getattr(
-            self.model_runner.server_args,
-            "decoupled_spec_target_verify_token_budget",
-            None,
-        )
-        if budget is None:
-            raise RuntimeError(
-                "decoupled verifier dynamic verify length requires "
-                "--decoupled-spec-target-verify-token-budget."
-            )
-
-        max_steps = int(self.speculative_num_steps)
-        max_num_tokens_per_bs = max(1, int(self.speculative_num_draft_tokens or 1))
-        legal_capture_bs: dict[int, list[int]] = {}
-        legal_compile_bs: dict[int, list[int]] = {}
-        candidate_capture_bs = set()
-
-        for num_tokens_per_bs in range(1, max_num_tokens_per_bs + 1):
-            capture_bs, compile_bs = get_batch_sizes_to_capture(
-                self.model_runner, num_tokens_per_bs
-            )
-            legal_capture_bs[num_tokens_per_bs] = capture_bs
-            legal_compile_bs[num_tokens_per_bs] = compile_bs
-            candidate_capture_bs.update(capture_bs)
-
-        capture_bs_union = set()
-        compile_bs_union = set()
-        for captured_bs in sorted(candidate_capture_bs):
-            try:
-                shape = compute_decoupled_verify_shape(
-                    raw_batch_size=int(captured_bs),
-                    captured_batch_size=int(captured_bs),
-                    budget=int(budget),
-                    max_speculative_num_steps=max_steps,
-                )
-            except ValueError:
-                continue
-
-            num_tokens_per_bs = int(shape.verify_tokens_per_req)
-            capture_bs = legal_capture_bs.get(num_tokens_per_bs, [])
-            if captured_bs not in capture_bs:
-                continue
-
-            self._capture_bs_by_num_tokens_per_bs.setdefault(
-                num_tokens_per_bs, []
-            ).append(captured_bs)
-            if captured_bs in legal_compile_bs.get(num_tokens_per_bs, []):
-                self._compile_bs_by_num_tokens_per_bs.setdefault(
-                    num_tokens_per_bs, []
-                ).append(captured_bs)
-                compile_bs_union.add(captured_bs)
-            capture_bs_union.add(captured_bs)
-
-        if not capture_bs_union:
-            raise RuntimeError(
-                "No legal full CUDA Graph capture shape for decoupled verifier "
-                "dynamic verify length: "
-                f"budget={budget}, max_speculative_num_steps={max_steps}, "
-                f"candidate_capture_bs={sorted(candidate_capture_bs)}"
-            )
-
-        for num_tokens_per_bs in list(self._capture_bs_by_num_tokens_per_bs):
-            self._capture_bs_by_num_tokens_per_bs[num_tokens_per_bs] = sorted(
-                self._capture_bs_by_num_tokens_per_bs[num_tokens_per_bs]
-            )
-            self._compile_bs_by_num_tokens_per_bs[num_tokens_per_bs] = sorted(
-                self._compile_bs_by_num_tokens_per_bs.get(num_tokens_per_bs, [])
-            )
-
-        return sorted(capture_bs_union), sorted(compile_bs_union)
-
-    def _runtime_num_tokens_per_bs_for(self, forward_batch: ForwardBatch) -> int:
-        if not self.decoupled_verify_dynamic:
-            return self.num_tokens_per_bs
-        if forward_batch.forward_mode.is_decode():
-            return 1
-        spec_info = getattr(forward_batch, "spec_info", None)
-        if spec_info is None:
-            return 1
-        return int(getattr(spec_info, "draft_token_num", 1))
-
-    def _runtime_forward_mode_for(
-        self, forward_batch: ForwardBatch, num_tokens_per_bs: int
-    ) -> ForwardMode:
-        if not self.decoupled_verify_dynamic:
-            return self.capture_forward_mode
-        if num_tokens_per_bs == 1 and forward_batch.forward_mode.is_decode():
-            return ForwardMode.DECODE
-        return ForwardMode.TARGET_VERIFY
-
-    def _capture_bs_for_num_tokens_per_bs(self, num_tokens_per_bs: int) -> list[int]:
-        if not self.decoupled_verify_dynamic:
-            return self.capture_bs
-        capture_bs = self._capture_bs_by_num_tokens_per_bs.get(int(num_tokens_per_bs))
-        if not capture_bs:
-            raise RuntimeError(
-                "No CUDA Graph capture batch sizes for decoupled verifier shape: "
-                f"num_tokens_per_bs={num_tokens_per_bs}"
-            )
-        return capture_bs
-
-    def _resolve_cuda_graph_bs(
-        self,
-        raw_bs: int,
-        num_tokens_per_bs: int,
-        max_batch_size: Optional[float] = None,
-    ) -> int:
-        capture_bs = self._capture_bs_for_num_tokens_per_bs(num_tokens_per_bs)
-        target_bs = (
-            int(raw_bs) if max_batch_size is None else int(math.ceil(max_batch_size))
-        )
-        return self._pad_to_bucket(target_bs, capture_bs)
-
-    def _validate_decoupled_dynamic_replay_shape(
-        self,
-        *,
-        raw_bs: int,
-        bs: int,
-        num_tokens_per_bs: int,
-    ) -> None:
-        if not self.decoupled_verify_dynamic:
-            return
-        budget = getattr(
-            self.model_runner.server_args,
-            "decoupled_spec_target_verify_token_budget",
-            None,
-        )
-        shape = compute_decoupled_verify_shape(
-            raw_batch_size=int(raw_bs),
-            captured_batch_size=int(bs),
-            budget=int(budget),
-            max_speculative_num_steps=int(self.speculative_num_steps),
-        )
-        if int(shape.verify_tokens_per_req) != int(num_tokens_per_bs):
-            raise RuntimeError(
-                "Decoupled verifier dynamic verify length changed before CUDA "
-                "Graph replay: "
-                f"expected={shape.verify_tokens_per_req}, "
-                f"runtime={num_tokens_per_bs}, raw_bs={raw_bs}, captured_bs={bs}"
-            )
-
-    def _decoupled_graph_variant_label(
-        self,
-        variant_label: Optional[str],
-        forward_mode: ForwardMode,
-        num_tokens_per_bs: int,
-    ) -> Optional[str]:
-        if not self.decoupled_verify_dynamic:
-            return variant_label
-        mode = "decode" if forward_mode.is_decode() else "target_verify"
-        dynamic_label = f"{mode}:vt{int(num_tokens_per_bs)}"
-        return (
-            dynamic_label
-            if variant_label is None
-            else f"{variant_label}|{dynamic_label}"
-        )
-
-    def _make_graph_key(
-        self,
-        bs,
-        stream_idx=None,
-        variant_label=None,
-        *,
-        forward_mode: Optional[ForwardMode] = None,
-        num_tokens_per_bs: Optional[int] = None,
-    ):
-        if self.decoupled_verify_dynamic:
-            if forward_mode is None or num_tokens_per_bs is None:
-                raise RuntimeError(
-                    "dynamic decoupled verifier CUDA Graph keys require "
-                    "forward_mode and num_tokens_per_bs."
-                )
-            variant_label = self._decoupled_graph_variant_label(
-                variant_label, forward_mode, int(num_tokens_per_bs)
-            )
+    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(
             size=bs,
             stream_idx=stream_idx,
             variant_label=variant_label,
-        )
-
-    def _make_decoupled_verify_runtime_state(
-        self, shape
-    ) -> DecoupledVerifyRuntimeState:
-        return DecoupledVerifyRuntimeState(
-            shape=shape,
-            target_attn_backend=self.attn_backend,
-            target_graph_runner=self,
-        )
-
-    def select_decoupled_verify_runtime_state(self, raw_batch_size: int):
-        if not self.decoupled_verify_dynamic:
-            return None
-        budget = getattr(
-            self.model_runner.server_args,
-            "decoupled_spec_target_verify_token_budget",
-            None,
-        )
-        for captured_bs in sorted(self.capture_bs):
-            if captured_bs < raw_batch_size:
-                continue
-            shape = compute_decoupled_verify_shape(
-                raw_batch_size=int(raw_batch_size),
-                captured_batch_size=int(captured_bs),
-                budget=int(budget),
-                max_speculative_num_steps=int(self.speculative_num_steps),
-            )
-            capture_bs = self._capture_bs_by_num_tokens_per_bs.get(
-                int(shape.verify_tokens_per_req), []
-            )
-            if captured_bs in capture_bs:
-                return self._make_decoupled_verify_runtime_state(shape)
-        raise RuntimeError(
-            "No legal full CUDA Graph shape found for decoupled verifier dynamic "
-            "verify length: "
-            f"raw_batch_size={raw_batch_size}, budget={budget}, "
-            f"capture_bs_by_tokens={self._capture_bs_by_num_tokens_per_bs}"
-        )
-
-    def select_decoupled_verify_shape(self, raw_batch_size: int):
-        state = self.select_decoupled_verify_runtime_state(raw_batch_size)
-        return state.shape if state is not None else None
-
-    def _decoupled_dynamic_capture_summary(self) -> str:
-        parts = []
-        for num_tokens_per_bs, capture_bs in sorted(
-            self._capture_bs_by_num_tokens_per_bs.items()
-        ):
-            forward_mode = "DECODE" if num_tokens_per_bs == 1 else "TARGET_VERIFY"
-            compile_bs = self._compile_bs_by_num_tokens_per_bs.get(
-                num_tokens_per_bs, []
-            )
-            parts.append(
-                f"{forward_mode}("
-                f"verify_tokens_per_req={num_tokens_per_bs}, "
-                f"num_speculative_steps={max(0, num_tokens_per_bs - 1)}, "
-                f"capture_bs={capture_bs}, compile_bs={compile_bs})"
-            )
-        return "; ".join(parts)
-
-    def _maybe_log_decoupled_dynamic_replay_shape(
-        self,
-        *,
-        raw_bs: int,
-        bs: int,
-        runtime_forward_mode: ForwardMode,
-        num_tokens_per_bs: int,
-    ) -> None:
-        if not self.decoupled_verify_dynamic:
-            return
-
-        log_key = (
-            runtime_forward_mode.name,
-            int(bs),
-            int(num_tokens_per_bs),
-            str(self._replay_graph_key),
-        )
-        if log_key == self._last_decoupled_dynamic_replay_log_key:
-            return
-        self._last_decoupled_dynamic_replay_log_key = log_key
-
-        budget = getattr(
-            self.model_runner.server_args,
-            "decoupled_spec_target_verify_token_budget",
-            "",
-        )
-        num_speculative_steps = max(0, int(num_tokens_per_bs) - 1)
-        graph_path = (
-            "decode CUDA Graph"
-            if runtime_forward_mode.is_decode()
-            else "target verify CUDA Graph"
-        )
-        zero_step = " zero-step fallback" if runtime_forward_mode.is_decode() else ""
-        log_info_on_rank0(
-            logger,
-            "Replay decoupled verifier "
-            f"{graph_path}{zero_step}: raw_bs={int(raw_bs)}, "
-            f"captured_bs={int(bs)}, "
-            f"num_speculative_steps={num_speculative_steps}, "
-            f"verify_tokens_per_req={int(num_tokens_per_bs)}, "
-            f"raw_verify_tokens={int(raw_bs) * int(num_tokens_per_bs)}, "
-            f"padded_verify_tokens={int(bs) * int(num_tokens_per_bs)}, "
-            f"budget={budget}, graph_key={self._replay_graph_key}",
         )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -711,13 +431,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-        runtime_num_tokens_per_bs = self._runtime_num_tokens_per_bs_for(forward_batch)
-        runtime_forward_mode = self._runtime_forward_mode_for(
-            forward_batch, runtime_num_tokens_per_bs
-        )
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // runtime_num_tokens_per_bs
+                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_decoupled_verify()
@@ -726,32 +442,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             cuda_graph_bs = forward_batch.batch_size
-        try:
-            if self.decoupled_verify_dynamic:
-                cuda_graph_bs = self._resolve_cuda_graph_bs(
-                    int(cuda_graph_bs), runtime_num_tokens_per_bs
-                )
-                self._validate_decoupled_dynamic_replay_shape(
-                    raw_bs=forward_batch.batch_size,
-                    bs=cuda_graph_bs,
-                    num_tokens_per_bs=runtime_num_tokens_per_bs,
-                )
-        except (AssertionError, RuntimeError, ValueError):
-            return False
 
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(
-            cuda_graph_bs,
-            stream_idx,
-            variant_label,
-            forward_mode=runtime_forward_mode,
-            num_tokens_per_bs=runtime_num_tokens_per_bs,
-        )
+        graph_key = cuda_graph_bs
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
             self.backend.can_run(forward_batch, graph_key)
-            if self.disable_padding or self.decoupled_verify_dynamic
+            if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
 
@@ -786,7 +484,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         is_ngram_supported = (
             (
-                forward_batch.batch_size * runtime_num_tokens_per_bs
+                forward_batch.batch_size * self.num_tokens_per_bs
                 == forward_batch.input_ids.numel()
             )
             if self.model_runner.spec_algorithm.is_ngram()
@@ -839,9 +537,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         size: int,
         stream_idx: Optional[int] = None,
-        *,
-        num_tokens_per_bs: Optional[int] = None,
-        capture_forward_mode: Optional[ForwardMode] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -852,13 +547,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         bs = size
         buffers: DecodeInputBuffers = self.buffers
-        num_tokens_per_bs = (
-            self.num_tokens_per_bs
-            if num_tokens_per_bs is None
-            else int(num_tokens_per_bs)
-        )
-        capture_forward_mode = capture_forward_mode or self.capture_forward_mode
-        num_tokens = bs * num_tokens_per_bs
+        num_tokens = bs * self.num_tokens_per_bs
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -878,7 +567,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
         mrope_positions = _slot("mrope_positions")
+        mamba_cache_src_indices = (
+            _slot("mamba_cache_src_indices")
+            if registry.has_slot("mamba_cache_src_indices")
+            else None
+        )
+        mamba_cache_dst_indices = (
+            _slot("mamba_cache_dst_indices")
+            if registry.has_slot("mamba_cache_dst_indices")
+            else None
+        )
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
@@ -917,11 +622,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(
-            num_tokens,
-            num_tokens_per_bs=num_tokens_per_bs,
-            capture_forward_mode=capture_forward_mode,
-        )
+        spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -951,7 +652,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
         forward_batch = ForwardBatch(
-            forward_mode=capture_forward_mode,
+            forward_mode=self.capture_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -961,6 +662,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=None,
@@ -977,8 +680,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=capture_forward_mode,
+            global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         # Trip the coordinator so the hisparse code path is captured into the
@@ -1018,25 +723,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers.seq_lens.fill_(self.seq_len_fill_value)
         self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
 
-        decoupled_capture_tic = None
-        decoupled_capture_mem_before = None
-        if self.decoupled_verify_dynamic:
-            decoupled_capture_tic = time.perf_counter()
-            decoupled_capture_mem_before = get_available_gpu_memory(
-                self.model_runner.device,
-                self.model_runner.gpu_id,
-                empty_cache=False,
-            )
-            log_info_on_rank0(
-                logger,
-                "Capture decoupled verifier CUDA Graph begin. "
-                f"target_verify_token_budget="
-                f"{getattr(self.model_runner.server_args, 'decoupled_spec_target_verify_token_budget', '')}, "
-                f"max_speculative_num_steps={int(self.speculative_num_steps)}, "
-                f"capture_shapes=[{self._decoupled_dynamic_capture_summary()}], "
-                f"available_gpu_memory={decoupled_capture_mem_before:.2f} GB",
-            )
-
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -1060,116 +746,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
-        if self.decoupled_verify_dynamic:
-            decoupled_capture_mem_after = get_available_gpu_memory(
-                self.model_runner.device,
-                self.model_runner.gpu_id,
-                empty_cache=False,
-            )
-            elapsed = (
-                time.perf_counter() - decoupled_capture_tic
-                if decoupled_capture_tic is not None
-                else 0.0
-            )
-            mem_delta = (
-                decoupled_capture_mem_before - decoupled_capture_mem_after
-                if decoupled_capture_mem_before is not None
-                else 0.0
-            )
-            log_info_on_rank0(
-                logger,
-                "Capture decoupled verifier CUDA Graph end. "
-                f"elapsed={elapsed:.2f}s, "
-                f"available_gpu_memory_before="
-                f"{decoupled_capture_mem_before:.2f} GB, "
-                f"available_gpu_memory_after={decoupled_capture_mem_after:.2f} GB, "
-                f"estimated_graph_memory={max(0.0, mem_delta):.2f} GB",
-            )
-
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
+        avail_mem = get_available_gpu_memory(
+            self.model_runner.device,
+            self.model_runner.gpu_id,
+            empty_cache=False,
+        )
+        # Reverse so cuda graphs share memory better.
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_bs)))
+            if get_tensor_model_parallel_rank() == 0
+            else reversed(self.capture_bs)
+        )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        capture_groups = (
-            [
-                (
-                    self.capture_forward_mode,
-                    self.num_tokens_per_bs,
-                    self.capture_bs,
-                    self.compile_bs,
+        for bs in capture_range:
+            if get_tensor_model_parallel_rank() == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
                 )
-            ]
-            if not self.decoupled_verify_dynamic
-            else [
-                (
-                    (
-                        ForwardMode.DECODE
-                        if num_tokens_per_bs == 1
-                        else ForwardMode.TARGET_VERIFY
-                    ),
-                    num_tokens_per_bs,
-                    capture_bs,
-                    self._compile_bs_by_num_tokens_per_bs.get(
-                        num_tokens_per_bs, []
-                    ),
+                capture_range.set_description(
+                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
-                for num_tokens_per_bs, capture_bs in sorted(
-                    self._capture_bs_by_num_tokens_per_bs.items()
-                )
-            ]
-        )
-        for (
-            capture_forward_mode,
-            num_tokens_per_bs,
-            capture_bs,
-            compile_bs,
-        ) in capture_groups:
-            if self.decoupled_verify_dynamic:
-                log_info_on_rank0(
-                    logger,
-                    "Capture decoupled verifier CUDA Graph shape group: "
-                    f"mode={capture_forward_mode.name}, "
-                    f"verify_tokens_per_req={int(num_tokens_per_bs)}, "
-                    f"num_speculative_steps={max(0, int(num_tokens_per_bs) - 1)}, "
-                    f"capture_bs={capture_bs}, compile_bs={compile_bs}",
-                )
-            # Reverse so cuda graphs share memory better.
-            capture_range = (
-                tqdm.tqdm(list(reversed(capture_bs)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(capture_bs)
-            )
-            for bs in capture_range:
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        "Capturing batches "
-                        f"(mode={capture_forward_mode.name} "
-                        f"vt={num_tokens_per_bs} {bs=} {avail_mem=:.2f} GB)"
-                    )
 
-                for variant_label, _variant_has_lora in lora_variants:
-                    _set_capture_lora_variant(variant_label)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in compile_bs,
-                        num_tokens=bs * num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            num_tokens_per_bs=num_tokens_per_bs,
-                            capture_forward_mode=capture_forward_mode,
-                        )
+            for variant_label, _variant_has_lora in lora_variants:
+                _set_capture_lora_variant(variant_label)
+                with torch_compile_decoration.patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    num_tokens=bs * self.num_tokens_per_bs,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
     def capture_one_shape(
         self,
@@ -1177,18 +790,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
-        *,
-        num_tokens_per_bs: Optional[int] = None,
-        capture_forward_mode: Optional[ForwardMode] = None,
     ):
         bs = size
-        num_tokens_per_bs = (
-            self.num_tokens_per_bs
-            if num_tokens_per_bs is None
-            else int(num_tokens_per_bs)
-        )
-        capture_forward_mode = capture_forward_mode or self.capture_forward_mode
-        num_tokens = bs * num_tokens_per_bs
+        num_tokens = bs * self.num_tokens_per_bs
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if self.model_runner.server_args.debug_cuda_graph:
@@ -1197,10 +801,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            size,
-            stream_idx=stream_idx,
-            num_tokens_per_bs=num_tokens_per_bs,
-            capture_forward_mode=capture_forward_mode,
+            size, stream_idx=stream_idx
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1259,13 +860,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    bs,
-                    stream_idx,
-                    variant_label,
-                    forward_mode=capture_forward_mode,
-                    num_tokens_per_bs=num_tokens_per_bs,
-                )
+                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
                 self.backend.capture_one(
                     shape_key,
                     run_once,
@@ -1332,24 +927,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-            runtime_num_tokens_per_bs = self._runtime_num_tokens_per_bs_for(
-                forward_batch
-            )
-            runtime_forward_mode = self._runtime_forward_mode_for(
-                forward_batch, runtime_num_tokens_per_bs
-            )
             self._replay_graph_key = self._make_graph_key(
-                self.bs,
-                stream_idx,
-                variant_label,
-                forward_mode=runtime_forward_mode,
-                num_tokens_per_bs=runtime_num_tokens_per_bs,
-            )
-            self._maybe_log_decoupled_dynamic_replay_shape(
-                raw_bs=getattr(self, "raw_bs", forward_batch.batch_size),
-                bs=self.bs,
-                runtime_forward_mode=runtime_forward_mode,
-                num_tokens_per_bs=runtime_num_tokens_per_bs,
+                self.bs, stream_idx, variant_label
             )
             return
 
@@ -1357,49 +936,37 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        runtime_num_tokens_per_bs = self._runtime_num_tokens_per_bs_for(forward_batch)
-        runtime_forward_mode = self._runtime_forward_mode_for(
-            forward_batch, runtime_num_tokens_per_bs
-        )
-        raw_num_token = raw_bs * runtime_num_tokens_per_bs
+        raw_num_token = raw_bs * self.num_tokens_per_bs
 
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / runtime_num_tokens_per_bs
+                max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_decoupled_verify()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
             )
-            bs = (
-                self._resolve_cuda_graph_bs(
-                    raw_bs,
-                    runtime_num_tokens_per_bs,
-                    max_batch_size=max_batch_size,
-                )
-                if self.decoupled_verify_dynamic
-                else self._pad_to_bucket(int(max_batch_size), self.capture_bs)
-            )
+            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
-            bs = (
-                self._resolve_cuda_graph_bs(raw_bs, runtime_num_tokens_per_bs)
-                if self.decoupled_verify_dynamic
-                else self._pad_to_bucket(raw_bs, self.capture_bs)
+            bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+
+        if self.buffer_registry.has_slot("mamba_cache_src_indices") and (
+            forward_batch.mamba_cache_src_indices is None
+            or forward_batch.mamba_cache_dst_indices is None
+        ):
+            raise ValueError(
+                "Mamba cache routing buffers are enabled, but ForwardBatch is "
+                "missing `mamba_cache_src_indices` or `mamba_cache_dst_indices`."
             )
-        self._validate_decoupled_dynamic_replay_shape(
-            raw_bs=raw_bs,
-            bs=bs,
-            num_tokens_per_bs=runtime_num_tokens_per_bs,
-        )
 
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
             padded_bs=bs,
             raw_num_tokens=raw_num_token,
-            padded_num_tokens=bs * runtime_num_tokens_per_bs,
+            padded_num_tokens=bs * self.num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -1412,7 +979,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing them.
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
-                forward_mode=runtime_forward_mode,
+                forward_mode=self.capture_forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
@@ -1429,9 +996,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers=buffers,
             bs=bs,
             raw_bs=raw_bs,
-            num_tokens=bs * runtime_num_tokens_per_bs,
+            num_tokens=bs * self.num_tokens_per_bs,
             seq_len_fill_value=self.seq_len_fill_value,
-            capture_forward_mode=runtime_forward_mode,
+            capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
         attn_backend.init_forward_metadata_out_graph(fb_view)
@@ -1447,17 +1014,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            self.bs,
-            stream_idx,
-            variant_label,
-            forward_mode=runtime_forward_mode,
-            num_tokens_per_bs=runtime_num_tokens_per_bs,
-        )
-        self._maybe_log_decoupled_dynamic_replay_shape(
-            raw_bs=raw_bs,
-            bs=bs,
-            runtime_forward_mode=runtime_forward_mode,
-            num_tokens_per_bs=runtime_num_tokens_per_bs,
+            self.bs, stream_idx, variant_label
         )
 
     def execute(
@@ -1517,21 +1074,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(
-        self,
-        num_tokens: int,
-        *,
-        num_tokens_per_bs: Optional[int] = None,
-        capture_forward_mode: Optional[ForwardMode] = None,
-    ):
+    def get_spec_info(self, num_tokens: int):
         spec_info = None
-        num_tokens_per_bs = (
-            self.num_tokens_per_bs
-            if num_tokens_per_bs is None
-            else int(num_tokens_per_bs)
-        )
-        capture_forward_mode = capture_forward_mode or self.capture_forward_mode
-        if capture_forward_mode.is_decode():
+        if self.capture_forward_mode.is_decode():
             return None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1607,9 +1152,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
                 retrieve_cum_len=None,
-                spec_steps=num_tokens_per_bs - 1,
+                spec_steps=self.num_tokens_per_bs - 1,
                 topk=self.model_runner.server_args.speculative_eagle_topk,
-                draft_token_num=num_tokens_per_bs,
+                draft_token_num=self.num_tokens_per_bs,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,

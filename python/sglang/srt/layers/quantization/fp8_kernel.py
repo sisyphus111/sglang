@@ -134,7 +134,6 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-
 from sglang.srt.layers import deep_gemm_wrapper
 
 

@@ -196,13 +196,30 @@ def parse_args() -> argparse.Namespace:
             "drafters, and decode/MTP baseline engines."
         ),
     )
-    parser.add_argument("--num-speculative-steps", type=int, default=3)
     parser.add_argument(
-        "--decoupled-spec-dynamic-verify-length",
+        "--num-speculative-steps",
+        type=int,
+        default=3,
+        help=(
+            "Static speculative steps. With --speculative-adaptive on the "
+            "decoupled verifier, this is the maximum verify-length cap before "
+            "the token budget is applied."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive",
         action="store_true",
         help=(
-            "Enable token-budget based dynamic verify length on the decoupled "
-            "verifier target engine."
+            "Enable adaptive decoupled verifier dynamic verify length on the "
+            "target engine."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive-config",
+        default=None,
+        help=(
+            "Optional adaptive speculative config JSON path for the target "
+            "engine when --speculative-adaptive is enabled."
         ),
     )
     parser.add_argument(
@@ -211,7 +228,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Strict target verify token budget used when "
-            "--decoupled-spec-dynamic-verify-length is enabled."
+            "--speculative-adaptive is enabled for decoupled verification."
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -699,12 +716,12 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
-    if args.decoupled_spec_dynamic_verify_length:
+    if args.speculative_adaptive:
         budget = args.decoupled_spec_target_verify_token_budget
         if budget is None or budget <= 0:
             raise ValueError(
                 "--decoupled-spec-target-verify-token-budget must be positive "
-                "when --decoupled-spec-dynamic-verify-length is enabled"
+                "when --speculative-adaptive is enabled"
             )
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
@@ -792,7 +809,6 @@ def run_draft_engine_process(
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
             disable_radix_cache=True,
-            chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
             spec_trace_dir=spec_trace_dir,
             decoupled_spec_rank_base=rank,
@@ -1081,11 +1097,15 @@ def create_verifier_engine(
     )
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
-    if args.decoupled_spec_dynamic_verify_length:
-        engine_kwargs["decoupled_spec_dynamic_verify_length"] = True
+    if args.speculative_adaptive:
+        engine_kwargs["speculative_adaptive"] = True
         engine_kwargs["decoupled_spec_target_verify_token_budget"] = (
             args.decoupled_spec_target_verify_token_budget
         )
+        if args.speculative_adaptive_config is not None:
+            engine_kwargs["speculative_adaptive_config"] = (
+                args.speculative_adaptive_config
+            )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:
@@ -1256,16 +1276,21 @@ def main() -> None:
     )
     print(f"  target_engine_tp_size: {target_engine_tp_size}", flush=True)
     print(
-        "  decoupled_spec_dynamic_verify_length: "
-        f"{args.decoupled_spec_dynamic_verify_length}",
+        f"  speculative_adaptive: {args.speculative_adaptive}",
         flush=True,
     )
-    if args.decoupled_spec_dynamic_verify_length:
+    if args.speculative_adaptive:
         print(
             "  decoupled_spec_target_verify_token_budget: "
             f"{args.decoupled_spec_target_verify_token_budget}",
             flush=True,
         )
+        if args.speculative_adaptive_config is not None:
+            print(
+                "  speculative_adaptive_config: "
+                f"{args.speculative_adaptive_config}",
+                flush=True,
+            )
     print(f"  draft_gpus: {args.draft_gpus}", flush=True)
     if reserved_ports is not None:
         print(f"  reserved_ports: {reserved_ports}", flush=True)

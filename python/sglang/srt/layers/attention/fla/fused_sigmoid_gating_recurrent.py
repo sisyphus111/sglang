@@ -56,6 +56,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    one = 1.0
+
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -166,13 +168,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply softplus with numerical stability
         softplus_x = tl.where(
             beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            (one / softplus_beta) * tl.log(one + tl.exp(beta_x)),
             x,
         )
         b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = one / (one + tl.exp(-b_b))
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Profile target-model decode throughput versus per-forward token batch size.
+Profile target-model decode throughput around the 4k-token decode region.
 
 This tool intentionally does not enable decoupled speculation. For each probed
 batch size, it creates a target-only engine with max_running_requests and decode
-CUDA Graph capture size set to that batch size, then measures ordinary decode.
-The measured peak/plateau gives a hardware/model/TP-specific budget candidate
-for dynamic decoupled verifier target verify.
+CUDA Graph capture size set to that batch size, then measures ordinary decode
+with streaming. The recommendation uses throughput in a window centered around
+--mid-token, so the selected budget reflects steady long-response decode rather
+than startup or very-late-response behavior.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -27,6 +29,7 @@ from typing import Any
 try:
     from . import common
 except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import common
 
 try:
@@ -57,12 +60,20 @@ class ProfileRow:
     repeat: int
     warmup: int
     max_new_tokens: int
+    mid_token: int
+    mid_window: int
     prompt_tokens_min: int
     prompt_tokens_max: int
     prompt_tokens_avg: float
     elapsed_s: float
     generated_tokens: int
     throughput_tok_s: float
+    stage_throughput_tok_s: float | None
+    stage_lower_total_tokens: int
+    stage_upper_total_tokens: int
+    stage_lower_time_s_avg: float | None
+    stage_upper_time_s_avg: float | None
+    stage_sample_count: int
     sec_per_token: float
     request_latency_p50_s: float | None
     request_latency_p90_s: float | None
@@ -220,6 +231,49 @@ def output_token_count(output: dict[str, Any]) -> int:
     return 0
 
 
+def _interpolate_time_at(points: list[tuple[float, int]], threshold: int) -> float | None:
+    if not points:
+        return None
+    prev_t, prev_tokens = points[0]
+    if prev_tokens >= threshold:
+        return prev_t
+    for cur_t, cur_tokens in points[1:]:
+        if cur_tokens < threshold:
+            prev_t, prev_tokens = cur_t, cur_tokens
+            continue
+        if cur_tokens == prev_tokens:
+            return cur_t
+        ratio = (threshold - prev_tokens) / (cur_tokens - prev_tokens)
+        return prev_t + ratio * (cur_t - prev_t)
+    return None
+
+
+def _compute_stage_window(
+    points: list[tuple[float, int]],
+    *,
+    batch_size: int,
+    mid_token: int,
+    mid_window: int,
+) -> dict[str, float | int | None]:
+    half_window = mid_window / 2
+    lower_per_req = int(mid_token - half_window)
+    upper_per_req = int(mid_token + half_window)
+    lower_total = lower_per_req * batch_size
+    upper_total = upper_per_req * batch_size
+    lower_time = _interpolate_time_at(points, lower_total)
+    upper_time = _interpolate_time_at(points, upper_total)
+    throughput = None
+    if lower_time is not None and upper_time is not None and upper_time > lower_time:
+        throughput = (upper_total - lower_total) / (upper_time - lower_time)
+    return {
+        "lower_total_tokens": lower_total,
+        "upper_total_tokens": upper_total,
+        "lower_time_s": lower_time,
+        "upper_time_s": upper_time,
+        "throughput_tok_s": throughput,
+    }
+
+
 def request_latency(output: dict[str, Any]) -> float | None:
     meta_info = output.get("meta_info", {}) or {}
     value = meta_info.get("e2e_latency")
@@ -238,12 +292,62 @@ def run_generate(engine, input_ids: list[list[int]], sampling_params: dict[str, 
     return outputs
 
 
+def run_streaming_generate(
+    engine,
+    input_ids: list[list[int]],
+    sampling_params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[tuple[float, int]], float]:
+    batch_size = len(input_ids)
+    completion_by_index = [0] * batch_size
+    final_outputs: list[dict[str, Any] | None] = [None] * batch_size
+    last_outputs: list[dict[str, Any] | None] = [None] * batch_size
+    points: list[tuple[float, int]] = [(0.0, 0)]
+
+    start = time.perf_counter()
+    stream = engine.generate(
+        input_ids=input_ids,
+        sampling_params=sampling_params,
+        stream=True,
+    )
+    for chunk in stream:
+        now = time.perf_counter() - start
+        meta_info = chunk.get("meta_info", {}) or {}
+        index = chunk.get("index")
+        if index is None:
+            if batch_size != 1:
+                raise RuntimeError(
+                    "streaming batch chunk is missing index for batch_size > 1"
+                )
+            index = 0
+        index = int(index)
+        completion_by_index[index] = int(meta_info.get("completion_tokens", 0))
+        total_tokens = sum(completion_by_index)
+        if total_tokens != points[-1][1]:
+            points.append((now, total_tokens))
+        last_outputs[index] = chunk
+        if meta_info.get("finish_reason") is not None:
+            final_outputs[index] = chunk
+
+    elapsed = time.perf_counter() - start
+    outputs: list[dict[str, Any]] = []
+    for index, output in enumerate(final_outputs):
+        if output is None:
+            output = last_outputs[index]
+        if output is None:
+            raise RuntimeError(f"request index {index} produced no output")
+        outputs.append(output)
+    return outputs, points, elapsed
+
+
 def profile_one_size(
     *,
     engine,
     input_ids: list[list[int]],
     token_batch_size: int,
     max_new_tokens: int,
+    mid_token: int,
+    mid_window: int,
+    stream_interval: int,
     temperature: float,
     repeat: int,
     warmup: int,
@@ -259,39 +363,70 @@ def profile_one_size(
         "temperature": temperature,
         "max_new_tokens": max_new_tokens,
         "ignore_eos": True,
+        "stream_interval": stream_interval,
     }
     for _ in range(warmup):
         run_generate(engine, batch_input_ids, sampling_params)
 
     all_latencies: list[float] = []
     generated_tokens = 0
+    elapsed = 0.0
+    stage_throughputs: list[float] = []
+    lower_times: list[float] = []
+    upper_times: list[float] = []
+    lower_total_tokens = int((mid_token - mid_window / 2) * token_batch_size)
+    upper_total_tokens = int((mid_token + mid_window / 2) * token_batch_size)
     with NvidiaSmiSampler(gpu_indices, gpu_sample_interval_s) as sampler:
-        tic = time.perf_counter()
         for _ in range(repeat):
-            outputs = run_generate(engine, batch_input_ids, sampling_params)
+            outputs, points, repeat_elapsed = run_streaming_generate(
+                engine,
+                batch_input_ids,
+                sampling_params,
+            )
+            elapsed += repeat_elapsed
             generated_tokens += sum(output_token_count(output) for output in outputs)
             all_latencies.extend(
                 latency
                 for latency in (request_latency(output) for output in outputs)
                 if latency is not None
             )
-        elapsed = time.perf_counter() - tic
+            stage = _compute_stage_window(
+                points,
+                batch_size=token_batch_size,
+                mid_token=mid_token,
+                mid_window=mid_window,
+            )
+            if stage["throughput_tok_s"] is not None:
+                stage_throughputs.append(float(stage["throughput_tok_s"]))
+            if stage["lower_time_s"] is not None:
+                lower_times.append(float(stage["lower_time_s"]))
+            if stage["upper_time_s"] is not None:
+                upper_times.append(float(stage["upper_time_s"]))
     gpu_summary = sampler.summarize()
 
     prompt_lens = [len(ids) for ids in batch_input_ids]
     throughput = generated_tokens / elapsed if elapsed > 0 else 0.0
+    stage_throughput = mean(stage_throughputs) if stage_throughputs else None
     return ProfileRow(
         token_batch_size=token_batch_size,
         batch_size=token_batch_size,
         repeat=repeat,
         warmup=warmup,
         max_new_tokens=max_new_tokens,
+        mid_token=mid_token,
+        mid_window=mid_window,
         prompt_tokens_min=min(prompt_lens),
         prompt_tokens_max=max(prompt_lens),
         prompt_tokens_avg=mean(prompt_lens),
         elapsed_s=elapsed,
         generated_tokens=generated_tokens,
         throughput_tok_s=throughput,
+        stage_throughput_tok_s=stage_throughput,
+        stage_lower_total_tokens=lower_total_tokens,
+        stage_upper_total_tokens=upper_total_tokens,
+        stage_lower_time_s_avg=mean(lower_times) if lower_times else None,
+        stage_upper_time_s_avg=mean(upper_times) if upper_times else None,
+        stage_sample_count=len(stage_throughputs),
         sec_per_token=elapsed / generated_tokens if generated_tokens > 0 else 0.0,
         request_latency_p50_s=median(all_latencies) if all_latencies else None,
         request_latency_p90_s=percentile(all_latencies, 0.90),
@@ -359,20 +494,30 @@ def choose_recommendations(
 ) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("no profile rows")
-    peak = max(rows, key=lambda row: row.throughput_tok_s)
-    threshold = peak.throughput_tok_s * plateau_ratio
+    def score(row: ProfileRow) -> float:
+        return (
+            row.stage_throughput_tok_s
+            if row.stage_throughput_tok_s is not None
+            else row.throughput_tok_s
+        )
+
+    peak = max(rows, key=score)
+    peak_score = score(peak)
+    threshold = peak_score * plateau_ratio
     plateau = min(
-        (row for row in rows if row.throughput_tok_s >= threshold),
+        (row for row in rows if score(row) >= threshold),
         key=lambda row: row.token_batch_size,
     )
     return {
         "peak_token_batch_size": peak.token_batch_size,
-        "peak_throughput_tok_s": peak.throughput_tok_s,
+        "peak_stage_throughput_tok_s": peak.stage_throughput_tok_s,
+        "peak_total_throughput_tok_s": peak.throughput_tok_s,
         "peak_budget": peak.token_batch_size,
         "plateau_ratio": plateau_ratio,
         "plateau_threshold_tok_s": threshold,
         "plateau_token_batch_size": plateau.token_batch_size,
-        "plateau_throughput_tok_s": plateau.throughput_tok_s,
+        "plateau_stage_throughput_tok_s": plateau.stage_throughput_tok_s,
+        "plateau_total_throughput_tok_s": plateau.throughput_tok_s,
         "plateau_budget": plateau.token_batch_size,
     }
 
@@ -405,32 +550,41 @@ def verify_length_table(
 
 
 def write_report(path: Path, summary: dict[str, Any], rows: list[ProfileRow]) -> None:
+    def fmt_optional(value: float | None) -> str:
+        return "" if value is None else f"{value:.3f}"
+
     lines = [
         "# Target Token-Batch Profile",
         "",
-        "This profile uses target-only decode as a surrogate for target-verify "
-        "token batch size. For decoupled verifier target verify, compare "
-        "`bs * (num_speculative_steps + 1)` against the recommended budget.",
+        "This profile uses target-only decode around the configured mid-token "
+        "window as a surrogate for target-verify token batch size. For "
+        "decoupled verifier target verify, compare `bs * "
+        "(num_speculative_steps + 1)` against the recommended budget. The "
+        "dynamic runtime caps verify length by both this budget and the "
+        "configured static `num_speculative_steps`.",
         "",
         "## Recommendation",
         "",
         f"- peak token_batch_size: {summary['recommendation']['peak_token_batch_size']}",
-        f"- peak throughput: {summary['recommendation']['peak_throughput_tok_s']:.3f} tok/s",
+        "- peak stage throughput: "
+        f"{fmt_optional(summary['recommendation']['peak_stage_throughput_tok_s'])} tok/s",
         f"- peak budget: {summary['recommendation']['peak_budget']}",
         f"- plateau ratio: {summary['recommendation']['plateau_ratio']:.3f}",
         f"- plateau token_batch_size: {summary['recommendation']['plateau_token_batch_size']}",
-        f"- plateau throughput: {summary['recommendation']['plateau_throughput_tok_s']:.3f} tok/s",
+        "- plateau stage throughput: "
+        f"{fmt_optional(summary['recommendation']['plateau_stage_throughput_tok_s'])} tok/s",
         f"- plateau budget: {summary['recommendation']['plateau_budget']}",
         "",
         "## Sweep",
         "",
-        "| token_batch_size | throughput tok/s | sec/token | avg GPU util % | avg power W |",
-        "|---:|---:|---:|---:|---:|",
+        "| token_batch_size | stage tok/s | total tok/s | sec/token | avg GPU util % | avg power W |",
+        "|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
             "| "
             f"{row.token_batch_size} | "
+            f"{fmt_optional(row.stage_throughput_tok_s)} | "
             f"{row.throughput_tok_s:.3f} | "
             f"{row.sec_per_token:.6f} | "
             f"{'' if row.avg_gpu_util_pct is None else f'{row.avg_gpu_util_pct:.1f}'} | "
@@ -461,8 +615,9 @@ def write_report(path: Path, summary: dict[str, Any], rows: list[ProfileRow]) ->
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Profile target-only decode throughput versus token batch size and "
-            "recommend decoupled verifier dynamic verify budgets."
+            "Profile target-only decode throughput around a 4k decode window "
+            "versus token batch size and recommend decoupled verifier dynamic "
+            "verify budgets."
         )
     )
     parser.add_argument("--target-model-path", required=True)
@@ -514,7 +669,20 @@ def parse_args() -> argparse.Namespace:
             "for example '1 2 4 8 16-128:16'."
         ),
     )
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--mid-token",
+        type=int,
+        default=4096,
+        help="Generated-token position at the center of the measured window.",
+    )
+    parser.add_argument(
+        "--mid-window",
+        type=int,
+        default=1024,
+        help="Generated tokens per request included in the measured window.",
+    )
+    parser.add_argument("--stream-interval", type=int, default=256)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -525,7 +693,15 @@ def parse_args() -> argparse.Namespace:
         default="1 2 4 8 16 32 64 128",
         help="Batch sizes to include in the recommended verify-length table.",
     )
-    parser.add_argument("--max-speculative-steps", type=int, default=4)
+    parser.add_argument(
+        "--max-speculative-steps",
+        type=int,
+        default=4,
+        help=(
+            "Static speculative-step cap to apply in the recommended "
+            "verify-length table, matching decoupled verifier dynamic runtime."
+        ),
+    )
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
 
@@ -535,6 +711,14 @@ def validate_args(args: argparse.Namespace, token_batch_sizes: list[int]) -> Non
         raise ValueError("--target-tp-size must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
+    if args.mid_token <= 0 or args.mid_window <= 0:
+        raise ValueError("--mid-token and --mid-window must be positive")
+    if args.mid_token - args.mid_window / 2 <= 0:
+        raise ValueError("--mid-token must be larger than half --mid-window")
+    if args.max_new_tokens < args.mid_token + args.mid_window / 2:
+        raise ValueError("--max-new-tokens must cover the mid-token window")
+    if args.stream_interval <= 0:
+        raise ValueError("--stream-interval must be positive")
     if args.repeat <= 0:
         raise ValueError("--repeat must be positive")
     if args.warmup < 0:
@@ -565,17 +749,6 @@ def main() -> None:
         args.gpu_indices, base_gpu_id=args.base_gpu_id, tp_size=args.target_tp_size
     )
 
-    engine_kwargs: dict[str, Any] = dict(
-        model_path=args.target_model_path,
-        tokenizer_path=args.tokenizer_path or args.target_model_path,
-        tp_size=args.target_tp_size,
-        base_gpu_id=args.base_gpu_id,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        disable_overlap_schedule=args.disable_overlap_schedule,
-        disable_radix_cache=args.disable_radix_cache,
-        enable_deterministic_inference=args.enable_deterministic,
-    )
     config = {
         "target_model_path": args.target_model_path,
         "tokenizer_path": args.tokenizer_path or args.target_model_path,
@@ -595,6 +768,9 @@ def main() -> None:
         "max_prompt_length": args.max_prompt_length,
         "token_batch_sizes": token_batch_sizes,
         "max_new_tokens": args.max_new_tokens,
+        "mid_token": args.mid_token,
+        "mid_window": args.mid_window,
+        "stream_interval": args.stream_interval,
         "repeat": args.repeat,
         "warmup": args.warmup,
         "temperature": args.temperature,
@@ -622,6 +798,9 @@ def main() -> None:
                 input_ids=input_ids,
                 token_batch_size=token_batch_size,
                 max_new_tokens=args.max_new_tokens,
+                mid_token=args.mid_token,
+                mid_window=args.mid_window,
+                stream_interval=args.stream_interval,
                 temperature=args.temperature,
                 repeat=args.repeat,
                 warmup=args.warmup,
@@ -630,7 +809,8 @@ def main() -> None:
             )
             rows.append(row)
             print(
-                f"  throughput={row.throughput_tok_s:.3f} tok/s "
+                f"  stage_throughput={row.stage_throughput_tok_s} tok/s "
+                f"total_throughput={row.throughput_tok_s:.3f} tok/s "
                 f"elapsed={row.elapsed_s:.3f}s generated={row.generated_tokens} "
                 f"avg_gpu_util={row.avg_gpu_util_pct}",
                 flush=True,

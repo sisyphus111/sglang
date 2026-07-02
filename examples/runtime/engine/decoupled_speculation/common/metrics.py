@@ -448,8 +448,9 @@ def build_result(
             "draft_tp_size": args.draft_tp_size,
             "draft_ngpus": args.draft_ngpus,
             "num_speculative_steps": args.num_speculative_steps,
-            "decoupled_spec_dynamic_verify_length": getattr(
-                args, "decoupled_spec_dynamic_verify_length", False
+            "speculative_adaptive": getattr(args, "speculative_adaptive", False),
+            "speculative_adaptive_config": getattr(
+                args, "speculative_adaptive_config", None
             ),
             "decoupled_spec_target_verify_token_budget": getattr(
                 args, "decoupled_spec_target_verify_token_budget", None
@@ -734,8 +735,8 @@ def print_summary(result: dict[str, Any]) -> None:
     print(f"num_verifier_replicas: {result['config']['num_verifier_replicas']}")
     print(f"num_draft_replicas: {result['config']['num_draft_replicas']}")
     print(
-        "decoupled_spec_dynamic_verify_length: "
-        f"{result['config'].get('decoupled_spec_dynamic_verify_length', False)}"
+        "speculative_adaptive: "
+        f"{result['config'].get('speculative_adaptive', False)}"
     )
     print(
         "decoupled_spec_target_verify_token_budget: "

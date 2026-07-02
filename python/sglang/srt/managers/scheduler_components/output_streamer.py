@@ -416,9 +416,7 @@ class _GenerationStreamAccumulator:
                 assert self.spec_valid_accepted_tokens is not None
                 assert self.spec_valid_draft_tokens_by_position is not None
                 assert self.spec_valid_accepted_tokens_by_position is not None
-                spec_steps = int(getattr(req, "dynamic_spec_steps", 0) or 0)
-                if spec_steps <= 0:
-                    spec_steps = len(req.spec_valid_draft_tokens_by_position)
+                spec_steps = len(req.spec_valid_draft_tokens_by_position)
                 self.spec_valid_draft_tokens.append(req.spec_valid_draft_tokens)
                 self.spec_valid_accepted_tokens.append(req.spec_valid_accepted_tokens)
                 self.spec_valid_draft_tokens_by_position.append(

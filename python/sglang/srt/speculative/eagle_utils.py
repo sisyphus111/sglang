@@ -283,9 +283,6 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
-    capture_hidden_mode: Optional[CaptureHiddenMode] = None,
-    allocate_verify_slots: bool = False,
-    page_size: int = 1,
 ):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -308,55 +305,15 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        end_offset = batch.seq_lens + verify_input.draft_token_num
-        if allocate_verify_slots:
-            from sglang.srt.mem_cache.common import (
-                alloc_paged_token_slots_extend,
-                alloc_token_slots,
-                get_last_loc,
-            )
-            from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
-            if page_size == 1:
-                batch.out_cache_loc = alloc_token_slots(
-                    batch.tree_cache,
-                    len(batch.input_ids),
-                )
-            else:
-                end_offset_cpu = batch.seq_lens_cpu + verify_input.draft_token_num
-                last_loc = get_last_loc(
-                    batch.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    batch.seq_lens,
-                )
-                batch.out_cache_loc = alloc_paged_token_slots_extend(
-                    batch.tree_cache,
-                    batch.seq_lens,
-                    batch.seq_lens_cpu,
-                    end_offset,
-                    end_offset_cpu,
-                    last_loc,
-                    len(batch.input_ids),
-                )
-
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                end_offset,
-                batch.out_cache_loc,
-                bs,
-            )
-        else:
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=end_offset,
-                batch_size=bs,
-                draft_token_num=verify_input.draft_token_num,
-                device=device,
-            )
+        batch.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + verify_input.draft_token_num,
+            batch_size=bs,
+            draft_token_num=verify_input.draft_token_num,
+            device=device,
+        )
 
         prepare_mamba_track_for_verify(batch)
 
@@ -370,13 +327,12 @@ def eagle_prepare_for_verify(
     batch.forward_mode = (
         ForwardMode.IDLE if batch.forward_mode.is_idle() else ForwardMode.TARGET_VERIFY
     )
-    capture_mode = capture_hidden_mode
-    if capture_mode is None:
-        capture_mode = (
-            CaptureHiddenMode.NULL
-            if target_worker.model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
-        )
+    spec_algorithm = target_worker.model_runner.spec_algorithm
+    capture_mode = (
+        CaptureHiddenMode.NULL
+        if spec_algorithm.is_standalone() or spec_algorithm.is_decoupled_verify()
+        else CaptureHiddenMode.FULL
+    )
     batch.capture_hidden_mode = capture_mode
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 

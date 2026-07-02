@@ -54,6 +54,8 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_draft_sleeping_reqs: Callable
+    get_draft_req_table: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -113,10 +115,23 @@ class SchedulerInvariantChecker:
             uncached,
         )
 
+    def _decoupled_drafter_mamba_ckpt_slots(self) -> set:
+        slots = set()
+        for state in self.get_draft_req_table().values():
+            mamba_slots = state.mamba_checkpoint_slots
+            if mamba_slots is not None:
+                slots.update(int(idx) for idx in mamba_slots.reshape(-1).tolist())
+        return slots
+
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
+        decoupled_draft_ckpt_slots = self._decoupled_drafter_mamba_ckpt_slots()
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
         if ckpt_pool is not None:
-            return self._check_mamba_pool_with_int8(ps, ckpt_pool)
+            return self._check_mamba_pool_with_int8(
+                ps,
+                ckpt_pool,
+                decoupled_draft_ckpt_uncached=len(decoupled_draft_ckpt_slots),
+            )
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -124,6 +139,7 @@ class SchedulerInvariantChecker:
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            uncached=len(decoupled_draft_ckpt_slots),
         )
         if leak:
             # Page-level leak diagnosis for mamba
@@ -145,15 +161,24 @@ class SchedulerInvariantChecker:
             )
             expected_mamba_pages = set(range(1, mamba_allocator.size + 1))
             leaked_mamba_pages = (
-                expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+                expected_mamba_pages
+                - free_mamba_pages
+                - cached_mamba_pages
+                - decoupled_draft_ckpt_slots
             )
             msg += (
                 f", leaked_full_pages={leaked_full_pages or None}"
                 f", leaked_mamba_pages={leaked_mamba_pages or None}"
+                f", decoupled_draft_ckpt_slots={decoupled_draft_ckpt_slots or None}"
             )
         return leak, msg
 
-    def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
+    def _check_mamba_pool_with_int8(
+        self,
+        ps: PoolStats,
+        ckpt_pool,
+        decoupled_draft_ckpt_uncached: int = 0,
+    ) -> Tuple[bool, str]:
         """Two-pool invariant for int8 mamba checkpoints.
 
         The radix-cached states live in the int8 checkpoint pool, NOT the active
@@ -173,6 +198,7 @@ class SchedulerInvariantChecker:
             0,
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
+            uncached=decoupled_draft_ckpt_uncached,
         )
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",
@@ -226,6 +252,22 @@ class SchedulerInvariantChecker:
                     swa_uncached += allocated_len - max(
                         req.cache_protected_len, req.swa_evicted_seqlen
                     )
+
+        for req in self.get_draft_sleeping_reqs().values():
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            if req.kv_committed_freed or req.req_pool_idx is None:
+                continue
+
+            allocated_len = req.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
+
+            full_uncached += allocated_len - req.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.cache_protected_len, req.swa_evicted_seqlen
+                )
 
         return full_uncached, swa_uncached
 

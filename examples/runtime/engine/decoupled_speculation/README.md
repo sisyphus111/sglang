@@ -1,9 +1,11 @@
 # Decoupled Speculation Example
 
-This directory has two CLI entrypoints for decoupled speculative decoding:
+This directory keeps runtime launch scripts separate from profiling utilities:
 
 - `multi-node.py`: run the Ray-backed multi-node benchmark from either `--prompt` or `--dataset-path`.
 - `single-node.py`: run the local-process single-node benchmark without Ray.
+- `utils/target-profile.py`: profile target-only decode throughput for different batch sizes around the 4k generated-token region. Use its recommended budget as a starting point for decoupled verifier dynamic verify length.
+- `configs/`: fixed example configs, such as adaptive speculative step candidates.
 - `common/`: shared helpers split by function: runtime/Ray topology, prompt loading, metrics/output, and shared types.
 
 Decoupled-spec engines use a two-stage runtime rendezvous. Verifier and drafter
@@ -106,4 +108,26 @@ python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --target-tp-size 4 \
   --draft-tp-size 1 \
   --max-new-tokens 256
+```
+
+Target token-batch profiling:
+
+```bash
+python examples/runtime/engine/decoupled_speculation/utils/target-profile.py \
+  --dataset-path /path/to/prompts.parquet \
+  --dataset-format dapo_math_17k \
+  --target-model-path /path/to/target \
+  --target-tp-size 4 \
+  --token-batch-sizes "8 16 32 48 64" \
+  --max-new-tokens 8192 \
+  --mid-token 4096 \
+  --mid-window 1024 \
+  --output-dir ./target_token_batch_profile
+```
+
+Adaptive config example:
+
+```bash
+--speculative-adaptive-config \
+  examples/runtime/engine/decoupled_speculation/configs/adaptive_steps_0_1_3_4.json
 ```

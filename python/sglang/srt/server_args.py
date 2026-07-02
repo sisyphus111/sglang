@@ -1549,17 +1549,6 @@ class ServerArgs:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
-    speculative_adaptive_strategy: A[
-        Literal["ema", "throughput_aware"],
-        Arg(
-            help=(
-                "Adaptive speculative decoding strategy. "
-                "'ema': acceptance-rate EMA controller. "
-                "'throughput_aware': throughput-aware controller from adaptive config."
-            ),
-            choices=["ema", "throughput_aware"],
-        ),
-    ] = "ema"
     decoupled_spec_rank_base: A[
         int,
         "Base global rank for dynamically configured decoupled-spec entry schedulers. The local DP rank is added to this value.",
@@ -1568,13 +1557,9 @@ class ServerArgs:
         Optional[str],
         "Directory for speculative decoding CSV trace files. Tracing is enabled when this flag is provided.",
     ] = None
-    decoupled_spec_dynamic_verify_length: A[
-        bool,
-        "Enable token-budget based dynamic verify length for DECOUPLED_VERIFY target verification.",
-    ] = False
     decoupled_spec_target_verify_token_budget: A[
         Optional[int],
-        "Strict target verify token budget for decoupled verifier dynamic verify length. The CUDA graph padded batch size times verify_tokens_per_req must be smaller than this value.",
+        "Strict target verify token budget for adaptive DECOUPLED_VERIFY target verification. The CUDA graph padded batch size times verify_tokens_per_req must be smaller than this value.",
     ] = None
 
     # -------------------------------------------------------------------------
@@ -3523,6 +3508,18 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        if model_arch in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForCausalLMMTP",
+        ]:
+            if not self.disable_radix_cache:
+                logger.info("Radix cache is disabled for Qwen3.5 models.")
+                self.disable_radix_cache = True
+            if self.disaggregation_decode_enable_radix_cache:
+                logger.info("Decode-side radix cache is disabled for Qwen3.5 models.")
+                self.disaggregation_decode_enable_radix_cache = False
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -6629,13 +6626,13 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        if self.speculative_adaptive_strategy == "throughput_aware":
-            from sglang.srt.speculative.throughput_aware_controller import (
-                resolve_throughput_aware_candidate_steps,
+        if self.speculative_algorithm == "DECOUPLED_VERIFY":
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_decoupled_verify_candidate_steps_from_server_args,
             )
 
-            candidate_steps = resolve_throughput_aware_candidate_steps(
-                self.speculative_adaptive_config,
+            candidate_steps = resolve_decoupled_verify_candidate_steps_from_server_args(
+                self
             )
         else:
             from sglang.srt.speculative.adaptive_spec_params import (
@@ -6645,8 +6642,8 @@ class ServerArgs:
             candidate_steps = resolve_candidate_steps_from_config(
                 cfg_path=self.speculative_adaptive_config,
             )
-        # adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots.
+        # TODO: adaptive spec currently requires topk=1, so each runtime state
+        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
         return max(candidate_steps) + 1
 
     @property

@@ -1,21 +1,29 @@
 import unittest
+import json
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.scheduler_decoupled_verify_mixin import (
+    SchedulerDecoupledVerifyMixin,
+)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
     DraftSync,
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
 )
-from sglang.srt.speculative.spec_info import (
-    compute_decoupled_verify_runtime_state,
-    compute_decoupled_verify_shape,
-    compute_runtime_state_from_capture_bs,
-    compute_shape_from_capture_bs,
-)
+from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.spec_info import DecoupledVerifySpecAlgo
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Req:
@@ -23,86 +31,517 @@ class _Req:
         self.rid = rid
 
 
+class _SchedReq:
+    def __init__(self, rid: str):
+        self.rid = rid
+        self.is_retracted = False
+        self.output_ids = [1, 2]
+        self.kv_committed_len = 2
+
+    def finished(self):
+        return False
+
+
+class _ForwardMode:
+    def __str__(self):
+        return "DECODE"
+
+
+class _Batch:
+    def __init__(self):
+        self.reqs = [_SchedReq("req-a"), _SchedReq("req-b")]
+        self.forward_mode = _ForwardMode()
+
+    def batch_size(self):
+        return len(self.reqs)
+
+
+class _Scheduler(SchedulerDecoupledVerifyMixin):
+    def __init__(self, steps: int, draft_tokens: int):
+        self.activations = []
+        self.server_args = SimpleNamespace(
+            speculative_adaptive=True,
+            speculative_algorithm="DECOUPLED_VERIFY",
+            speculative_num_steps=8,
+            speculative_num_draft_tokens=9,
+            disable_cuda_graph=False,
+            decoupled_spec_target_verify_token_budget=65,
+        )
+
+        def activate_step_by_batch(batch_size):
+            self.activations.append(batch_size)
+
+        self.model_worker = SimpleNamespace(
+            speculative_num_steps=steps,
+            speculative_num_draft_tokens=draft_tokens,
+            activate_step_by_batch=activate_step_by_batch,
+        )
+
+    def is_verify_entry_rank(self):
+        return False
+
+    def _broadcast_verify_snapshots(self, local_snapshots):
+        return []
+
+    def _bind_verify_snapshots(self, target_reqs, synced_snapshots):
+        return 0
+
+
 class TestDecoupledVerifyDynamic(unittest.TestCase):
-    def test_budget_formula_uses_captured_batch_size(self):
-        shape = compute_decoupled_verify_shape(
-            raw_batch_size=7,
-            captured_batch_size=8,
-            budget=33,
-            max_speculative_num_steps=8,
+    runtime_state_attr_name = "_".join(
+        ["decoupled", "verify", "runtime", "state"]
+    )
+
+    def test_scheduler_prepare_uses_active_worker_config_for_snapshot(self):
+        scheduler = _Scheduler(steps=3, draft_tokens=4)
+        batch = _Batch()
+
+        SchedulerDecoupledVerifyMixin._prepare_verify_decode_inputs(
+            scheduler, batch
         )
 
-        self.assertEqual(shape.num_speculative_steps, 3)
-        self.assertEqual(shape.verify_tokens_per_req, 4)
-        self.assertEqual(shape.raw_verify_tokens, 28)
-        self.assertEqual(shape.padded_verify_tokens, 32)
-        self.assertLess(shape.padded_verify_tokens, shape.budget)
+        self.assertEqual(scheduler.activations, [2])
+        self.assertFalse(hasattr(batch, self.runtime_state_attr_name))
+        for req in batch.reqs:
+            self.assertEqual(req._decoupled_verify_num_speculative_steps, 3)
+            self.assertEqual(req._decoupled_verify_tokens_per_req, 4)
+            self.assertEqual(req.kv_committed_len, 3)
 
-    def test_budget_clamps_to_zero_step_decode_graph(self):
-        shape = compute_decoupled_verify_shape(
-            raw_batch_size=31,
-            captured_batch_size=32,
-            budget=64,
-            max_speculative_num_steps=8,
+    def test_scheduler_zero_step_uses_active_worker_config(self):
+        scheduler = _Scheduler(steps=0, draft_tokens=1)
+        batch = _Batch()
+
+        SchedulerDecoupledVerifyMixin._prepare_verify_decode_inputs(
+            scheduler, batch
         )
 
-        self.assertEqual(shape.num_speculative_steps, 0)
-        self.assertEqual(shape.verify_tokens_per_req, 1)
-        self.assertTrue(shape.uses_decode_graph)
-        self.assertLess(shape.padded_verify_tokens, shape.budget)
+        self.assertEqual(scheduler.activations, [2])
+        self.assertFalse(hasattr(batch, self.runtime_state_attr_name))
+        for req in batch.reqs:
+            self.assertEqual(req._decoupled_verify_num_speculative_steps, 0)
+            self.assertEqual(req._decoupled_verify_tokens_per_req, 1)
+            self.assertEqual(req.kv_committed_len, 3)
 
-    def test_budget_rejects_padded_batch_that_cannot_verify_one_token(self):
-        with self.assertRaises(ValueError):
-            compute_decoupled_verify_shape(
-                raw_batch_size=63,
-                captured_batch_size=64,
-                budget=64,
-                max_speculative_num_steps=8,
-            )
+    def test_verify_worker_activate_step_by_batch_applies_state(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
-    def test_capture_bs_selection_uses_first_covering_shape(self):
-        shape = compute_shape_from_capture_bs(
-            raw_batch_size=9,
-            capture_bs=[1, 4, 8, 16],
-            budget=65,
-            max_speculative_num_steps=8,
-        )
-
-        self.assertEqual(shape.captured_batch_size, 16)
-        self.assertEqual(shape.verify_tokens_per_req, 4)
-        self.assertLess(shape.padded_verify_tokens, shape.budget)
-
-    def test_runtime_state_wraps_shape_and_target_resources(self):
+        graph_runner = SimpleNamespace(capture_bs=[16], num_tokens_per_bs=4)
         attn_backend = object()
-        graph_runner = object()
-        state = compute_decoupled_verify_runtime_state(
-            raw_batch_size=7,
-            captured_batch_size=8,
-            budget=33,
-            max_speculative_num_steps=8,
+        state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
             target_attn_backend=attn_backend,
             target_graph_runner=graph_runner,
         )
+        worker = object.__new__(VerifyWorker)
+        worker.speculative_num_steps = 8
+        worker.speculative_num_draft_tokens = 9
+        worker.server_args = SimpleNamespace(
+            decoupled_spec_target_verify_token_budget=65,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[16], max_bs=None)
+            ),
+            cuda_graph_bs=None,
+            cuda_graph_max_bs=None,
+        )
+        model_runner = SimpleNamespace(
+            attn_backend=object(), decode_cuda_graph_runner=None
+        )
+        worker._target_worker = SimpleNamespace(model_runner=model_runner)
 
-        self.assertEqual(state.num_speculative_steps, 3)
-        self.assertEqual(state.verify_tokens_per_req, 4)
-        self.assertEqual(state.raw_verify_tokens, 28)
-        self.assertEqual(state.padded_verify_tokens, 32)
-        self.assertIs(state.target_attn_backend, attn_backend)
-        self.assertIs(state.target_graph_runner, graph_runner)
-        self.assertEqual(state.shape.verify_tokens_per_req, state.verify_tokens_per_req)
+        class _Controller:
+            def __init__(self):
+                self.activated_steps = []
 
-    def test_runtime_state_capture_bs_selection(self):
-        state = compute_runtime_state_from_capture_bs(
-            raw_batch_size=9,
-            capture_bs=[1, 4, 8, 16],
-            budget=65,
-            max_speculative_num_steps=8,
+            def activate_step_by_batch(self, batch_size):
+                self.batch_size = batch_size
+                self.activated_steps.append(3)
+                VerifyWorker.apply_runtime_state(worker, state)
+
+        controller = _Controller()
+        worker.adaptive_controller = controller
+
+        result = VerifyWorker.activate_step_by_batch(worker, batch_size=16)
+
+        self.assertIsNone(result)
+        self.assertEqual(controller.batch_size, 16)
+        self.assertEqual(controller.activated_steps, [3])
+        self.assertEqual(worker.speculative_num_steps, 3)
+        self.assertEqual(worker.speculative_num_draft_tokens, 4)
+        self.assertIs(model_runner.attn_backend, attn_backend)
+        self.assertIs(model_runner.decode_cuda_graph_runner, graph_runner)
+
+    def test_verify_worker_verify_returns_generation_batch_result(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        req = SimpleNamespace(
+            rid="req-a",
+            draft_buffer=[10],
+            kv_committed_len=2,
+            kv_allocated_len=2,
+            spec_valid_draft_tokens=0,
+            spec_valid_accepted_tokens=0,
+            spec_valid_draft_tokens_by_position=[],
+            spec_valid_accepted_tokens_by_position=[],
+        )
+        spec_info = EagleVerifyInput(
+            draft_token=torch.tensor([2, 10], dtype=torch.long),
+            custom_mask=torch.ones(4, dtype=torch.bool),
+            positions=torch.tensor([2, 3], dtype=torch.int64),
+            retrieve_index=torch.tensor([[0, 1]], dtype=torch.long),
+            retrieve_next_token=torch.tensor([[1, -1]], dtype=torch.long),
+            retrieve_next_sibling=torch.full((1, 2), -1, dtype=torch.long),
+            retrieve_cum_len=None,
+            spec_steps=1,
+            topk=1,
+            draft_token_num=2,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.tensor([2], dtype=torch.int64),
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            input_ids=torch.tensor([2], dtype=torch.long),
+            out_cache_loc=torch.tensor([4], dtype=torch.int64),
+            tree_cache=object(),
+            return_hidden_states=True,
+            return_logprob=False,
+            spec_info=spec_info,
+            has_grammar=False,
         )
 
-        self.assertEqual(state.captured_batch_size, 16)
-        self.assertEqual(state.verify_tokens_per_req, 4)
-        self.assertLess(state.padded_verify_tokens, state.budget)
+        routed_output = object()
+        indexer_output = object()
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((2, 8), dtype=torch.float32)
+        )
+        verify_forward_batch = SimpleNamespace(
+            capture_hidden_mode=CaptureHiddenMode.NULL
+        )
+
+        class _TargetWorker:
+            def __init__(self):
+                self.forward_kwargs = None
+
+            def forward_batch_generation(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    can_run_cuda_graph=True,
+                    routed_experts_output=routed_output,
+                    indexer_topk_output=indexer_output,
+                )
+
+        target_worker = _TargetWorker()
+        freed = []
+        worker = object.__new__(VerifyWorker)
+        worker.device = "cpu"
+        worker.page_size = 1
+        worker.speculative_num_steps = 1
+        worker.speculative_num_draft_tokens = 2
+        worker.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.empty((1, 4), dtype=torch.int64)
+        )
+        worker.token_to_kv_pool_allocator = SimpleNamespace(
+            free=lambda slots: freed.append(slots.clone())
+        )
+        worker._target_worker = target_worker
+
+        def fake_prepare(verify_input, req_to_token_pool, batch, target_worker):
+            batch.input_ids = verify_input.draft_token
+            batch.out_cache_loc = torch.tensor([5, 6], dtype=torch.int64)
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+            return verify_forward_batch, True
+
+        with (
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "torch.get_device_module",
+                return_value=SimpleNamespace(current_stream=lambda: object()),
+            ),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "eagle_prepare_for_verify",
+                side_effect=fake_prepare,
+            ),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "eagle_sample",
+                return_value=(
+                    torch.tensor([2, 10], dtype=torch.long),
+                    torch.tensor([2], dtype=torch.int64),
+                    torch.tensor([[0, 1]], dtype=torch.long),
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "commit_mamba_states_after_verify"
+            ) as commit_mamba,
+        ):
+            result = VerifyWorker.verify(worker, batch)
+
+        self.assertIsInstance(result, GenerationBatchResult)
+        self.assertIs(result.logits_output, logits_output)
+        self.assertEqual(result.next_token_ids.tolist(), [2, 10])
+        self.assertEqual(result.next_draft_input.bonus_tokens.tolist(), [10])
+        self.assertEqual(result.next_draft_input.topk_p.shape, (1, 1))
+        self.assertEqual(result.next_draft_input.topk_index.shape, (1, 1))
+        self.assertTrue(
+            torch.equal(result.next_draft_input.topk_p, torch.zeros(1, 1))
+        )
+        self.assertTrue(
+            torch.equal(
+                result.next_draft_input.topk_index,
+                torch.zeros(1, 1, dtype=torch.int64),
+            )
+        )
+        self.assertEqual(
+            result.next_draft_input.capture_hidden_mode, CaptureHiddenMode.NULL
+        )
+        self.assertEqual(result.num_correct_drafts, 1)
+        self.assertEqual(result.num_correct_drafts_per_req_cpu, [1])
+        self.assertTrue(result.can_run_cuda_graph)
+        self.assertEqual(result.speculative_num_draft_tokens, 2)
+        self.assertEqual(result.accept_lens.tolist(), [2])
+        self.assertEqual(result.new_seq_lens.tolist(), [4])
+        self.assertIs(result.routed_experts_output, routed_output)
+        self.assertIs(result.indexer_topk_output, indexer_output)
+        self.assertEqual(result.extra_keep_alive_refs, [verify_forward_batch])
+        self.assertEqual(batch.forward_mode, ForwardMode.DECODE)
+        self.assertIsNone(batch.spec_info)
+        self.assertEqual(req.kv_allocated_len, 2)
+        self.assertEqual(len(freed), 0)
+        commit_mamba.assert_called_once()
+
+    def test_verify_worker_extend_result_uses_shape_valid_next_draft_input(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        batch_output = GenerationBatchResult(
+            next_token_ids=torch.tensor([31, 32], dtype=torch.long)
+        )
+        target_worker = SimpleNamespace(
+            forward_batch_generation=lambda batch: batch_output
+        )
+        worker = object.__new__(VerifyWorker)
+        worker.topk = 1
+        worker._target_worker = target_worker
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            is_extend_in_batch=False,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens=torch.tensor([4, 5], dtype=torch.int64),
+        )
+
+        result = VerifyWorker.forward_batch_generation(worker, batch)
+
+        self.assertIs(result, batch_output)
+        self.assertEqual(batch.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertEqual(result.new_seq_lens.tolist(), [4, 5])
+        self.assertEqual(result.next_draft_input.bonus_tokens.tolist(), [31, 32])
+        self.assertEqual(result.next_draft_input.topk_p.shape, (2, 1))
+        self.assertEqual(result.next_draft_input.topk_index.shape, (2, 1))
+        self.assertTrue(
+            torch.equal(result.next_draft_input.topk_p, torch.zeros(2, 1))
+        )
+        self.assertTrue(
+            torch.equal(
+                result.next_draft_input.topk_index,
+                torch.zeros(2, 1, dtype=torch.int64),
+            )
+        )
+
+    def test_decoupled_verify_factory_imports_verify_worker(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        self.assertEqual(VerifyWorker.__name__, "VerifyWorker")
+
+    def test_verify_worker_builds_zero_step_verify_input(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        req = SimpleNamespace(
+            rid="req-a",
+            output_ids=[5, 7],
+            origin_input_ids=[1, 2],
+            decode_batch_idx=0,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            device=torch.device("cpu"),
+            seq_lens=torch.tensor([2], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([2], dtype=torch.int64),
+            seq_lens_sum=None,
+            sampling_info=None,
+            forward_mode=ForwardMode.DECODE,
+            maybe_evict_swa=lambda: None,
+            batch_size=lambda: 1,
+        )
+        worker = object.__new__(VerifyWorker)
+        worker.topk = 1
+        worker.speculative_num_steps = 0
+        worker.speculative_num_draft_tokens = 1
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+        )
+
+        spec_info = VerifyWorker.draft(worker, batch)
+
+        self.assertEqual(spec_info.spec_steps, 0)
+        self.assertEqual(spec_info.draft_token_num, 1)
+        self.assertEqual(spec_info.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertEqual(spec_info.draft_token.tolist(), [7])
+        self.assertEqual(spec_info.retrieve_next_token.tolist(), [[-1]])
+        self.assertEqual(req.decode_batch_idx, 1)
+
+    def test_verify_worker_update_weights_delegates_to_target_only(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        calls = []
+        target_worker = SimpleNamespace(
+            update_weights_from_disk=lambda req: calls.append(("disk", req))
+            or (True, "disk"),
+            update_weights_from_ipc=lambda req: calls.append(("ipc", req))
+            or (True, "ipc"),
+            update_weights_from_tensor=lambda req: calls.append(("tensor", req))
+            or (True, "tensor"),
+        )
+        worker = object.__new__(VerifyWorker)
+        worker._target_worker = target_worker
+        disk_req = object()
+        ipc_req = object()
+        tensor_req = object()
+
+        self.assertEqual(
+            VerifyWorker.update_weights_from_disk(worker, disk_req), (True, "disk")
+        )
+        self.assertEqual(
+            VerifyWorker.update_weights_from_ipc(worker, ipc_req), (True, "ipc")
+        )
+        self.assertEqual(
+            VerifyWorker.update_weights_from_tensor(worker, tensor_req),
+            (True, "tensor"),
+        )
+        self.assertEqual(
+            calls,
+            [("disk", disk_req), ("ipc", ipc_req), ("tensor", tensor_req)],
+        )
+
+    def test_verify_worker_rejects_state_with_draft_resources(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        state = SpecRuntimeState(
+            speculative_num_steps=1,
+            speculative_num_draft_tokens=2,
+            draft_attn_backend=object(),
+            target_attn_backend=object(),
+            target_graph_runner=object(),
+        )
+        worker = object.__new__(VerifyWorker)
+
+        with self.assertRaisesRegex(ValueError, "must not carry draft resources"):
+            VerifyWorker._validate_decoupled_runtime_state(worker, state)
+
+    def test_zero_step_runtime_state_builds_decode_graph_runner(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        attn_backend = object()
+        graph_runner = SimpleNamespace(capture_bs=[8], num_tokens_per_bs=1)
+        server_args = SimpleNamespace(
+            speculative_num_steps=8,
+            speculative_num_draft_tokens=9,
+            cuda_graph_bs_decode=None,
+            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[8])),
+            decoupled_spec_target_verify_token_budget=65,
+        )
+        model_runner = SimpleNamespace(
+            gpu_id=0,
+            init_new_workspace=False,
+            server_args=server_args,
+            _get_attention_backend=lambda init_new_workspace: attn_backend,
+        )
+        worker = object.__new__(VerifyWorker)
+        worker.device = "cuda"
+        worker.server_args = server_args
+        worker.speculative_num_steps = server_args.speculative_num_steps
+        worker.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        worker._target_worker = SimpleNamespace(model_runner=model_runner)
+
+        with (
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "check_cuda_graph_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker."
+                "DecodeCudaGraphRunner",
+                return_value=graph_runner,
+            ) as graph_runner_cls,
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker.log_info_on_rank0"
+            ),
+        ):
+            state = VerifyWorker.build_adaptive_runtime_state(
+                worker,
+                speculative_num_steps=0,
+                speculative_num_draft_tokens=1,
+                cuda_graph_bs=[8],
+            )
+
+        _, kwargs = graph_runner_cls.call_args
+        self.assertIs(kwargs["attn_backend"], attn_backend)
+        self.assertEqual(kwargs["speculative_num_steps"], 0)
+        self.assertEqual(kwargs["speculative_num_draft_tokens"], 1)
+
+        self.assertEqual(state.speculative_num_steps, 0)
+        self.assertEqual(state.speculative_num_draft_tokens, 1)
+        self.assertIs(state.target_attn_backend, attn_backend)
+        self.assertIs(state.target_graph_runner, graph_runner)
+
+    def test_decoupled_adaptive_allows_zero_step_candidates(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        cfg = {"1": {"candidate_steps": [0, 1]}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
+            json.dump(cfg, f)
+            f.flush()
+
+            args = SimpleNamespace(
+                pp_size=1,
+                decoupled_spec_rank_base=0,
+                page_size=1,
+                max_running_requests=1,
+                disable_overlap_schedule=True,
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="extra_buffer",
+                enable_mixed_chunk=False,
+                disable_piecewise_cuda_graph=False,
+                speculative_algorithm="DECOUPLED_VERIFY",
+                speculative_adaptive=True,
+                speculative_adaptive_config=f.name,
+                speculative_num_steps=1,
+                speculative_num_draft_tokens=2,
+                speculative_eagle_topk=1,
+                decoupled_spec_target_verify_token_budget=65,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.DISABLED),
+                    decode=SimpleNamespace(backend=Backend.FULL),
+                ),
+            )
+
+            DecoupledVerifySpecAlgo.validate_server_args(args)
+
+        self.assertEqual(args.decoupled_spec_target_verify_token_budget, 65)
+        self.assertEqual(args.speculative_num_draft_tokens, 2)
+        self.assertTrue(args.disable_radix_cache)
+        self.assertEqual(args.mamba_radix_cache_strategy, "no_buffer")
 
     def test_draft_tail_buffer_caps_snapshot_tail_without_hiding_raw_tail(self):
         rid = "req-a"

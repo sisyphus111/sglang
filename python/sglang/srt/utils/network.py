@@ -8,11 +8,37 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import psutil
 import zmq
 
 logger = logging.getLogger(__name__)
+
+
+def _format_host_for_url(host: str) -> str:
+    if host.startswith("[") and host.endswith("]"):
+        return host
+    if is_valid_ipv6_address(host):
+        return f"[{host}]"
+    return host
+
+
+def resolve_base_url(base_url: str | None, host: str, port: int) -> str:
+    """Resolve an HTTP base URL from explicit base_url or host/port."""
+    if base_url:
+        return base_url.rstrip("/")
+    return f"http://{_format_host_for_url(host)}:{int(port)}"
+
+
+def resolve_host_port(base_url: str | None, host: str, port: int) -> str:
+    """Resolve a bare host:port endpoint from explicit base_url or host/port."""
+    if base_url:
+        parsed = urlparse(base_url if "://" in base_url else f"//{base_url}")
+        endpoint = parsed.netloc or parsed.path.split("/", 1)[0]
+        if endpoint:
+            return endpoint.rstrip("/")
+    return f"{_format_host_for_url(host)}:{int(port)}"
 
 
 def get_open_port() -> int:
