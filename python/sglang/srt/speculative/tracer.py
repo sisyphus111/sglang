@@ -32,6 +32,13 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "can_run_cuda_graph",
         "graph_path",
         "batch_size",
+        "dynamic_verify_length",
+        "captured_batch_size",
+        "target_verify_token_budget",
+        "num_speculative_steps",
+        "verify_tokens_per_req",
+        "raw_verify_tokens",
+        "padded_verify_tokens",
         "rids",
         "committed_lens_by_req",
         "output_lens_by_req",
@@ -47,6 +54,14 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
     ("verifier", "snapshot_tail_batch"): _fields(
         "forward_mode",
         "batch_size",
+        "dynamic_verify_length",
+        "raw_batch_size",
+        "captured_batch_size",
+        "target_verify_token_budget",
+        "num_speculative_steps",
+        "verify_tokens_per_req",
+        "raw_verify_tokens",
+        "padded_verify_tokens",
         "rids",
         "valid_tail_lens_by_req",
         "raw_tail_lens_by_req",
@@ -604,6 +619,13 @@ def _scheduler_forward_fields(
             else ""
         ),
         batch_size=len(batch.reqs),
+        dynamic_verify_length="",
+        captured_batch_size="",
+        target_verify_token_budget="",
+        num_speculative_steps="",
+        verify_tokens_per_req="",
+        raw_verify_tokens="",
+        padded_verify_tokens="",
         rids=[
             (
                 owner._get_draft_state_by_req(req).key.request_id
@@ -615,6 +637,42 @@ def _scheduler_forward_fields(
         committed_lens_by_req=committed_lens_by_req,
         output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
     )
+    if worker_role == "verifier":
+        runtime_state = getattr(batch, "decoupled_verify_runtime_state", None)
+        shape = (
+            runtime_state.shape
+            if runtime_state is not None
+            else getattr(batch, "decoupled_verify_shape", None)
+        )
+        if shape is not None:
+            event_fields.update(
+                dynamic_verify_length=True,
+                captured_batch_size=int(shape.captured_batch_size),
+                target_verify_token_budget=int(shape.budget),
+                num_speculative_steps=int(shape.num_speculative_steps),
+                verify_tokens_per_req=int(shape.verify_tokens_per_req),
+                raw_verify_tokens=int(shape.raw_verify_tokens),
+                padded_verify_tokens=int(shape.padded_verify_tokens),
+            )
+        elif batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify():
+            num_speculative_steps = int(
+                getattr(owner.server_args, "speculative_num_steps", 0) or 0
+            )
+            verify_tokens_per_req = int(
+                getattr(owner.server_args, "speculative_num_draft_tokens", 0) or 0
+            )
+            event_fields.update(
+                dynamic_verify_length=False,
+                captured_batch_size=len(batch.reqs) if can_run_cuda_graph else "",
+                num_speculative_steps=num_speculative_steps,
+                verify_tokens_per_req=verify_tokens_per_req,
+                raw_verify_tokens=len(batch.reqs) * verify_tokens_per_req,
+                padded_verify_tokens=(
+                    len(batch.reqs) * verify_tokens_per_req
+                    if can_run_cuda_graph
+                    else ""
+                ),
+            )
     return event_fields
 
 

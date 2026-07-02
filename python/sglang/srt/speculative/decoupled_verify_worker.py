@@ -5,16 +5,27 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.common import alloc_for_decode
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleVerifyInput, EagleVerifyOutput
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
-from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    eagle_prepare_for_verify,
+    eagle_sample,
+)
+from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
+    generate_token_bitmask,
+)
+from sglang.srt.speculative.spec_info import dynamic_verify_enabled
+from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
@@ -82,8 +93,6 @@ def _build_linear_topk1_tree_metadata(
 
 
 class VerifyWorker:
-    _mamba_verify_update = EAGLEWorker._mamba_verify_update
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -111,7 +120,7 @@ class VerifyWorker:
         self.speculative_num_draft_tokens = int(
             server_args.speculative_num_draft_tokens
         )
-        self.enable_nan_detection = bool(server_args.enable_nan_detection)
+        self.dynamic_verify_length = dynamic_verify_enabled(server_args)
         self.device = self.model_runner.device
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -122,14 +131,50 @@ class VerifyWorker:
     def clear_cache_pool(self):
         return
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        if req_to_token_pool is not None:
+            self.req_to_token_pool = req_to_token_pool
+        if token_to_kv_pool_allocator is not None:
+            self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+    def init_attention_backends(self):
+        return
+
+    def init_cuda_graphs(self):
+        return
+
+    def on_verify_complete_cpu(self, *args, **kwargs):
+        return
+
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         return self.target_worker.update_weights_from_tensor(recv_req)
 
-    def _get_verify_buffers(self, draft_token_num: int):
-        if draft_token_num != self.speculative_num_draft_tokens:
+    def _decoupled_verify_runtime_state(self, batch: ScheduleBatch):
+        return getattr(batch, "decoupled_verify_runtime_state", None)
+
+    def _get_verify_buffers(self, draft_token_num: int, batch: ScheduleBatch | None):
+        if draft_token_num > self.speculative_num_draft_tokens:
+            return None, None
+        if (
+            draft_token_num != self.speculative_num_draft_tokens
+            and not self.dynamic_verify_length
+        ):
             return None, None
 
-        attn_backend = getattr(self.target_worker.model_runner, "attn_backend", None)
+        runtime_state = (
+            self._decoupled_verify_runtime_state(batch) if batch is not None else None
+        )
+        attn_backend = (
+            runtime_state.target_attn_backend
+            if runtime_state is not None
+            and runtime_state.target_attn_backend is not None
+            else getattr(self.target_worker.model_runner, "attn_backend", None)
+        )
         if attn_backend is None:
             return None, None
 
@@ -175,31 +220,47 @@ class VerifyWorker:
 
         raise RuntimeError("External draft verification requires an EOS token id.")
 
-    def _build_req_verify_tokens(self, req, pad_token_id: int) -> list[int]:
+    def _decoupled_verify_shape(self, batch: ScheduleBatch):
+        runtime_state = self._decoupled_verify_runtime_state(batch)
+        if runtime_state is not None:
+            return runtime_state.shape
+        return getattr(batch, "decoupled_verify_shape", None)
+
+    def _effective_verify_shape(self, batch: ScheduleBatch) -> tuple[int, int]:
+        shape = self._decoupled_verify_shape(batch)
+        if shape is None:
+            return self.speculative_num_steps, self.speculative_num_draft_tokens
+        return int(shape.num_speculative_steps), int(shape.verify_tokens_per_req)
+
+    def _build_req_verify_tokens(
+        self, req, pad_token_id: int, spec_depth: int
+    ) -> list[int]:
         tail_token = _get_req_tail_token_id(req)
         draft_buffer = list(getattr(req, "draft_buffer", []) or [])
-        spec_depth = self.speculative_num_draft_tokens - 1
         draft_tokens = list(draft_buffer[:spec_depth])
         if len(draft_tokens) < spec_depth:
             draft_tokens.extend([int(pad_token_id)] * (spec_depth - len(draft_tokens)))
         return [tail_token, *draft_tokens]
 
-    def _get_snapshot_tail_lens(self, batch: ScheduleBatch) -> list[int]:
+    def _get_snapshot_tail_lens(
+        self, batch: ScheduleBatch, spec_depth: int
+    ) -> list[int]:
         return [
             min(
                 len(list(getattr(req, "draft_buffer", []) or [])),
-                self.speculative_num_draft_tokens - 1,
+                spec_depth,
             )
             for req in batch.reqs
         ]
 
-    def _assert_verify_output_within_snapshot_tail(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    def _assert_num_correct_within_snapshot_tail(
+        self, batch: ScheduleBatch, num_correct_drafts_per_req_cpu: list[int]
     ) -> list[int]:
         # req.draft_buffer is a per-forward snapshot bound before verify. Any
         # concurrent drafter appends belong to later verify rounds.
-        real_tail_lens = self._get_snapshot_tail_lens(batch)
-        raw_accept_lens = [int(x) for x in verify_output.num_correct_drafts_per_req_cpu]
+        spec_steps, _ = self._effective_verify_shape(batch)
+        real_tail_lens = self._get_snapshot_tail_lens(batch, spec_steps)
+        raw_accept_lens = [int(x) for x in num_correct_drafts_per_req_cpu]
         for req, raw_accept_len, real_tail_len in zip(
             batch.reqs, raw_accept_lens, real_tail_lens
         ):
@@ -210,27 +271,131 @@ class VerifyWorker:
                 f"snapshot_tail_len={real_tail_len}"
             )
 
-        if verify_output.accept_tokens is None:
-            raise RuntimeError("Decoupled verify did not produce accepted tokens.")
-
         return raw_accept_lens
 
-    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        draft_token_num = self.speculative_num_draft_tokens
-        if draft_token_num < 2:
+    def _record_valid_draft_metrics(
+        self, batch: ScheduleBatch, num_correct_drafts_per_req_cpu: list[int]
+    ) -> None:
+        spec_steps, _ = self._effective_verify_shape(batch)
+        for req, accepted_drafts in zip(batch.reqs, num_correct_drafts_per_req_cpu):
+            valid_draft_tokens = min(
+                len(list(getattr(req, "draft_buffer", []) or [])), spec_steps
+            )
+            valid_accepted_tokens = min(int(accepted_drafts), valid_draft_tokens)
+            req.spec_valid_draft_tokens += valid_draft_tokens
+            req.spec_valid_accepted_tokens += valid_accepted_tokens
+            metric_len = max(
+                spec_steps,
+                len(req.spec_valid_draft_tokens_by_position),
+                len(req.spec_valid_accepted_tokens_by_position),
+            )
+            req.spec_valid_draft_tokens_by_position = (
+                req.spec_valid_draft_tokens_by_position + [0] * metric_len
+            )[:metric_len]
+            req.spec_valid_accepted_tokens_by_position = (
+                req.spec_valid_accepted_tokens_by_position + [0] * metric_len
+            )[:metric_len]
+            for pos in range(valid_draft_tokens):
+                req.spec_valid_draft_tokens_by_position[pos] += 1
+            for pos in range(valid_accepted_tokens):
+                req.spec_valid_accepted_tokens_by_position[pos] += 1
+
+    def _forward_decode_as_zero_step(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        shape = self._decoupled_verify_shape(batch)
+        if shape is None or not shape.uses_decode_graph:
             raise RuntimeError(
-                "External draft verification requires at least one draft token per request."
+                "zero-step decoupled verifier decode fallback requires a "
+                "dynamic verify shape with num_speculative_steps == 0."
+            )
+        log_key = (int(shape.captured_batch_size), int(shape.verify_tokens_per_req))
+        if log_key != getattr(self, "_last_zero_step_decode_graph_log_key", None):
+            setattr(self, "_last_zero_step_decode_graph_log_key", log_key)
+            log_info_on_rank0(
+                logger,
+                "Decoupled verifier dynamic verify selected zero speculative "
+                "steps; running decode CUDA Graph: "
+                f"raw_bs={shape.raw_batch_size}, "
+                f"captured_bs={shape.captured_batch_size}, "
+                f"verify_tokens_per_req={shape.verify_tokens_per_req}, "
+                f"padded_verify_tokens={shape.padded_verify_tokens}, "
+                f"budget={shape.budget}",
+            )
+
+        batch.spec_info = None
+        batch.return_hidden_states = False
+        batch.forward_mode = ForwardMode.DECODE
+        batch.input_ids = torch.tensor(
+            [_get_req_tail_token_id(req) for req in batch.reqs],
+            dtype=torch.int64,
+            device=batch.device,
+        )
+        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
+        batch.seq_lens.add_(1)
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu.add_(1)
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+        batch_result = self.target_worker.forward_batch_generation(batch)
+        if self.dynamic_verify_length and not batch_result.can_run_cuda_graph:
+            raise RuntimeError(
+                "Decoupled verifier dynamic verify length selected zero "
+                "speculative steps, but the fallback decode forward did not use "
+                f"CUDA Graph: shape={shape}"
+            )
+
+        next_token_ids_obj = batch_result.next_token_ids
+        if isinstance(next_token_ids_obj, torch.Tensor):
+            next_token_ids = [int(x) for x in next_token_ids_obj.tolist()]
+        else:
+            next_token_ids = [int(x) for x in next_token_ids_obj]
+        if len(next_token_ids) != len(batch.reqs):
+            raise RuntimeError(
+                "zero-step decoupled verifier decode returned unexpected token "
+                "count: "
+                f"num_tokens={len(next_token_ids)}, batch_size={len(batch.reqs)}"
+            )
+
+        batch_result.num_correct_drafts = 0
+        batch_result.num_correct_drafts_per_req_cpu = [0] * len(batch.reqs)
+        batch_result.next_token_ids = (
+            next_token_ids_obj
+            if isinstance(next_token_ids_obj, torch.Tensor)
+            else torch.tensor(next_token_ids, dtype=torch.long, device=batch.device)
+        )
+        return batch_result
+
+    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        spec_steps, draft_token_num = self._effective_verify_shape(batch)
+        if draft_token_num < 1:
+            raise RuntimeError(
+                "External draft verification requires at least one verify token per request."
             )
 
         if batch.forward_mode.is_idle():
             spec_info = EagleVerifyInput.create_idle_input(
                 self.topk,
-                self.speculative_num_steps,
+                spec_steps,
                 draft_token_num,
             )
             # Decoupled verify does not consume target hidden states. Keep idle
             # companion ranks on the same NULL-hidden CUDA graph as active ranks.
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+            setattr(
+                spec_info,
+                "decoupled_verify_runtime_state",
+                getattr(batch, "decoupled_verify_runtime_state", None),
+            )
+            setattr(
+                spec_info,
+                "decoupled_verify_shape",
+                self._decoupled_verify_shape(batch),
+            )
             return spec_info
 
         batch.maybe_evict_swa()
@@ -258,9 +423,9 @@ class VerifyWorker:
         pad_token_id = self._get_pad_token_id()
 
         full_draft_tokens_by_req = [
-            self._build_req_verify_tokens(req, pad_token_id) for req in batch.reqs
+            self._build_req_verify_tokens(req, pad_token_id, spec_steps)
+            for req in batch.reqs
         ]
-        spec_steps = draft_token_num - 1
         bonus_tokens = torch.tensor(
             [tokens[0] for tokens in full_draft_tokens_by_req],
             dtype=torch.long,
@@ -279,7 +444,9 @@ class VerifyWorker:
             batch.device,
         )
 
-        tree_mask_buf, position_buf = self._get_verify_buffers(draft_token_num)
+        tree_mask_buf, position_buf = self._get_verify_buffers(
+            draft_token_num, batch=batch
+        )
 
         (
             tree_mask,
@@ -304,14 +471,15 @@ class VerifyWorker:
         )
 
         terminal_indices = torch.tensor(
-            self._get_snapshot_tail_lens(batch),
+            self._get_snapshot_tail_lens(batch, spec_steps),
             dtype=torch.long,
             device=batch.device,
         )
         row_indices = torch.arange(batch_size, dtype=torch.long, device=batch.device)
+        terminal_indices = torch.clamp(terminal_indices, max=draft_token_num - 1)
         retrieve_next_token[row_indices, terminal_indices] = -1
 
-        return EagleVerifyInput(
+        spec_info = EagleVerifyInput(
             draft_token=flat_draft_tokens,
             custom_mask=tree_mask,
             positions=positions,
@@ -326,6 +494,17 @@ class VerifyWorker:
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
+        setattr(
+            spec_info,
+            "decoupled_verify_runtime_state",
+            getattr(batch, "decoupled_verify_runtime_state", None),
+        )
+        setattr(
+            spec_info,
+            "decoupled_verify_shape",
+            self._decoupled_verify_shape(batch),
+        )
+        return spec_info
 
     def verify(
         self,
@@ -335,16 +514,20 @@ class VerifyWorker:
         was_idle = batch.forward_mode.is_idle()
         seq_lens_pre_verify = batch.seq_lens.clone()
 
-        spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        spec_info.num_tokens_per_req = spec_info.draft_token_num
         batch.return_hidden_states = False
-        batch.forward_mode = ForwardMode.IDLE if was_idle else ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
 
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu
+        verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+            spec_info,
+            self.req_to_token_pool,
+            batch,
+            self.target_worker,
+            capture_hidden_mode=spec_info.capture_hidden_mode,
+            allocate_verify_slots=True,
+            page_size=self.page_size,
         )
-        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+        assert verify_forward_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
@@ -354,11 +537,13 @@ class VerifyWorker:
             ).cpu()
 
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
+            bool(batch_result.can_run_cuda_graph or can_run_cuda_graph),
         )
 
         vocab_mask = None
@@ -381,36 +566,45 @@ class VerifyWorker:
             logits_output.next_token_logits, "decoupled_verify: target model logits"
         )
 
-        # Decoupled verify has no local draft-extend consumer for target hidden
-        # states, but EagleVerifyInput.verify expects this attribute to exist.
-        spec_info.hidden_states = None
-        verify_output: EagleVerifyOutput = spec_info.verify(
-            batch,
-            logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask,
+        predict, accept_lens, accept_index = eagle_sample(
+            spec_info, batch, logits_output, vocab_mask
         )
+        num_correct_drafts_per_req_cpu = (accept_lens - 1).cpu().tolist()
+        self._assert_num_correct_within_snapshot_tail(
+            batch, num_correct_drafts_per_req_cpu
+        )
+        self._record_valid_draft_metrics(batch, num_correct_drafts_per_req_cpu)
 
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            verify_output.accept_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                verify_output.accept_indices
-            ]
+        if not was_idle:
+            if self.page_size != 1:
+                raise RuntimeError(
+                    "Decoupled verifier currently requires page_size == 1."
+                )
+            accepted_indices = accept_index[accept_index != -1]
+            evict_mask = torch.full_like(
+                spec_info.draft_token, True, dtype=torch.bool
+            )
+            evict_mask[accepted_indices] = False
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            batch.out_cache_loc = batch.out_cache_loc[accepted_indices]
 
-        if (
+        if (not was_idle) and (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, verify_output, logits_output, spec_info, seq_lens_pre_verify
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                spec_info.draft_token_num,
             )
 
         if batch.return_logprob:
-            add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
+            compute_spec_v2_logprobs(
+                batch, logits_output, predict, accept_index, spec_info.spec_steps
+            )
 
         batch.forward_mode = ForwardMode.IDLE if was_idle else ForwardMode.DECODE
         # Decoupled verify rebuilds verify inputs from fresh external draft
@@ -418,7 +612,10 @@ class VerifyWorker:
         batch.spec_info = None
         return (
             logits_output,
-            verify_output,
+            predict,
+            accept_lens,
+            num_correct_drafts_per_req_cpu,
+            seq_lens_pre_verify + accept_lens,
             can_run_cuda_graph,
         )
 
@@ -433,29 +630,47 @@ class VerifyWorker:
             result = self.target_worker.forward_batch_generation(model_worker_batch)
             return result
 
+        shape = self._decoupled_verify_shape(batch)
+        if (
+            self.dynamic_verify_length
+            and shape is not None
+            and shape.uses_decode_graph
+            and batch.forward_mode.is_decode_or_idle()
+        ):
+            result = self._forward_decode_as_zero_step(batch)
+            num_verified_reqs = len(result.num_correct_drafts_per_req_cpu or [])
+            self.total_num_verified_reqs += num_verified_reqs
+            return result
+
         spec_info = self.draft(batch)
-        can_use_full_graph_path = (
-            spec_info.draft_token_num == self.speculative_num_draft_tokens
-        )
         (
             logits_output,
-            verify_output,
+            predict,
+            accept_lens,
+            num_correct_drafts_per_req_cpu,
+            new_seq_lens,
             can_run_cuda_graph,
         ) = self.verify(batch, spec_info)
 
-        num_correct_drafts_per_req_cpu = (
-            self._assert_verify_output_within_snapshot_tail(batch, verify_output)
-        )
-        accepted_tokens = verify_output.accept_tokens
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
-        reported_can_run_cuda_graph = can_run_cuda_graph and can_use_full_graph_path
+        reported_can_run_cuda_graph = can_run_cuda_graph
+        if self.dynamic_verify_length and not reported_can_run_cuda_graph:
+            shape = self._decoupled_verify_shape(batch)
+            raise RuntimeError(
+                "Decoupled verifier dynamic verify length requires full CUDA "
+                "Graph replay for target verify, but this forward ran without it: "
+                f"shape={shape}, draft_token_num={spec_info.draft_token_num}"
+            )
 
         result = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accepted_tokens,
+            next_token_ids=predict,
             num_correct_drafts=num_correct_drafts,
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=reported_can_run_cuda_graph,
+            speculative_num_draft_tokens=spec_info.draft_token_num,
+            accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
         )
         num_verified_reqs = len(num_correct_drafts_per_req_cpu)
         self.total_accept_length += int(result.num_correct_drafts)

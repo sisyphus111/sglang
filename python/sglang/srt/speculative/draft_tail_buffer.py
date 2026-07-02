@@ -630,10 +630,15 @@ class DraftTailBuffer:
         *,
         allow_partial: bool = True,
         include_raw_tail_tokens: bool = False,
+        max_tail_len: int | None = None,
     ) -> list[DraftTailSnapshot]:
+        tail_cap = None if max_tail_len is None else max(0, int(max_tail_len))
         with self._condition:
             if not allow_partial:
-                min_raw_tail_len = max(1, self.required_tail_len)
+                required_tail_len = self.required_tail_len
+                if tail_cap is not None:
+                    required_tail_len = min(required_tail_len, tail_cap)
+                min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
                 self._wait_for_draft_tokens_locked(
                     [req.rid for req in reqs], min_raw_tail_len
                 )
@@ -646,7 +651,11 @@ class DraftTailBuffer:
                     DraftTailSnapshot(
                         request_id=req.rid,
                         committed_len=int(state.committed_len),
-                        tail_tokens=state.consumable_tail_tokens(),
+                        tail_tokens=(
+                            state.consumable_tail_tokens()
+                            if tail_cap is None
+                            else state.consumable_tail_tokens()[:tail_cap]
+                        ),
                         raw_tail_len=len(state.tail_tokens),
                         raw_tail_tokens=(
                             list(state.tail_tokens) if include_raw_tail_tokens else []

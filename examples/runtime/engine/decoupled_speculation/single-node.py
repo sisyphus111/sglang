@@ -197,6 +197,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-speculative-steps", type=int, default=3)
+    parser.add_argument(
+        "--decoupled-spec-dynamic-verify-length",
+        action="store_true",
+        help=(
+            "Enable token-budget based dynamic verify length on the decoupled "
+            "verifier target engine."
+        ),
+    )
+    parser.add_argument(
+        "--decoupled-spec-target-verify-token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Strict target verify token budget used when "
+            "--decoupled-spec-dynamic-verify-length is enabled."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--deterministic",
@@ -682,6 +699,13 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
+    if args.decoupled_spec_dynamic_verify_length:
+        budget = args.decoupled_spec_target_verify_token_budget
+        if budget is None or budget <= 0:
+            raise ValueError(
+                "--decoupled-spec-target-verify-token-budget must be positive "
+                "when --decoupled-spec-dynamic-verify-length is enabled"
+            )
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
     if args.draft_ngpus is not None and args.draft_ngpus <= 0:
@@ -1057,6 +1081,11 @@ def create_verifier_engine(
     )
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.decoupled_spec_dynamic_verify_length:
+        engine_kwargs["decoupled_spec_dynamic_verify_length"] = True
+        engine_kwargs["decoupled_spec_target_verify_token_budget"] = (
+            args.decoupled_spec_target_verify_token_budget
+        )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:
@@ -1226,6 +1255,17 @@ def main() -> None:
         flush=True,
     )
     print(f"  target_engine_tp_size: {target_engine_tp_size}", flush=True)
+    print(
+        "  decoupled_spec_dynamic_verify_length: "
+        f"{args.decoupled_spec_dynamic_verify_length}",
+        flush=True,
+    )
+    if args.decoupled_spec_dynamic_verify_length:
+        print(
+            "  decoupled_spec_target_verify_token_budget: "
+            f"{args.decoupled_spec_target_verify_token_budget}",
+            flush=True,
+        )
     print(f"  draft_gpus: {args.draft_gpus}", flush=True)
     if reserved_ports is not None:
         print(f"  reserved_ports: {reserved_ports}", flush=True)

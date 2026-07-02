@@ -32,6 +32,12 @@ from sglang.srt.speculative.decoupled_spec_io import (
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
 )
+from sglang.srt.speculative.spec_info import (
+    DecoupledVerifyRuntimeState,
+    DecoupledVerifyShape,
+    compute_runtime_state_from_capture_bs,
+    dynamic_verify_enabled,
+)
 from sglang.srt.speculative.cpp_decoupled_spec import (
     CppDraftProxyThread,
     CppDraftTailBuffer,
@@ -45,7 +51,7 @@ from sglang.srt.speculative.tracer import (
 from sglang.srt.speculative.draft_proxy import DraftProxyThread
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
 from sglang.srt.speculative.token_sync_thread import TokenSyncThread
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import broadcast_pyobj, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -58,6 +64,7 @@ class DraftReqState:
     key: DraftReqKey
     req: Optional[Req] = None
     verifier_committed_prefix_len: int = 0
+    streamed_output_len: int = 0
     is_sleeping: bool = False
     mamba_checkpoint_positions: set[int] = field(default_factory=set)
     mamba_checkpoint_slots: Optional[torch.Tensor] = None
@@ -111,7 +118,9 @@ class SchedulerDecoupledSpecMixin:
 
     def get_decoupled_spec_local_dp_rank(self: Scheduler) -> int:
         local_dp_rank = (
-            self.attn_dp_rank if self.server_args.enable_dp_attention else self.dp_rank
+            self.ps.attn_dp_rank
+            if self.server_args.enable_dp_attention
+            else self.ps.dp_rank
         )
         return 0 if local_dp_rank is None else int(local_dp_rank)
 
@@ -207,7 +216,7 @@ class SchedulerDecoupledSpecMixin:
             else TokenSyncThread
         )
         self.token_sync_thread = token_sync_cls(
-            context=getattr(self, "zmq_context", None),
+            context=self.ipc_channels.context,
             drafter_rank=self.get_decoupled_spec_rank(),
             tracer=self.tracer,
         )
@@ -298,6 +307,7 @@ class SchedulerDecoupledSpecMixin:
 
         stream_output_batch = DraftTailStreamOutputBatch()
         src_drafter_rank = self.get_decoupled_spec_rank()
+        streamed_output_len_updates: dict[DraftReqKey, int] = {}
         for req_batch_idx in emit_candidate_indices:
             if not (0 <= req_batch_idx < len(batch.reqs)):
                 continue
@@ -320,6 +330,9 @@ class SchedulerDecoupledSpecMixin:
                     new_token_id=token_id,
                 )
             )
+            streamed_output_len_updates[state.key] = max(
+                streamed_output_len_updates.get(state.key, 0), token_pos + 1
+            )
 
         trace_payload = {
             "num_emit_candidates": len(emit_candidate_indices),
@@ -333,6 +346,12 @@ class SchedulerDecoupledSpecMixin:
         setattr(stream_output_batch, "_decoupled_spec_payload", trace_payload)
         if stream_output_batch.outputs and self.is_draft_entry_rank():
             self._get_token_sync_thread().submit_draft_results(stream_output_batch)
+        for draft_key, streamed_output_len in streamed_output_len_updates.items():
+            state = self.draft_req_table.get(draft_key)
+            if state is not None:
+                state.streamed_output_len = max(
+                    int(state.streamed_output_len), int(streamed_output_len)
+                )
         return stream_output_batch
 
     def prepare_verify_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
@@ -353,8 +372,8 @@ class SchedulerDecoupledSpecMixin:
                 or self.spec_algorithm.is_eagle()
             )
         )
-        dp_rank = self.dp_rank or 0
-        rank_suffix = f"dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}"
+        dp_rank = self.ps.dp_rank or 0
+        rank_suffix = f"dp{dp_rank}_tp{self.ps.tp_rank}_pp{self.ps.pp_rank}"
         if self.spec_algorithm.is_decoupled_verify():
             forward_trace_prefix = "verifier"
         elif self.spec_algorithm.is_decoupled_draft():
@@ -388,6 +407,26 @@ class SchedulerDecoupledSpecMixin:
             return "eager"
         if batch.forward_mode.is_decode():
             if self.spec_algorithm.is_decoupled_verify():
+                runtime_state = getattr(
+                    batch, "decoupled_verify_runtime_state", None
+                )
+                shape = (
+                    runtime_state.shape
+                    if runtime_state is not None
+                    else getattr(batch, "decoupled_verify_shape", None)
+                )
+                if shape is not None:
+                    if shape.uses_decode_graph:
+                        return (
+                            "cuda_graph_decode_zero_step"
+                            f":bs{shape.captured_batch_size}"
+                            f":vt{shape.verify_tokens_per_req}"
+                        )
+                    return (
+                        "cuda_graph_target_verify"
+                        f":bs{shape.captured_batch_size}"
+                        f":vt{shape.verify_tokens_per_req}"
+                    )
                 return "cuda_graph_target_verify"
             return "cuda_graph_decode"
         if batch.forward_mode.is_extend(include_draft_extend_v2=True):
@@ -399,9 +438,9 @@ class SchedulerDecoupledSpecMixin:
     def is_draft_entry_rank(self: Scheduler) -> bool:
         return (
             self.spec_algorithm.is_decoupled_draft()
-            and self.pp_rank == 0
-            and self.attn_tp_rank == 0
-            and self.attn_cp_rank == 0
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
         )
 
     def _broadcast_ready_draft_controls(
@@ -431,13 +470,13 @@ class SchedulerDecoupledSpecMixin:
             return payload[0]
 
         if getattr(self.server_args, "enable_dp_attention", False):
-            if self.attn_tp_size != 1:
+            if self.ps.attn_tp_size != 1:
                 ready_controls = broadcast_ready_controls(
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-            if self.attn_cp_size != 1:
+            if self.ps.attn_cp_size != 1:
                 ready_controls = broadcast_ready_controls(
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
@@ -449,7 +488,7 @@ class SchedulerDecoupledSpecMixin:
                 else ReadyDraftControls()
             )
 
-        if self.tp_size != 1:
+        if self.ps.tp_size != 1:
             ready_controls = broadcast_ready_controls(
                 self.tp_group.rank,
                 self.tp_cpu_group,
@@ -505,7 +544,7 @@ class SchedulerDecoupledSpecMixin:
         if slots is None:
             return
 
-        self.req_to_token_pool.mamba_pool.free(slots)
+        self.req_to_token_pool.mamba_allocator.free(slots)
 
     def _ensure_draft_mamba_ckpt_slots(
         self: Scheduler,
@@ -526,20 +565,21 @@ class SchedulerDecoupledSpecMixin:
             )
 
         mamba_pool = self.req_to_token_pool.mamba_pool
-        if mamba_pool is None:
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_pool is None or mamba_allocator is None:
             raise RuntimeError(
                 "Decoupled drafter mamba checkpoint requested without a mamba pool: "
                 f"request_id={state.key.request_id}"
             )
 
-        slots = mamba_pool.alloc(window)
+        slots = mamba_allocator.alloc(window)
         if slots is None:
             raise RuntimeError(
                 "Not enough space for decoupled drafter mamba rollback "
                 "checkpoints. Try to increase --mamba-full-memory-ratio or "
                 f"--max-mamba-cache-size. request_id={state.key.request_id}, "
                 f"window={window}, mamba_pool_size={mamba_pool.size}, "
-                f"mamba_available_size={mamba_pool.available_size()}"
+                f"mamba_available_size={mamba_allocator.available_size()}"
             )
 
         state.mamba_checkpoint_slots = slots
@@ -754,17 +794,19 @@ class SchedulerDecoupledSpecMixin:
                 "running_batch. Verifier commit segment metadata updates should "
                 "only be queued for requests in running_batch."
             )
+        token_ids_tensor = batch.output_ids
+        if token_ids_tensor is None:
+            token_ids_tensor = batch.input_ids
         if (
             batch.seq_lens_cpu is None
             or batch.seq_lens is None
             or batch.orig_seq_lens is None
-            or batch.output_ids is None
             or batch.seq_lens_sum is None
         ):
             raise RuntimeError(
                 "Decoupled draft batch metadata update requires complete "
                 "running_batch metadata: seq_lens_cpu, seq_lens, "
-                "orig_seq_lens, output_ids, and seq_lens_sum must be set."
+                "orig_seq_lens, and seq_lens_sum must be set."
             )
 
         req_batch_idx_set = {update.req_batch_idx for update in batch_metadata_updates}
@@ -803,16 +845,31 @@ class SchedulerDecoupledSpecMixin:
 
         metadata_device = metadata_cpu.to(device=device, non_blocking=True)
         block_size = 256
-        _flush_draft_batch_metadata_updates_kernel[
-            (triton.cdiv(num_updates, block_size),)
-        ](
-            metadata_device,
-            batch.seq_lens,
-            batch.orig_seq_lens,
-            batch.output_ids,
-            num_updates,
-            BLOCK_SIZE=block_size,
-        )
+        if token_ids_tensor is not None:
+            _flush_draft_batch_metadata_updates_kernel[
+                (triton.cdiv(num_updates, block_size),)
+            ](
+                metadata_device,
+                batch.seq_lens,
+                batch.orig_seq_lens,
+                token_ids_tensor,
+                num_updates,
+                BLOCK_SIZE=block_size,
+            )
+        else:
+            req_batch_indices_device = metadata_device[0]
+            new_seq_lens_device = metadata_device[1]
+            new_tail_token_ids_device = metadata_device[2]
+            batch.seq_lens[req_batch_indices_device] = new_seq_lens_device.to(
+                batch.seq_lens.dtype
+            )
+            batch.orig_seq_lens[req_batch_indices_device] = new_seq_lens_device.to(
+                batch.orig_seq_lens.dtype
+            )
+            req_pool_indices = batch.req_pool_indices[req_batch_indices_device]
+            self.future_map.output_tokens_buf[req_pool_indices] = (
+                new_tail_token_ids_device.to(torch.int64)
+            )
 
         batch.seq_lens_sum += seq_lens_delta
 
@@ -920,6 +977,9 @@ class SchedulerDecoupledSpecMixin:
         if matched_segment_len == committed_segment_len:
             # all committed_tokens match the drafter's output, simply advance the committed prefix
             state.verifier_committed_prefix_len = new_committed_len
+            state.streamed_output_len = max(
+                int(state.streamed_output_len), new_committed_len
+            )
             self._prune_draft_mamba_ckpts(state)
             return
 
@@ -1069,6 +1129,7 @@ class SchedulerDecoupledSpecMixin:
             )
 
         state.verifier_committed_prefix_len = new_committed_len
+        state.streamed_output_len = new_committed_len
         self._prune_draft_mamba_ckpts(state)
 
         if req_batch_idx is not None:
@@ -1199,7 +1260,9 @@ class SchedulerDecoupledSpecMixin:
             stream=False,
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
-            metrics_collector=(self.metrics_collector if self.enable_metrics else None),
+            metrics_collector=(
+                self.metrics_collector if self.server_args.enable_metrics else None
+            ),
         )
         req.tokenizer = self.tokenizer
         req.output_ids = list(message.committed_output_ids)
@@ -1207,6 +1270,7 @@ class SchedulerDecoupledSpecMixin:
         self.init_req_max_new_tokens(req)
         state.req = req
         state.verifier_committed_prefix_len = len(req.output_ids)
+        state.streamed_output_len = len(req.output_ids)
         return req
 
     def _draft_commit_segment_consumable_len(
@@ -1446,11 +1510,144 @@ class SchedulerDecoupledSpecMixin:
         draft_tokens = self.server_args.speculative_num_draft_tokens
         return max(0, int(draft_tokens or 0) * 2)
 
+    def _get_decoupled_verify_graph_runner(self: Scheduler):
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return None
+        for attr in ("decode_cuda_graph_runner", "graph_runner"):
+            graph_runner = getattr(model_runner, attr, None)
+            if graph_runner is not None:
+                return graph_runner
+        return None
+
+    def _get_decoupled_verify_capture_bs(self: Scheduler) -> list[int]:
+        graph_runner = self._get_decoupled_verify_graph_runner()
+        if graph_runner is not None and getattr(graph_runner, "capture_bs", None):
+            return [int(bs) for bs in graph_runner.capture_bs]
+        cuda_graph_config = getattr(self.server_args, "cuda_graph_config", None)
+        decode_config = getattr(cuda_graph_config, "decode", None)
+        capture_bs = getattr(decode_config, "bs", None)
+        if capture_bs:
+            return [int(bs) for bs in capture_bs]
+        max_bs = getattr(decode_config, "max_bs", None)
+        if max_bs is not None:
+            return [int(max_bs)]
+        capture_bs = getattr(self.server_args, "cuda_graph_bs", None)
+        if capture_bs:
+            return [int(bs) for bs in capture_bs]
+        max_bs = getattr(self.server_args, "cuda_graph_max_bs", None)
+        if max_bs is not None:
+            return [int(max_bs)]
+        raise RuntimeError(
+            "Cannot determine decoupled verifier CUDA graph batch sizes for "
+            "dynamic verify length."
+        )
+
+    def _select_decoupled_verify_shape(
+        self: Scheduler, raw_batch_size: int
+    ) -> DecoupledVerifyShape | None:
+        state = self._select_decoupled_verify_runtime_state(raw_batch_size)
+        return state.shape if state is not None else None
+
+    def _select_decoupled_verify_runtime_state(
+        self: Scheduler, raw_batch_size: int
+    ) -> DecoupledVerifyRuntimeState | None:
+        if not dynamic_verify_enabled(self.server_args):
+            return None
+        if getattr(self.server_args, "disable_cuda_graph", False):
+            raise RuntimeError(
+                "decoupled verifier dynamic verify length requires full CUDA Graph."
+            )
+        budget = getattr(
+            self.server_args, "decoupled_spec_target_verify_token_budget", None
+        )
+        if budget is None:
+            raise RuntimeError(
+                "decoupled verifier dynamic verify length requires "
+                "--decoupled-spec-target-verify-token-budget."
+            )
+        graph_runner = self._get_decoupled_verify_graph_runner()
+        select_state = getattr(
+            graph_runner, "select_decoupled_verify_runtime_state", None
+        )
+        if select_state is not None:
+            state = select_state(int(raw_batch_size))
+            if state is not None:
+                return state
+
+        select_shape = getattr(graph_runner, "select_decoupled_verify_shape", None)
+        if select_shape is not None:
+            shape = select_shape(int(raw_batch_size))
+            if shape is not None:
+                return self._build_decoupled_verify_runtime_state(shape, graph_runner)
+
+        return compute_runtime_state_from_capture_bs(
+            raw_batch_size=int(raw_batch_size),
+            capture_bs=self._get_decoupled_verify_capture_bs(),
+            budget=int(budget),
+            max_speculative_num_steps=int(self.server_args.speculative_num_steps),
+            target_attn_backend=self._get_decoupled_verify_attn_backend(),
+            target_graph_runner=graph_runner,
+        )
+
+    def _get_decoupled_verify_attn_backend(self: Scheduler):
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        return getattr(model_runner, "attn_backend", None)
+
+    def _build_decoupled_verify_runtime_state(
+        self: Scheduler,
+        shape: DecoupledVerifyShape,
+        graph_runner=None,
+    ) -> DecoupledVerifyRuntimeState:
+        return DecoupledVerifyRuntimeState(
+            shape=shape,
+            target_attn_backend=self._get_decoupled_verify_attn_backend(),
+            target_graph_runner=graph_runner,
+        )
+
+    def _maybe_log_decoupled_verify_shape_selection(
+        self: Scheduler, shape: DecoupledVerifyShape | None
+    ) -> None:
+        if shape is None:
+            return
+        log_key = (
+            int(shape.raw_batch_size),
+            int(shape.captured_batch_size),
+            int(shape.verify_tokens_per_req),
+            int(shape.num_speculative_steps),
+        )
+        if log_key == getattr(self, "_last_decoupled_verify_shape_log_key", None):
+            return
+        setattr(self, "_last_decoupled_verify_shape_log_key", log_key)
+
+        graph_path = (
+            "decode CUDA Graph"
+            if shape.uses_decode_graph
+            else "target verify CUDA Graph"
+        )
+        zero_step = " zero-step fallback" if shape.uses_decode_graph else ""
+        log_info_on_rank0(
+            logger,
+            "Select decoupled verifier dynamic CUDA Graph shape: "
+            f"raw_bs={shape.raw_batch_size}, "
+            f"captured_bs={shape.captured_batch_size}, "
+            f"num_speculative_steps={shape.num_speculative_steps}, "
+            f"verify_tokens_per_req={shape.verify_tokens_per_req}, "
+            f"draft_tail_max_len={shape.num_speculative_steps}, "
+            f"raw_verify_tokens={shape.raw_verify_tokens}, "
+            f"padded_verify_tokens={shape.padded_verify_tokens}, "
+            f"budget={shape.budget}, graph_path={graph_path}{zero_step}",
+        )
+
     def _draft_req_ahead(self: Scheduler, state: DraftReqState) -> int:
         req = state.req
         if req is None:
             return 0
-        return len(req.output_ids) - int(state.verifier_committed_prefix_len)
+        return max(
+            0,
+            int(state.streamed_output_len)
+            - int(state.verifier_committed_prefix_len),
+        )
 
     def has_draft_sleeping_requests(self: Scheduler) -> bool:
         # check whether decoupled drafter has sleeping requests
@@ -1672,26 +1869,34 @@ class SchedulerDecoupledSpecMixin:
                 f"consumed={offset} total={len(verified_ids)}"
             )
 
-        spec_steps = int(self.server_args.speculative_num_steps or 0)
-        if spec_steps <= 0:
-            spec_steps = max(
-                0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
-            )
         for (
             req,
             valid_draft_tokens,
             valid_accepted_tokens,
         ) in valid_draft_metric_updates:
+            spec_steps = getattr(req, "_decoupled_verify_num_speculative_steps", None)
+            if spec_steps is None:
+                spec_steps = int(self.server_args.speculative_num_steps or 0)
+                if spec_steps <= 0:
+                    spec_steps = max(
+                        0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
+                    )
+            spec_steps = int(spec_steps)
             valid_draft_tokens = min(valid_draft_tokens, spec_steps)
             valid_accepted_tokens = min(valid_accepted_tokens, valid_draft_tokens)
             req.spec_valid_draft_tokens += valid_draft_tokens
             req.spec_valid_accepted_tokens += valid_accepted_tokens
+            metric_len = max(
+                spec_steps,
+                len(req.spec_valid_draft_tokens_by_position),
+                len(req.spec_valid_accepted_tokens_by_position),
+            )
             req.spec_valid_draft_tokens_by_position = (
-                req.spec_valid_draft_tokens_by_position + [0] * spec_steps
-            )[:spec_steps]
+                req.spec_valid_draft_tokens_by_position + [0] * metric_len
+            )[:metric_len]
             req.spec_valid_accepted_tokens_by_position = (
-                req.spec_valid_accepted_tokens_by_position + [0] * spec_steps
-            )[:spec_steps]
+                req.spec_valid_accepted_tokens_by_position + [0] * metric_len
+            )[:metric_len]
             for pos in range(valid_draft_tokens):
                 req.spec_valid_draft_tokens_by_position[pos] += 1
             for pos in range(valid_accepted_tokens):
@@ -1700,9 +1905,9 @@ class SchedulerDecoupledSpecMixin:
     def is_verify_entry_rank(self) -> bool:
         return (
             self.spec_algorithm.is_decoupled_verify()
-            and self.pp_rank == 0
-            and self.attn_tp_rank == 0
-            and self.attn_cp_rank == 0
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
         )
 
     def assign_drafter_rank(self, request_id: str) -> int:
@@ -1846,14 +2051,14 @@ class SchedulerDecoupledSpecMixin:
         )
         if getattr(self.server_args, "enable_dp_attention", False):
             synced_snapshots = source_payload
-            if self.attn_tp_size != 1:
+            if self.ps.attn_tp_size != 1:
                 synced_snapshots = broadcast_pyobj(
                     synced_snapshots,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-            if self.attn_cp_size != 1:
+            if self.ps.attn_cp_size != 1:
                 synced_snapshots = broadcast_pyobj(
                     synced_snapshots,
                     self.attn_cp_group.rank,
@@ -1862,7 +2067,7 @@ class SchedulerDecoupledSpecMixin:
                 )
             return list(synced_snapshots or [])
 
-        if self.tp_size != 1:
+        if self.ps.tp_size != 1:
             source_payload = broadcast_pyobj(
                 source_payload,
                 self.tp_group.rank,
@@ -2031,7 +2236,33 @@ class SchedulerDecoupledSpecMixin:
             )
         target_reqs = live_reqs
         if not target_reqs:
+            setattr(batch, "decoupled_verify_runtime_state", None)
+            setattr(batch, "decoupled_verify_shape", None)
             return None
+
+        dynamic_state = self._select_decoupled_verify_runtime_state(batch.batch_size())
+        dynamic_shape = dynamic_state.shape if dynamic_state is not None else None
+        setattr(batch, "decoupled_verify_runtime_state", dynamic_state)
+        setattr(batch, "decoupled_verify_shape", dynamic_shape)
+        self._maybe_log_decoupled_verify_shape_selection(dynamic_shape)
+        snapshot_tail_cap = (
+            dynamic_shape.num_speculative_steps if dynamic_shape is not None else None
+        )
+        for req in target_reqs:
+            setattr(
+                req,
+                "_decoupled_verify_num_speculative_steps",
+                snapshot_tail_cap,
+            )
+            setattr(
+                req,
+                "_decoupled_verify_tokens_per_req",
+                (
+                    dynamic_shape.verify_tokens_per_req
+                    if dynamic_shape is not None
+                    else None
+                ),
+            )
 
         local_snapshots: list[DraftTailSnapshot] = []
         if self.is_verify_entry_rank():
@@ -2041,6 +2272,7 @@ class SchedulerDecoupledSpecMixin:
                 target_reqs,
                 allow_partial=envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.get(),
                 include_raw_tail_tokens=True,
+                max_tail_len=snapshot_tail_cap,
             )
 
         synced_snapshots = self._broadcast_verify_snapshots(local_snapshots)
@@ -2050,9 +2282,41 @@ class SchedulerDecoupledSpecMixin:
         snapshot_by_rid = {
             snapshot.request_id: snapshot for snapshot in synced_snapshots
         }
+        static_spec_steps = int(self.server_args.speculative_num_steps or 0)
+        static_verify_tokens = int(self.server_args.speculative_num_draft_tokens or 0)
         return {
             "forward_mode": str(batch.forward_mode),
             "batch_size": len(target_reqs),
+            "dynamic_verify_length": dynamic_shape is not None,
+            "raw_batch_size": (
+                dynamic_shape.raw_batch_size if dynamic_shape is not None else ""
+            ),
+            "captured_batch_size": (
+                dynamic_shape.captured_batch_size if dynamic_shape is not None else ""
+            ),
+            "target_verify_token_budget": (
+                dynamic_shape.budget if dynamic_shape is not None else ""
+            ),
+            "num_speculative_steps": (
+                dynamic_shape.num_speculative_steps
+                if dynamic_shape is not None
+                else static_spec_steps
+            ),
+            "verify_tokens_per_req": (
+                dynamic_shape.verify_tokens_per_req
+                if dynamic_shape is not None
+                else static_verify_tokens
+            ),
+            "raw_verify_tokens": (
+                dynamic_shape.raw_verify_tokens
+                if dynamic_shape is not None
+                else len(target_reqs) * static_verify_tokens
+            ),
+            "padded_verify_tokens": (
+                dynamic_shape.padded_verify_tokens
+                if dynamic_shape is not None
+                else ""
+            ),
             "rids": [req.rid for req in target_reqs],
             "valid_tail_lens_by_req": [
                 len(getattr(req, "draft_buffer", None) or []) for req in target_reqs

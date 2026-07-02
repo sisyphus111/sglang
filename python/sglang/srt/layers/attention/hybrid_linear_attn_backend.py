@@ -138,6 +138,7 @@ class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
+        self.server_args = model_runner.server_args
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
@@ -151,6 +152,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self._replay_forward_batch: Optional[ForwardBatch] = None
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_verify_query_start_loc_by_draft_token_num = {}
         self.conv_states_shape: tuple[int, int] = None
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
@@ -391,6 +393,33 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info
         )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.input_ids.numel(),
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                forward_batch.encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                forward_batch.seq_lens_cpu,
+            )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -421,10 +450,11 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
-        draft_token_num = max_num_tokens // max_bs
+        max_tokens_per_req = max(
+            1,
+            (max_num_tokens + max_bs - 1) // max_bs,
+            int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0),
+        )
         for i in range(max_bs):
             self.state_src_indices_list.append(
                 torch.full(
@@ -441,28 +471,42 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             self.retrieve_next_token_list.append(
                 torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                    (i + 1, max_tokens_per_req),
+                    dtype=torch.int32,
+                    device=self.device,
                 )
             )
             self.retrieve_next_sibling_list.append(
                 torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                    (i + 1, max_tokens_per_req),
+                    dtype=torch.int32,
+                    device=self.device,
                 )
             )
             self.retrieve_parent_token_list.append(
                 torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                    (i + 1, max_tokens_per_req),
+                    dtype=torch.int32,
+                    device=self.device,
                 )
             )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
-        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
-            0,
-            max_bs * draft_token_num + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=self.device,
+        for draft_token_num in range(1, max_tokens_per_req + 1):
+            self.cached_cuda_graph_verify_query_start_loc_by_draft_token_num[
+                draft_token_num
+            ] = torch.arange(
+                0,
+                max_bs * draft_token_num + 1,
+                step=draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        self.cached_cuda_graph_verify_query_start_loc = (
+            self.cached_cuda_graph_verify_query_start_loc_by_draft_token_num[
+                max_tokens_per_req
+            ]
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -499,8 +543,15 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
+            draft_token_num = getattr(spec_info, "draft_token_num", None)
+            if draft_token_num is None:
+                raise ValueError(
+                    "Target verify CUDA Graph metadata requires spec_info.draft_token_num."
+                )
             self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                self.cached_cuda_graph_verify_query_start_loc_by_draft_token_num[
+                    int(draft_token_num)
+                ][: bs + 1]
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -585,16 +636,22 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
+            draft_token_num = int(spec_info.draft_token_num)
+            query_start_loc = (
+                self.cached_cuda_graph_verify_query_start_loc_by_draft_token_num[
+                    draft_token_num
+                ]
+            )
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                    query_start_loc[: bs + 1]
                 )
             else:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                    query_start_loc[: bs - num_padding]
                 )
                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
+                    (bs - num_padding) * draft_token_num
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -828,6 +885,21 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info,
             )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_out_graph(
+                forward_batch,
+                in_capture=in_capture,
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
     def init_forward_metadata_capture_cpu_graph(
         self,
         bs: int,
@@ -1026,8 +1098,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+        intermediate_state_cache = mamba_caches.intermediate_ssm.contiguous()
+        intermediate_conv_window_cache = (
+            mamba_caches.intermediate_conv_window[0].contiguous()
+        )
 
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
