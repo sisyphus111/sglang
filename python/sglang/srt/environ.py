@@ -472,6 +472,7 @@ class Envs:
 
     # Decoupled Speculation
     SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL = EnvBool(True)
+    SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)

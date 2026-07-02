@@ -32,6 +32,11 @@ from sglang.srt.speculative.decoupled_spec_io import (
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
 )
+from sglang.srt.speculative.cpp_decoupled_spec import (
+    CppDraftProxyThread,
+    CppDraftTailBuffer,
+    CppTokenSyncThread,
+)
 from sglang.srt.speculative.tracer import (
     SpecTraceEvent,
     build_tracer,
@@ -159,7 +164,12 @@ class SchedulerDecoupledSpecMixin:
     def create_draft_tail_buffer(self: Scheduler) -> Optional[DraftTailBuffer]:
         if not self.is_verify_entry_rank():
             return None
-        return DraftTailBuffer(
+        tail_buffer_cls = (
+            CppDraftTailBuffer
+            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+            else DraftTailBuffer
+        )
+        return tail_buffer_cls(
             verifier_rank=self.get_decoupled_spec_rank(),
             required_tail_len=max(
                 0, int(self.server_args.speculative_num_draft_tokens) - 1
@@ -174,7 +184,12 @@ class SchedulerDecoupledSpecMixin:
             raise RuntimeError(
                 "DraftTailBuffer is required on decoupled_verify entry rank"
             )
-        self.draft_proxy_thread = DraftProxyThread(
+        proxy_cls = (
+            CppDraftProxyThread
+            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+            else DraftProxyThread
+        )
+        self.draft_proxy_thread = proxy_cls(
             context=context,
             verifier_rank=self.get_decoupled_spec_rank(),
             draft_tail_buffer=self.draft_tail_buffer,
@@ -186,7 +201,12 @@ class SchedulerDecoupledSpecMixin:
         self.token_sync_thread = None
         if not self.is_draft_entry_rank():
             return
-        self.token_sync_thread = TokenSyncThread(
+        token_sync_cls = (
+            CppTokenSyncThread
+            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+            else TokenSyncThread
+        )
+        self.token_sync_thread = token_sync_cls(
             context=getattr(self, "zmq_context", None),
             drafter_rank=self.get_decoupled_spec_rank(),
             tracer=self.tracer,
