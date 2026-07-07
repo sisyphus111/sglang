@@ -70,7 +70,7 @@ from sglang.srt.utils.common import get_available_gpu_memory
 logger = logging.getLogger(__name__)
 
 _ROOFLINE_PROFILE_WARMUP_ITERS = 5
-_ROOFLINE_PROFILE_MEASURE_ITERS = 10
+_ROOFLINE_PROFILE_MEASURE_ITERS = 1000
 _ROOFLINE_PROFILE_PLATEAU_RATIO = 0.95
 
 
