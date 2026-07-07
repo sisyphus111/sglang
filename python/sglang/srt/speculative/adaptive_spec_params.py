@@ -10,7 +10,7 @@ import json
 import logging
 import math
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.srt.utils import log_info_on_rank0
 
@@ -18,6 +18,39 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+DECOUPLED_VERIFY_ROOFLINE_TOKEN_BUDGET = "roofline"
+DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES = list(range(64, 513, 64))
+
+
+def is_decoupled_verify_roofline_budget(value) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip().lower() == DECOUPLED_VERIFY_ROOFLINE_TOKEN_BUDGET
+    )
+
+
+def normalize_decoupled_verify_roofline_bs_candidates(value) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        raise ValueError(
+            "--verifier-roofline-profile-bs-candidates must be a list of "
+            "positive integers."
+        )
+    try:
+        candidates = sorted({int(bs) for bs in value if int(bs) > 0})
+    except TypeError as exc:
+        raise ValueError(
+            "--verifier-roofline-profile-bs-candidates must be a list of "
+            "positive integers."
+        ) from exc
+    if not candidates:
+        raise ValueError(
+            "--verifier-roofline-profile-bs-candidates must contain at least "
+            "one positive integer."
+        )
+    return candidates
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
@@ -206,6 +239,83 @@ def build_decoupled_verify_adaptive_config(
     return config
 
 
+def build_decoupled_verify_roofline_adaptive_config(
+    *,
+    max_running_requests: int,
+    roofline_bs: int,
+    max_speculative_steps: int | None = None,
+    cuda_graph_bs: list[int] | None = None,
+) -> dict[str, dict]:
+    """Build per-BS verify steps from a profiled roofline token batch."""
+    max_running_requests = int(max_running_requests)
+    if max_running_requests <= 0:
+        raise ValueError(
+            "max_running_requests must be positive for decoupled verifier "
+            f"roofline config, got {max_running_requests}."
+        )
+
+    roofline_bs = int(roofline_bs)
+    if roofline_bs <= 0:
+        raise ValueError(
+            f"roofline_bs must be positive for decoupled verifier, got {roofline_bs}."
+        )
+
+    if max_speculative_steps is not None:
+        max_speculative_steps = int(max_speculative_steps)
+        if max_speculative_steps < 0:
+            raise ValueError(
+                "max_speculative_steps must be non-negative for decoupled verifier "
+                f"roofline config, got {max_speculative_steps}."
+            )
+
+    if cuda_graph_bs is None:
+        bs_values = [max_running_requests]
+    else:
+        bs_values = sorted({int(bs) for bs in cuda_graph_bs if int(bs) > 0})
+        if not bs_values:
+            raise ValueError(
+                "cuda_graph_bs must contain at least one positive batch size for "
+                "decoupled verifier roofline config."
+            )
+
+    config: dict[str, dict] = {}
+    for bs in bs_values:
+        # num of speculative steps when reaching the roofline
+        roofline_step_cap = max(0, roofline_bs // bs - 1)
+        max_step = (
+            roofline_step_cap
+            if max_speculative_steps is None
+            else min(max_speculative_steps, roofline_step_cap)
+        )
+        config[str(bs)] = {"candidate_steps": [max_step]}
+
+    return config
+
+
+def select_decoupled_verify_roofline_bs(
+    profile_rows: Iterable[tuple[int, float]],
+    plateau_ratio: float = 0.95,
+) -> tuple[int, int, float, float]:
+    """Return (roofline_bs, peak_bs, peak_throughput, threshold)."""
+    if not (0 < plateau_ratio <= 1.0):
+        raise ValueError(f"plateau_ratio must be in (0, 1], got {plateau_ratio}.")
+
+    rows = [(int(bs), float(throughput)) for bs, throughput in profile_rows]
+    if not rows:
+        raise ValueError("Cannot select roofline batch size from an empty profile.")
+    for bs, throughput in rows:
+        if bs <= 0 or throughput <= 0:
+            raise ValueError(
+                "Profile rows must contain positive batch sizes and throughputs, "
+                f"got bs={bs}, throughput={throughput}."
+            )
+
+    peak_bs, peak_throughput = max(rows, key=lambda item: item[1])
+    threshold = peak_throughput * plateau_ratio
+    roofline_bs = min(bs for bs, throughput in rows if throughput >= threshold)
+    return roofline_bs, peak_bs, peak_throughput, threshold
+
+
 def _resolve_server_args_decode_cuda_graph_bs(
     server_args: ServerArgs,
 ) -> list[int] | None:
@@ -228,6 +338,23 @@ def _resolve_server_args_decode_cuda_graph_bs(
     return sorted(set(bs_values)) or [max_running_requests]
 
 
+def resolve_decoupled_verify_roofline_profile_bs_candidates(
+    server_args: ServerArgs,
+    cuda_graph_bs: list[int] | None = None,
+) -> list[int]:
+    explicit_candidates = normalize_decoupled_verify_roofline_bs_candidates(
+        getattr(server_args, "verifier_roofline_profile_bs_candidates", None)
+    )
+    if explicit_candidates is None:
+        return list(DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES)
+
+    if cuda_graph_bs is None:
+        cuda_graph_bs = _resolve_server_args_decode_cuda_graph_bs(server_args)
+    if cuda_graph_bs:
+        explicit_candidates.extend(int(bs) for bs in cuda_graph_bs if int(bs) > 0)
+    return sorted(set(explicit_candidates))
+
+
 def resolve_decoupled_verify_adaptive_config_from_server_args(
     server_args: ServerArgs,
     cuda_graph_bs: list[int] | None = None,
@@ -238,6 +365,26 @@ def resolve_decoupled_verify_adaptive_config_from_server_args(
 
     if cuda_graph_bs is None:
         cuda_graph_bs = _resolve_server_args_decode_cuda_graph_bs(server_args)
+
+    if is_decoupled_verify_roofline_budget(
+        getattr(server_args, "decoupled_spec_target_verify_token_budget", None)
+    ):
+        roofline_bs = getattr(server_args, "_decoupled_verify_roofline_bs", None)
+        if roofline_bs is None:
+            profile_candidates = resolve_decoupled_verify_roofline_profile_bs_candidates(
+                server_args, cuda_graph_bs=cuda_graph_bs
+            )
+            roofline_bs = max(profile_candidates)
+        return build_decoupled_verify_roofline_adaptive_config(
+            max_running_requests=server_args.max_running_requests,
+            roofline_bs=roofline_bs,
+            max_speculative_steps=getattr(
+                server_args,
+                "_decoupled_verify_max_speculative_steps",
+                getattr(server_args, "speculative_num_steps", None),
+            ),
+            cuda_graph_bs=cuda_graph_bs,
+        )
 
     return build_decoupled_verify_adaptive_config(
         max_running_requests=server_args.max_running_requests,

@@ -6,9 +6,13 @@ from types import SimpleNamespace
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES,
     build_decoupled_verify_adaptive_config,
+    build_decoupled_verify_roofline_adaptive_config,
     resolve_decoupled_verify_adaptive_config_from_server_args,
+    resolve_decoupled_verify_roofline_profile_bs_candidates,
     resolve_candidate_steps_from_config,
+    select_decoupled_verify_roofline_bs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
@@ -467,6 +471,77 @@ class TestResolveCandidateSteps(unittest.TestCase):
 
         self.assertEqual(sorted(config), ["1", "32", "64", "8"])
         self.assertEqual(config["1"]["candidate_steps"], [63])
+        self.assertEqual(config["8"]["candidate_steps"], [7])
+        self.assertEqual(config["32"]["candidate_steps"], [1])
+        self.assertEqual(config["64"]["candidate_steps"], [0])
+
+    def test_decoupled_roofline_selects_smallest_p95_peak_batch(self):
+        roofline_bs, peak_bs, peak_throughput, threshold = (
+            select_decoupled_verify_roofline_bs(
+                [(8, 100.0), (16, 180.0), (32, 200.0), (64, 198.0)]
+            )
+        )
+
+        self.assertEqual(roofline_bs, 32)
+        self.assertEqual(peak_bs, 32)
+        self.assertEqual(peak_throughput, 200.0)
+        self.assertEqual(threshold, 190.0)
+
+    def test_decoupled_roofline_config_maps_profile_bs(self):
+        config = build_decoupled_verify_roofline_adaptive_config(
+            max_running_requests=96,
+            roofline_bs=64,
+            max_speculative_steps=8,
+            cuda_graph_bs=[1, 8, 16, 32, 64, 96],
+        )
+
+        self.assertEqual(config["1"]["candidate_steps"], [8])
+        self.assertEqual(config["8"]["candidate_steps"], [7])
+        self.assertEqual(config["16"]["candidate_steps"], [3])
+        self.assertEqual(config["32"]["candidate_steps"], [1])
+        self.assertEqual(config["64"]["candidate_steps"], [0])
+        self.assertEqual(config["96"]["candidate_steps"], [0])
+
+    def test_decoupled_roofline_profile_candidates_default_when_unset(self):
+        args = SimpleNamespace(
+            verifier_roofline_profile_bs_candidates=None,
+        )
+
+        candidates = resolve_decoupled_verify_roofline_profile_bs_candidates(args)
+
+        self.assertEqual(
+            candidates,
+            DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES,
+        )
+
+    def test_decoupled_roofline_profile_candidates_union_decode_graph_bs(self):
+        args = SimpleNamespace(
+            verifier_roofline_profile_bs_candidates=[64, 512],
+        )
+
+        candidates = resolve_decoupled_verify_roofline_profile_bs_candidates(
+            args,
+            cuda_graph_bs=[1, 8, 64],
+        )
+
+        self.assertEqual(candidates, [1, 8, 64, 512])
+
+    def test_decoupled_roofline_server_args_uses_candidate_max_before_profile(self):
+        args = SimpleNamespace(
+            speculative_adaptive_config=None,
+            max_running_requests=64,
+            decoupled_spec_target_verify_token_budget="roofline",
+            verifier_roofline_profile_bs_candidates=[32, 64],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[1, 8, 32, 64])
+            ),
+            cuda_graph_bs_decode=None,
+            _decoupled_verify_max_speculative_steps=8,
+        )
+
+        config = resolve_decoupled_verify_adaptive_config_from_server_args(args)
+
+        self.assertEqual(config["1"]["candidate_steps"], [8])
         self.assertEqual(config["8"]["candidate_steps"], [7])
         self.assertEqual(config["32"]["candidate_steps"], [1])
         self.assertEqual(config["64"]["candidate_steps"], [0])

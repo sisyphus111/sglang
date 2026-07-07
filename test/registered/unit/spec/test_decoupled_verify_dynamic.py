@@ -92,6 +92,91 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         ["decoupled", "verify", "runtime", "state"]
     )
 
+    def _make_validate_args(self, **overrides):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        args = SimpleNamespace(
+            pp_size=1,
+            decoupled_spec_rank_base=0,
+            page_size=1,
+            max_running_requests=1,
+            disable_overlap_schedule=True,
+            disable_radix_cache=True,
+            mamba_radix_cache_strategy="no_buffer",
+            enable_mixed_chunk=False,
+            disable_piecewise_cuda_graph=False,
+            speculative_algorithm="DECOUPLED_VERIFY",
+            speculative_adaptive=True,
+            speculative_adaptive_config=None,
+            speculative_num_steps=8,
+            speculative_num_draft_tokens=9,
+            speculative_eagle_topk=1,
+            speculative_use_rejection_sampling=False,
+            decoupled_spec_target_verify_token_budget="roofline",
+            verifier_roofline_profile_bs_candidates=[64, 128],
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.FULL),
+            ),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_roofline_budget_validation_accepts_adaptive_full_cuda_graph(self):
+        args = self._make_validate_args()
+
+        DecoupledVerifySpecAlgo.validate_server_args(args)
+
+        self.assertEqual(args.decoupled_spec_target_verify_token_budget, "roofline")
+        self.assertEqual(args.verifier_roofline_profile_bs_candidates, [64, 128])
+
+    def test_roofline_budget_validation_allows_default_profile_candidates(self):
+        args = self._make_validate_args(
+            verifier_roofline_profile_bs_candidates=None,
+        )
+
+        DecoupledVerifySpecAlgo.validate_server_args(args)
+
+        self.assertIsNone(args.verifier_roofline_profile_bs_candidates)
+
+    def test_roofline_budget_validation_requires_adaptive_decoupled_verify(self):
+        args = self._make_validate_args(speculative_adaptive=False)
+
+        with self.assertRaisesRegex(ValueError, "requires adaptive"):
+            DecoupledVerifySpecAlgo.validate_server_args(args)
+
+    def test_roofline_budget_validation_rejects_empty_profile_candidates(self):
+        args = self._make_validate_args(verifier_roofline_profile_bs_candidates=[])
+
+        with self.assertRaisesRegex(
+            ValueError, "verifier-roofline-profile-bs-candidates"
+        ):
+            DecoupledVerifySpecAlgo.validate_server_args(args)
+
+    def test_roofline_budget_validation_requires_full_decode_cuda_graph(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        args = self._make_validate_args(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED),
+                decode=SimpleNamespace(backend=Backend.BREAKABLE),
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "full decode CUDA Graph"):
+            DecoupledVerifySpecAlgo.validate_server_args(args)
+
+    def test_integer_budget_validation_is_unchanged(self):
+        args = self._make_validate_args(
+            decoupled_spec_target_verify_token_budget="65",
+            verifier_roofline_profile_bs_candidates=None,
+        )
+
+        DecoupledVerifySpecAlgo.validate_server_args(args)
+
+        self.assertEqual(args.decoupled_spec_target_verify_token_budget, 65)
+
     def test_scheduler_prepare_uses_active_worker_config_for_snapshot(self):
         scheduler = _Scheduler(steps=3, draft_tokens=4)
         batch = _Batch()
@@ -442,6 +527,41 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must not carry draft resources"):
             VerifyWorker._validate_decoupled_runtime_state(worker, state)
+
+    def test_verify_worker_roofline_validation_allows_zero_step_fallback_only(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.server_args = SimpleNamespace(
+            decoupled_spec_target_verify_token_budget="roofline",
+            _decoupled_verify_roofline_bs=64,
+            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=None)),
+            cuda_graph_bs=None,
+            cuda_graph_max_bs=None,
+        )
+        zero_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=0,
+            speculative_num_draft_tokens=1,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[128]),
+        )
+        ok_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[16]),
+        )
+        bad_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[17]),
+        )
+
+        VerifyWorker._validate_decoupled_runtime_state(worker, zero_state)
+        VerifyWorker._validate_decoupled_runtime_state(worker, ok_state)
+        with self.assertRaisesRegex(RuntimeError, "roofline budget violated"):
+            VerifyWorker._validate_decoupled_runtime_state(worker, bad_state)
 
     def test_zero_step_runtime_state_builds_decode_graph_runner(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker

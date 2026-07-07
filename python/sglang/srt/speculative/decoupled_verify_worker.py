@@ -1,9 +1,12 @@
+import dataclasses
 import contextlib
 import logging
 import time
+from array import array
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
@@ -11,9 +14,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -27,13 +31,19 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
+    build_decoupled_verify_roofline_adaptive_config,
+    is_decoupled_verify_roofline_budget,
     resolve_decoupled_verify_adaptive_config_from_server_args,
+    resolve_decoupled_verify_roofline_profile_bs_candidates,
+    select_decoupled_verify_roofline_bs,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -58,6 +68,10 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
+
+_ROOFLINE_PROFILE_WARMUP_ITERS = 5
+_ROOFLINE_PROFILE_MEASURE_ITERS = 10
+_ROOFLINE_PROFILE_PLATEAU_RATIO = 0.95
 
 
 def _get_req_tail_token_id(req) -> int:
@@ -166,6 +180,15 @@ class VerifyWorker(BaseSpecWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self._decoupled_verify_max_speculative_steps = (
+            None
+            if server_args.speculative_num_steps is None
+            else int(server_args.speculative_num_steps)
+        )
+        if not hasattr(server_args, "_decoupled_verify_max_speculative_steps"):
+            server_args._decoupled_verify_max_speculative_steps = (
+                self._decoupled_verify_max_speculative_steps
+            )
         self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -189,6 +212,9 @@ class VerifyWorker(BaseSpecWorker):
         self.total_accept_length = 0
         self.total_num_verified_reqs = 0
         self.adaptive_controller: Optional[AdaptiveController] = None
+        self._roofline_zero_state: Optional[SpecRuntimeState] = None
+        self._roofline_profile_capture_bs: Optional[List[int]] = None
+        self._roofline_profile_done = False
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -224,6 +250,20 @@ class VerifyWorker(BaseSpecWorker):
                 capture_bs, _ = get_batch_sizes_to_capture(
                     self.target_worker.model_runner, num_tokens_per_bs=1
                 )
+
+            if is_decoupled_verify_roofline_budget(
+                self.server_args.decoupled_spec_target_verify_token_budget
+            ):
+                # Capture step0 here; profiling needs scheduler-owned tree_cache.
+                self._capture_roofline_zero_step_state()
+                log_info_on_rank0(
+                    logger,
+                    "Captured decoupled verifier zero-step roofline runtime state; "
+                    "startup profiling will run after scheduler KV cache init. "
+                    f"profile_capture_bs={self._roofline_profile_capture_bs}",
+                )
+                return
+
             adaptive_config = resolve_decoupled_verify_adaptive_config_from_server_args(
                 self.server_args, cuda_graph_bs=capture_bs
             )
@@ -260,6 +300,330 @@ class VerifyWorker(BaseSpecWorker):
                 logger,
                 "Capture decoupled verifier adaptive runtime states end.",
             )
+
+    def _capture_roofline_zero_step_state(self) -> None:
+        profile_capture_bs = self._generate_roofline_profile_capture_bs()
+        zero_state = self.build_adaptive_runtime_state(
+            speculative_num_steps=0,
+            speculative_num_draft_tokens=1,
+            cuda_graph_bs=profile_capture_bs,
+        )
+        self._roofline_zero_state = zero_state
+        self._roofline_profile_capture_bs = self._get_capture_bs(
+            zero_state.target_graph_runner
+        )
+
+    def _generate_roofline_profile_capture_bs(self) -> List[int]:
+        decode_capture_bs = getattr(self.server_args.cuda_graph_config.decode, "bs", None)
+        return resolve_decoupled_verify_roofline_profile_bs_candidates(
+            self.server_args,
+            cuda_graph_bs=decode_capture_bs,
+        )
+
+    def run_startup_spec_profiling(self, tree_cache) -> None:
+        if not is_decoupled_verify_roofline_budget(
+            self.server_args.decoupled_spec_target_verify_token_budget
+        ):
+            return
+        if self._roofline_profile_done:
+            return
+        
+        # in profile phase, only capture zero-step verify cuda graph
+        if self._roofline_zero_state is None:
+            self._capture_roofline_zero_step_state()
+
+        zero_state = self._roofline_zero_state
+        assert zero_state is not None
+        profile_capture_bs = self._roofline_profile_capture_bs or self._get_capture_bs(
+            zero_state.target_graph_runner
+        )
+        if not profile_capture_bs:
+            raise RuntimeError(
+                "Decoupled verifier roofline profiling has no captured zero-step "
+                "CUDA Graph batch sizes."
+            )
+
+        # apply zero-step cuda graph for roofline profiling
+        self.apply_runtime_state(zero_state)
+        log_info_on_rank0(
+            logger,
+            "Profile decoupled verifier zero-step roofline begin: "
+            f"profile_capture_bs={profile_capture_bs}, "
+            f"warmup_iters={_ROOFLINE_PROFILE_WARMUP_ITERS}, "
+            f"measure_iters={_ROOFLINE_PROFILE_MEASURE_ITERS}",
+        )
+
+        profile_rows: list[tuple[int, float, float]] = []
+        for bs in profile_capture_bs:
+            avg_decode_ms = self._profile_roofline_batch_size(
+                batch_size=int(bs),
+                tree_cache=tree_cache,
+            )
+            avg_decode_ms = self._max_reduce_profile_ms(avg_decode_ms)
+            throughput = int(bs) * 1000.0 / avg_decode_ms
+            profile_rows.append((int(bs), avg_decode_ms, throughput))
+            log_info_on_rank0(
+                logger,
+                "Decoupled verifier zero-step roofline profile point: "
+                f"bs={int(bs)}, avg_decode_ms={avg_decode_ms:.4f}, "
+                f"throughput={throughput:.2f} tok/s",
+            )
+
+        roofline_bs, peak_bs, peak_throughput, threshold = (
+            select_decoupled_verify_roofline_bs(
+                [(bs, throughput) for bs, _, throughput in profile_rows],
+                plateau_ratio=_ROOFLINE_PROFILE_PLATEAU_RATIO,
+            )
+        )
+        roofline_bs = self._broadcast_roofline_bs(roofline_bs)
+        self.server_args._decoupled_verify_roofline_bs = roofline_bs
+
+        adaptive_config = build_decoupled_verify_roofline_adaptive_config(
+            max_running_requests=self.server_args.max_running_requests,
+            roofline_bs=roofline_bs,
+            max_speculative_steps=self._roofline_max_speculative_steps(),
+            cuda_graph_bs=profile_capture_bs,
+        )
+        log_info_on_rank0(
+            logger,
+            "Decoupled verifier zero-step roofline selected: "
+            f"peak_bs={peak_bs}, peak_throughput={peak_throughput:.2f} tok/s, "
+            f"p95_threshold={threshold:.2f} tok/s, "
+            f"roofline_bs={roofline_bs}, adaptive_config={adaptive_config}",
+        )
+
+        self.adaptive_controller = AdaptiveController(self, config=adaptive_config)
+        self.adaptive_controller.register(zero_state, steps=0)
+        self.adaptive_controller.init_states(cuda_graph_bs=profile_capture_bs)
+        self._roofline_profile_done = True
+        log_info_on_rank0(
+            logger,
+            "Profile decoupled verifier zero-step roofline end.",
+        )
+
+    def _roofline_max_speculative_steps(self) -> Optional[int]:
+        max_steps = getattr(
+            self.server_args,
+            "_decoupled_verify_max_speculative_steps",
+            None,
+        )
+        if max_steps is None:
+            max_steps = getattr(self, "_decoupled_verify_max_speculative_steps", None)
+        if max_steps is None:
+            max_steps = getattr(self.server_args, "speculative_num_steps", None)
+        return None if max_steps is None else int(max_steps)
+
+    def _profile_roofline_batch_size(self, batch_size: int, tree_cache) -> float:
+        if self.device != "cuda":
+            raise RuntimeError(
+                "Decoupled verifier roofline profiling currently requires CUDA "
+                "event timing."
+            )
+
+        reqs, batch = self._build_roofline_profile_batch(
+            batch_size=batch_size,
+            tree_cache=tree_cache,
+        )
+        
+        try:
+            keep_alive_refs = []
+            keep_alive_refs.extend(
+                self._run_roofline_prefill(batch).extra_keep_alive_refs or []
+            )
+            for _ in range(_ROOFLINE_PROFILE_WARMUP_ITERS):
+                keep_alive_refs.extend(
+                    self._run_roofline_decode(batch).extra_keep_alive_refs or []
+                )
+            torch.cuda.current_stream().synchronize()
+            keep_alive_refs.clear()
+
+            events = []
+            for _ in range(_ROOFLINE_PROFILE_MEASURE_ITERS):
+                batch.prepare_for_decode()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                result = self._run_roofline_profile_forward(batch)
+                end_event.record()
+                self._apply_roofline_decode_result(batch, result)
+                keep_alive_refs.extend(result.extra_keep_alive_refs or [])
+                events.append((start_event, end_event))
+
+            torch.cuda.current_stream().synchronize()
+            total_ms = sum(start.elapsed_time(end) for start, end in events)
+            return total_ms / max(1, _ROOFLINE_PROFILE_MEASURE_ITERS)
+        finally:
+            self._teardown_roofline_profile_reqs(reqs, tree_cache)
+
+    def _build_roofline_profile_batch(
+        self,
+        *,
+        batch_size: int,
+        tree_cache,
+    ) -> tuple[list[Req], ScheduleBatch]:
+        seq_len = self._roofline_profile_prompt_len()
+        vocab_size = int(getattr(self.model_config, "vocab_size", 32000) or 32000)
+        token_mod = max(1, vocab_size - 1)
+        max_new_tokens = (
+            _ROOFLINE_PROFILE_WARMUP_ITERS
+            + _ROOFLINE_PROFILE_MEASURE_ITERS
+            + 4
+        )
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_new_tokens=max_new_tokens,
+            ignore_eos=True,
+        )
+        sampling_params.normalize(None)
+        sampling_params.verify(vocab_size)
+
+        reqs = []
+        for i in range(int(batch_size)):
+            token_ids = array(
+                "q",
+                [((i + j) % token_mod) + 1 for j in range(seq_len)],
+            )
+            req = Req(
+                rid=f"decoupled-roofline-profile-{batch_size}-{i}-{time.time_ns()}",
+                origin_input_text="",
+                origin_input_ids=token_ids,
+                sampling_params=sampling_params,
+                extra_key=f"decoupled-roofline-profile-{batch_size}-{i}-{time.time_ns()}",
+            )
+            req.skip_radix_cache_insert = True
+            req.init_next_round_input(tree_cache)
+            reqs.append(req)
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            model_config=self.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.speculative_algorithm,
+        )
+        return reqs, batch
+
+    def _roofline_profile_prompt_len(self) -> int:
+        context_len = int(getattr(self.model_config, "context_len", 4096) or 4096)
+        decode_headroom = (
+            _ROOFLINE_PROFILE_WARMUP_ITERS
+            + _ROOFLINE_PROFILE_MEASURE_ITERS
+            + 8
+        )
+        max_profile_bs = max(self._roofline_profile_capture_bs or [1])
+        available_tokens = getattr(
+            self.token_to_kv_pool_allocator, "available_size", lambda: 0
+        )()
+        pool_limited_len = (
+            max(
+                1,
+                int(available_tokens) // max(1, int(max_profile_bs))
+                - decode_headroom,
+            )
+            if available_tokens
+            else 256
+        )
+        return max(1, min(256, context_len - decode_headroom, pool_limited_len))
+
+    def _run_roofline_prefill(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        batch.prepare_for_extend()
+        if batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+        result = self._run_roofline_profile_forward(batch)
+        self._apply_roofline_prefill_result(batch, result)
+        return result
+
+    def _run_roofline_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        batch.prepare_for_decode()
+        result = self._run_roofline_profile_forward(batch)
+        self._apply_roofline_decode_result(batch, result)
+        return result
+
+    def _run_roofline_profile_forward(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        snapshot = {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+        sampling_info = batch.sampling_info
+        if sampling_info is not None:
+            batch.sampling_info = sampling_info.copy_for_forward()
+        try:
+            result = self.forward_batch_generation(batch)
+            if result.extra_keep_alive_refs is None:
+                result.extra_keep_alive_refs = []
+            result.extra_keep_alive_refs.append(snapshot)
+            return result
+        finally:
+            for name, value in snapshot.items():
+                setattr(batch, name, value)
+
+    def _apply_roofline_prefill_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+        batch.input_ids = None
+        for i, req in enumerate(batch.reqs):
+            req.output_ids.append(self._roofline_dummy_token_id(i, len(req.output_ids)))
+
+    def _apply_roofline_decode_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        if not result.can_run_cuda_graph:
+            raise RuntimeError(
+                "Decoupled verifier roofline profiling expected zero-step target "
+                "verify CUDA Graph replay, but the measured decode ran eagerly."
+            )
+        batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = batch.seq_lens_cpu + 1
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        batch.input_ids = None
+        for i, req in enumerate(batch.reqs):
+            req.output_ids.append(self._roofline_dummy_token_id(i, len(req.output_ids)))
+
+    def _roofline_dummy_token_id(self, req_idx: int, output_idx: int) -> int:
+        vocab_size = int(getattr(self.model_config, "vocab_size", 32000) or 32000)
+        return ((int(req_idx) + int(output_idx)) % max(1, vocab_size - 1)) + 1
+
+    def _teardown_roofline_profile_reqs(self, reqs: list[Req], tree_cache) -> None:
+        for req in reqs:
+            if req.req_pool_idx is None and getattr(req, "mamba_pool_idx", None) is None:
+                continue
+            try:
+                release_kv_cache(req, tree_cache, is_insert=False)
+            except Exception:
+                logger.exception(
+                    "Failed to release decoupled verifier roofline profile request "
+                    f"{req.rid}."
+                )
+
+    def _max_reduce_profile_ms(self, avg_ms: float) -> float:
+        if not (dist.is_available() and dist.is_initialized()):
+            return float(avg_ms)
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return float(avg_ms)
+        value = torch.tensor([float(avg_ms)], dtype=torch.float32, device=self.device)
+        dist.all_reduce(value, op=dist.ReduceOp.MAX, group=tp_group.device_group)
+        return float(value.item())
+
+    def _broadcast_roofline_bs(self, roofline_bs: int) -> int:
+        if not (dist.is_available() and dist.is_initialized()):
+            return int(roofline_bs)
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return int(roofline_bs)
+        value = torch.tensor([int(roofline_bs)], dtype=torch.int64, device=self.device)
+        tp_group.broadcast(value, src=0)
+        return int(value.item())
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
@@ -347,6 +711,9 @@ class VerifyWorker(BaseSpecWorker):
             target_attn_backend=target_attn_backend,
             target_graph_runner=target_graph_runner,
         )
+        # in the profile phase of roofline-adaptive verfier,
+        # _validate_decoupled_runtime_state() will only allow zero_step verify
+        # when roofline_bs is not set
         self._validate_decoupled_runtime_state(state)
         return state
 
@@ -453,7 +820,6 @@ class VerifyWorker(BaseSpecWorker):
             raise RuntimeError(
                 "Decoupled verifier adaptive runtime state has no target graph runner."
             )
-        budget = int(self.server_args.decoupled_spec_target_verify_token_budget)
         capture_bs = self._get_capture_bs(graph_runner)
         if not capture_bs:
             raise RuntimeError(
@@ -462,6 +828,37 @@ class VerifyWorker(BaseSpecWorker):
             )
         max_capture_bs = max(int(bs) for bs in capture_bs)
         padded_verify_tokens = max_capture_bs * int(state.speculative_num_draft_tokens)
+        budget_value = self.server_args.decoupled_spec_target_verify_token_budget
+        if is_decoupled_verify_roofline_budget(budget_value):
+            roofline_bs = getattr(
+                self.server_args, "_decoupled_verify_roofline_bs", None
+            )
+            if roofline_bs is None:
+                if (
+                    int(state.speculative_num_steps) == 0
+                    and int(state.speculative_num_draft_tokens) == 1
+                ):
+                    return
+                raise RuntimeError(
+                    "Decoupled verifier roofline runtime state validation needs "
+                    "a resolved roofline batch size for nonzero-step states."
+                )
+            roofline_bs = int(roofline_bs)
+            if int(state.speculative_num_steps) == 0:
+                return
+            if padded_verify_tokens > roofline_bs:
+                raise RuntimeError(
+                    "decoupled verifier roofline budget violated by adaptive "
+                    "runtime state: "
+                    f"steps={state.speculative_num_steps}, "
+                    f"verify_tokens_per_req={state.speculative_num_draft_tokens}, "
+                    f"max_capture_bs={max_capture_bs}, "
+                    f"padded_verify_tokens={padded_verify_tokens}, "
+                    f"roofline_bs={roofline_bs}"
+                )
+            return
+
+        budget = int(budget_value)
         if padded_verify_tokens >= budget:
             raise RuntimeError(
                 "decoupled verifier target verify budget violated by "

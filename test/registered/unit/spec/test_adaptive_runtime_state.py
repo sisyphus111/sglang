@@ -77,10 +77,14 @@ class _Worker:
     def __init__(self):
         self.speculative_num_steps = 1
         self.applied = []
+        self.build_calls = []
 
     def build_adaptive_runtime_state(
         self, speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs=None
     ):
+        self.build_calls.append(
+            (speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs)
+        )
         return SpecRuntimeState.for_decoupled_verify(
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -113,6 +117,29 @@ class TestAdaptiveController(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(worker.speculative_num_steps, 3)
         self.assertEqual(worker.applied[-1].speculative_num_steps, 3)
+
+    def test_init_states_reuses_registered_zero_step_state(self):
+        worker = _Worker()
+        worker.speculative_num_steps = 0
+        controller = AdaptiveController(
+            worker,
+            config={
+                "1": {"candidate_steps": [0]},
+                "8": {"candidate_steps": [3]},
+            },
+        )
+        zero_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=0,
+            speculative_num_draft_tokens=1,
+            target_attn_backend=object(),
+            target_graph_runner=object(),
+        )
+        controller.register(zero_state, steps=0)
+
+        controller.init_states(cuda_graph_bs=[1, 8])
+
+        self.assertEqual(worker.build_calls, [(3, 4, [8])])
+        self.assertIs(worker.applied[-1], zero_state)
 
 
 if __name__ == "__main__":

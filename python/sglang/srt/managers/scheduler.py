@@ -525,6 +525,9 @@ class Scheduler(
             page_size=self.page_size,
         )
 
+        # profile roofline bs for adaptive verifier in decoupled-spec
+        self.maybe_run_spec_startup_profiling()
+
         # Init running status
         self.init_running_status()
 
@@ -979,6 +982,15 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+    def maybe_run_spec_startup_profiling(self):
+        if self.draft_worker is None:
+            return
+        run_startup_spec_profiling = getattr(
+            self.draft_worker, "run_startup_spec_profiling", None
+        )
+        if callable(run_startup_spec_profiling):
+            run_startup_spec_profiling(self.tree_cache)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
