@@ -492,6 +492,7 @@ class VerifyWorker(BaseSpecWorker):
             )
             req.skip_radix_cache_insert = True
             req.init_next_round_input(tree_cache)
+            req.fill_len = len(req.full_untruncated_fill_ids)
             reqs.append(req)
 
         batch = ScheduleBatch.init_new(
@@ -525,7 +526,28 @@ class VerifyWorker(BaseSpecWorker):
             if available_tokens
             else 256
         )
-        return max(1, min(256, context_len - decode_headroom, pool_limited_len))
+        prefill_budget_candidates = [
+            int(value)
+            for value in (
+                getattr(self.server_args, "chunked_prefill_size", None),
+                getattr(self.server_args, "max_prefill_tokens", None),
+            )
+            if value is not None and int(value) > 0
+        ]
+        prefill_limited_len = (
+            max(1, min(prefill_budget_candidates) // max(1, int(max_profile_bs)))
+            if prefill_budget_candidates
+            else 256
+        )
+        return max(
+            1,
+            min(
+                256,
+                context_len - decode_headroom,
+                pool_limited_len,
+                prefill_limited_len,
+            ),
+        )
 
     def _run_roofline_prefill(self, batch: ScheduleBatch) -> GenerationBatchResult:
         batch.prepare_for_extend()
