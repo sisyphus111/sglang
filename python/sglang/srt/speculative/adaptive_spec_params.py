@@ -316,6 +316,74 @@ def select_decoupled_verify_roofline_bs(
     return roofline_bs, peak_bs, peak_throughput, threshold
 
 
+def select_decoupled_verify_roofline_steps_by_bs(
+    profile_rows: Iterable[tuple[int, int, float]],
+    plateau_ratio: float = 0.95,
+) -> tuple[
+    dict[int, int], dict[int, dict[str, float | int]], tuple[int, int, float]
+]:
+    """Select a per-BS step from measured ``(bs, steps, throughput)`` rows."""
+    if not (0 < plateau_ratio <= 1.0):
+        raise ValueError(f"plateau_ratio must be in (0, 1], got {plateau_ratio}.")
+
+    grouped: dict[int, list[tuple[int, float]]] = {}
+    global_rows: list[tuple[int, int, float]] = []
+    for raw_bs, raw_steps, raw_throughput in profile_rows:
+        bs = int(raw_bs)
+        steps = int(raw_steps)
+        throughput = float(raw_throughput)
+        if bs <= 0 or steps < 0 or throughput <= 0:
+            raise ValueError(
+                "Profile rows must contain positive batch sizes, non-negative "
+                f"steps, and positive throughputs, got bs={bs}, steps={steps}, "
+                f"throughput={throughput}."
+            )
+        grouped.setdefault(bs, []).append((steps, throughput))
+        global_rows.append((bs, steps, throughput))
+
+    if not global_rows:
+        raise ValueError("Cannot select roofline steps from an empty profile.")
+
+    selected_steps: dict[int, int] = {}
+    summaries: dict[int, dict[str, float | int]] = {}
+    for bs, points in sorted(grouped.items()):
+        peak_step, peak_throughput = max(points, key=lambda item: item[1])
+        threshold = peak_throughput * plateau_ratio
+        selected_step = min(
+            steps for steps, throughput in points if throughput >= threshold
+        )
+        selected_steps[bs] = selected_step
+        summaries[bs] = {
+            "selected_step": selected_step,
+            "peak_step": peak_step,
+            "peak_throughput": peak_throughput,
+            "threshold": threshold,
+        }
+
+    global_peak = max(global_rows, key=lambda item: item[2])
+    return selected_steps, summaries, global_peak
+
+
+def build_decoupled_verify_profiled_adaptive_config(
+    selected_steps_by_bs: dict[int, int],
+) -> dict[str, dict]:
+    """Build adaptive config from per-BS profiled roofline step limits."""
+    if not selected_steps_by_bs:
+        raise ValueError("selected_steps_by_bs must contain at least one entry.")
+
+    config: dict[str, dict] = {}
+    for raw_bs, raw_selected_step in sorted(selected_steps_by_bs.items()):
+        bs = int(raw_bs)
+        selected_step = int(raw_selected_step)
+        if bs <= 0 or selected_step < 0:
+            raise ValueError(
+                "selected_steps_by_bs must map positive batch sizes to "
+                f"non-negative steps, got bs={bs}, steps={selected_step}."
+            )
+        config[str(bs)] = {"candidate_steps": list(range(selected_step + 1))}
+    return config
+
+
 def _resolve_server_args_decode_cuda_graph_bs(
     server_args: ServerArgs,
 ) -> list[int] | None:
@@ -342,18 +410,31 @@ def resolve_decoupled_verify_roofline_profile_bs_candidates(
     server_args: ServerArgs,
     cuda_graph_bs: list[int] | None = None,
 ) -> list[int]:
-    explicit_candidates = normalize_decoupled_verify_roofline_bs_candidates(
-        getattr(server_args, "verifier_roofline_profile_bs_candidates", None)
+    return (
+        normalize_decoupled_verify_roofline_bs_candidates(
+            getattr(server_args, "verifier_roofline_profile_bs_candidates", None)
+        )
+        or list(DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES)
     )
-    if explicit_candidates is None:
-        return list(DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES)
 
+
+def resolve_decoupled_verify_roofline_capture_bs_candidates(
+    server_args: ServerArgs,
+    profile_bs_candidates: list[int],
+    cuda_graph_bs: list[int] | None = None,
+) -> list[int]:
+    capture_bs = list(int(bs) for bs in profile_bs_candidates if int(bs) > 0)
     if cuda_graph_bs is None:
         cuda_graph_bs = _resolve_server_args_decode_cuda_graph_bs(server_args)
     if cuda_graph_bs:
-        explicit_candidates.extend(int(bs) for bs in cuda_graph_bs if int(bs) > 0)
-    return sorted(set(explicit_candidates))
-
+        capture_bs.extend(int(bs) for bs in cuda_graph_bs if int(bs) > 0)
+    capture_bs = sorted(set(capture_bs))
+    if not capture_bs:
+        raise ValueError(
+            "Decoupled verifier roofline capture bs candidates must contain at "
+            "least one positive batch size."
+        )
+    return capture_bs
 
 def resolve_decoupled_verify_adaptive_config_from_server_args(
     server_args: ServerArgs,
@@ -369,6 +450,12 @@ def resolve_decoupled_verify_adaptive_config_from_server_args(
     if is_decoupled_verify_roofline_budget(
         getattr(server_args, "decoupled_spec_target_verify_token_budget", None)
     ):
+        adaptive_config = getattr(
+            server_args, "_decoupled_verify_roofline_adaptive_config", None
+        )
+        if adaptive_config is not None:
+            return adaptive_config
+
         roofline_bs = getattr(server_args, "_decoupled_verify_roofline_bs", None)
         if roofline_bs is None:
             profile_candidates = resolve_decoupled_verify_roofline_profile_bs_candidates(

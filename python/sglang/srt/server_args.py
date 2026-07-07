@@ -1580,8 +1580,9 @@ class ServerArgs:
                 "Strict target verify token budget for adaptive DECOUPLED_VERIFY "
                 "target verification. The CUDA graph padded batch size times "
                 "verify_tokens_per_req must be smaller than this value. Pass "
-                "'roofline' to profile zero-step target verify CUDA Graphs at "
-                "startup and derive the budget automatically."
+                "'roofline' to profile target verify CUDA Graphs across "
+                "(batch_size, speculative_steps) shapes at startup and derive "
+                "the adaptive config automatically."
             ),
             type_parser=parse_decoupled_verify_token_budget,
         ),
@@ -1590,7 +1591,7 @@ class ServerArgs:
         Optional[List[int]],
         Arg(
             help=(
-                "Candidate zero-step verifier batch sizes to profile when "
+                "Candidate verifier batch sizes to profile when "
                 "--decoupled-spec-target-verify-token-budget=roofline. These "
                 "batch sizes are combined with the default decode CUDA Graph "
                 "capture batch sizes before profiling. If unset, a default "

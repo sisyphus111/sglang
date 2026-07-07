@@ -141,6 +141,33 @@ class TestAdaptiveController(unittest.TestCase):
         self.assertEqual(worker.build_calls, [(3, 4, [8])])
         self.assertIs(worker.applied[-1], zero_state)
 
+    def test_init_states_reuses_registered_profile_states(self):
+        worker = _Worker()
+        worker.speculative_num_steps = 0
+        controller = AdaptiveController(
+            worker,
+            config={
+                "1": {"candidate_steps": [0, 1]},
+                "8": {"candidate_steps": [0, 1, 3]},
+            },
+        )
+        states = {
+            steps: SpecRuntimeState.for_decoupled_verify(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                target_attn_backend=object(),
+                target_graph_runner=object(),
+            )
+            for steps in (0, 1, 3)
+        }
+        for steps, state in states.items():
+            controller.register(state, steps=steps)
+
+        controller.init_states(cuda_graph_bs=[1, 8])
+
+        self.assertEqual(worker.build_calls, [])
+        self.assertIs(worker.applied[-1], states[0])
+
 
 if __name__ == "__main__":
     unittest.main()

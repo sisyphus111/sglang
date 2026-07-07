@@ -563,6 +563,108 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "roofline budget violated"):
             VerifyWorker._validate_decoupled_runtime_state(worker, bad_state)
 
+    def test_verify_worker_roofline_validation_uses_profiled_config(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.server_args = SimpleNamespace(
+            decoupled_spec_target_verify_token_budget="roofline",
+            _decoupled_verify_roofline_adaptive_config={
+                "16": {"candidate_steps": [0, 1]},
+                "32": {"candidate_steps": [0]},
+            },
+        )
+        ok_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=1,
+            speculative_num_draft_tokens=2,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[32]),
+        )
+        unselected_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[16]),
+        )
+        unsupported_state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=1,
+            speculative_num_draft_tokens=2,
+            target_attn_backend=object(),
+            target_graph_runner=SimpleNamespace(capture_bs=[8]),
+        )
+
+        VerifyWorker._validate_decoupled_runtime_state(worker, ok_state)
+        with self.assertRaisesRegex(RuntimeError, "not selected"):
+            VerifyWorker._validate_decoupled_runtime_state(worker, unselected_state)
+        with self.assertRaisesRegex(RuntimeError, "captured graph bucket"):
+            VerifyWorker._validate_decoupled_runtime_state(worker, unsupported_state)
+
+    def test_roofline_profile_draft_buffers_populate_nonzero_steps(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.model_config = SimpleNamespace(vocab_size=100)
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(output_ids=[1]),
+                SimpleNamespace(output_ids=[1, 2]),
+            ]
+        )
+
+        VerifyWorker._prepare_roofline_profile_draft_buffers(worker, batch, 3)
+
+        self.assertEqual([len(req.draft_buffer) for req in batch.reqs], [3, 3])
+        for req in batch.reqs:
+            self.assertTrue(all(1 <= token_id < 100 for token_id in req.draft_buffer))
+
+    def test_roofline_profile_bs_candidates_pad_to_capture_buckets(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+
+        profile_bs = VerifyWorker._filter_roofline_profile_bs_by_capture(
+            worker,
+            profile_bs_candidates=[32, 96, 160],
+            capture_bs=[64, 128],
+        )
+
+        self.assertEqual(profile_bs, [32, 96])
+        self.assertEqual(
+            VerifyWorker._roofline_padded_graph_bs(worker, 96, [64, 128]), 128
+        )
+
+    def test_roofline_profile_decode_result_applies_accept_lens(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.model_config = SimpleNamespace(vocab_size=100)
+        next_draft_input = object()
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(output_ids=[1]),
+                SimpleNamespace(output_ids=[1, 2]),
+            ],
+            spec_info=None,
+            seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_sum=30,
+            input_ids=object(),
+        )
+        result = GenerationBatchResult(
+            can_run_cuda_graph=True,
+            next_draft_input=next_draft_input,
+            accept_lens=torch.tensor([3, 1], dtype=torch.int32),
+            new_seq_lens=torch.tensor([13, 21], dtype=torch.int64),
+        )
+
+        VerifyWorker._apply_roofline_decode_result(worker, batch, result)
+
+        self.assertIs(batch.spec_info, next_draft_input)
+        self.assertIsNone(batch.input_ids)
+        self.assertEqual([len(req.output_ids) for req in batch.reqs], [4, 3])
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [13, 21])
+        self.assertEqual(batch.seq_lens_sum, 34)
+
     def test_zero_step_runtime_state_builds_decode_graph_runner(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
@@ -572,7 +674,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             speculative_num_steps=8,
             speculative_num_draft_tokens=9,
             cuda_graph_bs_decode=None,
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[8])),
+            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=None)),
             decoupled_spec_target_verify_token_budget=65,
         )
         model_runner = SimpleNamespace(
@@ -624,6 +726,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertEqual(state.speculative_num_draft_tokens, 1)
         self.assertIs(state.target_attn_backend, attn_backend)
         self.assertIs(state.target_graph_runner, graph_runner)
+        self.assertIsNone(server_args.cuda_graph_config.decode.bs)
 
     def test_decoupled_adaptive_allows_zero_step_candidates(self):
         from sglang.srt.model_executor.cuda_graph_config import Backend

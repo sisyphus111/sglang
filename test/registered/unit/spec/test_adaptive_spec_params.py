@@ -8,11 +8,14 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveStepSlot,
     DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES,
     build_decoupled_verify_adaptive_config,
+    build_decoupled_verify_profiled_adaptive_config,
     build_decoupled_verify_roofline_adaptive_config,
     resolve_decoupled_verify_adaptive_config_from_server_args,
+    resolve_decoupled_verify_roofline_capture_bs_candidates,
     resolve_decoupled_verify_roofline_profile_bs_candidates,
     resolve_candidate_steps_from_config,
     select_decoupled_verify_roofline_bs,
+    select_decoupled_verify_roofline_steps_by_bs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
@@ -502,6 +505,30 @@ class TestResolveCandidateSteps(unittest.TestCase):
         self.assertEqual(config["64"]["candidate_steps"], [0])
         self.assertEqual(config["96"]["candidate_steps"], [0])
 
+    def test_decoupled_roofline_selects_steps_from_per_bs_p95_peak(self):
+        selected, summaries, global_peak = select_decoupled_verify_roofline_steps_by_bs(
+            [
+                (32, 0, 100.0),
+                (32, 1, 192.0),
+                (32, 2, 200.0),
+                (64, 0, 300.0),
+                (64, 1, 280.0),
+                (64, 2, 260.0),
+            ]
+        )
+
+        self.assertEqual(selected, {32: 1, 64: 0})
+        self.assertEqual(summaries[32]["peak_step"], 2)
+        self.assertEqual(summaries[32]["threshold"], 190.0)
+        self.assertEqual(summaries[64]["peak_step"], 0)
+        self.assertEqual(global_peak, (64, 0, 300.0))
+
+    def test_decoupled_roofline_profiled_config_maps_candidate_prefix(self):
+        config = build_decoupled_verify_profiled_adaptive_config({32: 2, 64: 0})
+
+        self.assertEqual(config["32"]["candidate_steps"], [0, 1, 2])
+        self.assertEqual(config["64"]["candidate_steps"], [0])
+
     def test_decoupled_roofline_profile_candidates_default_when_unset(self):
         args = SimpleNamespace(
             verifier_roofline_profile_bs_candidates=None,
@@ -514,7 +541,7 @@ class TestResolveCandidateSteps(unittest.TestCase):
             DEFAULT_DECOUPLED_VERIFY_ROOFLINE_BS_CANDIDATES,
         )
 
-    def test_decoupled_roofline_profile_candidates_union_decode_graph_bs(self):
+    def test_decoupled_roofline_profile_candidates_are_raw_profile_bs(self):
         args = SimpleNamespace(
             verifier_roofline_profile_bs_candidates=[64, 512],
         )
@@ -524,7 +551,18 @@ class TestResolveCandidateSteps(unittest.TestCase):
             cuda_graph_bs=[1, 8, 64],
         )
 
-        self.assertEqual(candidates, [1, 8, 64, 512])
+        self.assertEqual(candidates, [64, 512])
+
+    def test_decoupled_roofline_capture_candidates_union_decode_graph_bs(self):
+        args = SimpleNamespace()
+
+        capture_bs = resolve_decoupled_verify_roofline_capture_bs_candidates(
+            args,
+            profile_bs_candidates=[64, 512],
+            cuda_graph_bs=[1, 8, 64],
+        )
+
+        self.assertEqual(capture_bs, [1, 8, 64, 512])
 
     def test_decoupled_roofline_server_args_uses_candidate_max_before_profile(self):
         args = SimpleNamespace(
@@ -545,6 +583,27 @@ class TestResolveCandidateSteps(unittest.TestCase):
         self.assertEqual(config["8"]["candidate_steps"], [7])
         self.assertEqual(config["32"]["candidate_steps"], [1])
         self.assertEqual(config["64"]["candidate_steps"], [0])
+
+    def test_decoupled_roofline_server_args_uses_profiled_config_when_resolved(self):
+        profiled_config = {
+            "32": {"candidate_steps": [0, 1]},
+            "64": {"candidate_steps": [0]},
+        }
+        args = SimpleNamespace(
+            speculative_adaptive_config=None,
+            max_running_requests=64,
+            decoupled_spec_target_verify_token_budget="roofline",
+            verifier_roofline_profile_bs_candidates=[32, 64],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[1, 8, 32, 64])
+            ),
+            cuda_graph_bs_decode=None,
+            _decoupled_verify_roofline_adaptive_config=profiled_config,
+        )
+
+        config = resolve_decoupled_verify_adaptive_config_from_server_args(args)
+
+        self.assertIs(config, profiled_config)
 
 
 if __name__ == "__main__":
