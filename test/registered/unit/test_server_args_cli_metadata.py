@@ -131,6 +131,21 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
+    def test_decoupled_verifier_adaptive_strategy_replaces_budget_flags(self):
+        self.assertEqual(
+            self.actions_by_option["--speculative-adaptive-strategy"].choices,
+            ["ema", "throughput_aware"],
+        )
+        removed_options = (
+            "--decoupled-spec-target-verify-token-budget",
+            "--verifier-roofline-profile-bs-candidates",
+        )
+        for option in removed_options:
+            with self.subTest(option=option):
+                self.assertNotIn(option, self.actions_by_option)
+                with self.assertRaises(SystemExit):
+                    self.parser.parse_args(["--model", "dummy", option, "1"])
+
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(
             [

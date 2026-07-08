@@ -137,6 +137,7 @@ class SchedulerMetricsReporter:
         # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
         self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
+        self.spec_valid_draft_tokens = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
@@ -344,9 +345,16 @@ class SchedulerMetricsReporter:
             "num_draft_tokens": num_draft_tokens or 0,
         }
 
-    def update_spec_metrics(self, bs: int, num_correct_drafts: int):
+    def update_spec_metrics(
+        self,
+        bs: int,
+        num_correct_drafts: int,
+        valid_draft_tokens: Optional[int] = None,
+    ):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
+        if valid_draft_tokens is not None:
+            self.spec_valid_draft_tokens += valid_draft_tokens
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
@@ -724,10 +732,26 @@ class SchedulerMetricsReporter:
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
+            valid_draft_len_msg = ""
+            if self.scheduler.spec_algorithm.is_decoupled_verify():
+                valid_draft_len = (
+                    self.spec_valid_draft_tokens / self.spec_num_forward_ct
+                )
+                spec_accept_rate = (
+                    num_correct_drafts / self.spec_valid_draft_tokens
+                    if self.spec_valid_draft_tokens > 0
+                    else 0
+                )
+                valid_draft_len_msg = f"valid draft len: {valid_draft_len:.2f}, "
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
+            self.spec_valid_draft_tokens = 0
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            msg += (
+                f"accept len: {spec_accept_length:.2f}, "
+                f"{valid_draft_len_msg}"
+                f"accept rate: {spec_accept_rate:.2f}, "
+            )
 
             if self.current_scheduler_metrics_enabled:
                 spec_snapshot = self._active_spec_config_snapshot()

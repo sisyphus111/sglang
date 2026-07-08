@@ -680,7 +680,9 @@ class SchedulerBatchResultProcessor:
             and not batch.spec_algorithm.is_decoupled_draft()
         ):
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                batch.batch_size(),
+                result.num_correct_drafts,
+                valid_draft_tokens=result.spec_valid_draft_tokens,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(

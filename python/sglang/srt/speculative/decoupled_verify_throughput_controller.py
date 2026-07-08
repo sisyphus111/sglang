@@ -258,11 +258,14 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
                 f"candidate_steps must be non-negative, got {self._candidate_steps}."
             )
 
-        self._current_steps = (
-            int(initial_steps)
-            if int(initial_steps) in self._candidate_steps
-            else self._candidate_steps[0]
-        )
+        initial_steps = int(initial_steps)
+        if initial_steps > 0 and initial_steps in self._candidate_steps:
+            self._current_steps = initial_steps
+        else:
+            positive_steps = self._positive_candidate_steps()
+            if not positive_steps:
+                raise ValueError("candidate_steps must include a positive step.")
+            self._current_steps = positive_steps[0]
         self._update_interval = max(1, int(update_interval))
         self._switch_hysteresis = float(switch_hysteresis)
         self._batch_count = 0

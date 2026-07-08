@@ -65,7 +65,6 @@ class _Scheduler(SchedulerDecoupledVerifyMixin):
             speculative_num_steps=8,
             speculative_num_draft_tokens=9,
             disable_cuda_graph=False,
-            decoupled_spec_target_verify_token_budget=65,
         )
 
         def activate_step_by_batch(batch_size):
@@ -107,13 +106,12 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             disable_piecewise_cuda_graph=False,
             speculative_algorithm="DECOUPLED_VERIFY",
             speculative_adaptive=True,
+            speculative_adaptive_strategy="throughput_aware",
             speculative_adaptive_config=None,
             speculative_num_steps=8,
             speculative_num_draft_tokens=9,
             speculative_eagle_topk=1,
             speculative_use_rejection_sampling=False,
-            decoupled_spec_target_verify_token_budget="roofline",
-            verifier_roofline_profile_bs_candidates=[64, 128],
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=Backend.DISABLED),
                 decode=SimpleNamespace(backend=Backend.FULL),
@@ -123,38 +121,31 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             setattr(args, key, value)
         return args
 
-    def test_roofline_budget_validation_accepts_adaptive_full_cuda_graph(self):
+    def test_throughput_aware_validation_accepts_adaptive_full_cuda_graph(self):
         args = self._make_validate_args()
 
         DecoupledVerifySpecAlgo.validate_server_args(args)
 
-        self.assertEqual(args.decoupled_spec_target_verify_token_budget, "roofline")
-        self.assertEqual(args.verifier_roofline_profile_bs_candidates, [64, 128])
+        self.assertEqual(args.speculative_adaptive_strategy, "throughput_aware")
 
-    def test_roofline_budget_validation_allows_default_profile_candidates(self):
-        args = self._make_validate_args(
-            verifier_roofline_profile_bs_candidates=None,
-        )
-
-        DecoupledVerifySpecAlgo.validate_server_args(args)
-
-        self.assertIsNone(args.verifier_roofline_profile_bs_candidates)
-
-    def test_roofline_budget_validation_requires_adaptive_decoupled_verify(self):
+    def test_throughput_aware_validation_requires_adaptive_decoupled_verify(self):
         args = self._make_validate_args(speculative_adaptive=False)
 
         with self.assertRaisesRegex(ValueError, "requires adaptive"):
             DecoupledVerifySpecAlgo.validate_server_args(args)
 
-    def test_roofline_budget_validation_rejects_empty_profile_candidates(self):
-        args = self._make_validate_args(verifier_roofline_profile_bs_candidates=[])
+    def test_throughput_aware_validation_requires_positive_max_steps(self):
+        for speculative_num_steps in (None, 0):
+            with self.subTest(speculative_num_steps=speculative_num_steps):
+                args = self._make_validate_args(
+                    speculative_num_steps=speculative_num_steps
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "positive --speculative-num-steps"
+                ):
+                    DecoupledVerifySpecAlgo.validate_server_args(args)
 
-        with self.assertRaisesRegex(
-            ValueError, "verifier-roofline-profile-bs-candidates"
-        ):
-            DecoupledVerifySpecAlgo.validate_server_args(args)
-
-    def test_roofline_budget_validation_requires_full_decode_cuda_graph(self):
+    def test_throughput_aware_validation_requires_full_decode_cuda_graph(self):
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         args = self._make_validate_args(
@@ -167,15 +158,19 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "full decode CUDA Graph"):
             DecoupledVerifySpecAlgo.validate_server_args(args)
 
-    def test_integer_budget_validation_is_unchanged(self):
+    def test_decoupled_ema_requires_explicit_config(self):
+        args = self._make_validate_args(speculative_adaptive_strategy="ema")
+
+        with self.assertRaisesRegex(ValueError, "requires --speculative-adaptive-config"):
+            DecoupledVerifySpecAlgo.validate_server_args(args)
+
+    def test_decoupled_ema_explicit_config_is_accepted(self):
         args = self._make_validate_args(
-            decoupled_spec_target_verify_token_budget="65",
-            verifier_roofline_profile_bs_candidates=None,
+            speculative_adaptive_strategy="ema",
+            speculative_adaptive_config="/tmp/adaptive-config.json",
         )
 
         DecoupledVerifySpecAlgo.validate_server_args(args)
-
-        self.assertEqual(args.decoupled_spec_target_verify_token_budget, 65)
 
     def test_scheduler_prepare_uses_active_worker_config_for_snapshot(self):
         scheduler = _Scheduler(steps=3, draft_tokens=4)
@@ -222,7 +217,6 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         worker.speculative_num_steps = 8
         worker.speculative_num_draft_tokens = 9
         worker.server_args = SimpleNamespace(
-            decoupled_spec_target_verify_token_budget=65,
             cuda_graph_config=SimpleNamespace(
                 decode=SimpleNamespace(bs=[16], max_bs=None)
             ),
@@ -528,78 +522,54 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not carry draft resources"):
             VerifyWorker._validate_decoupled_runtime_state(worker, state)
 
-    def test_verify_worker_roofline_validation_allows_zero_step_fallback_only(self):
+    def test_verify_worker_validation_allows_candidate_state_without_budget(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
         worker.server_args = SimpleNamespace(
-            decoupled_spec_target_verify_token_budget="roofline",
-            _decoupled_verify_roofline_bs=64,
             cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=None)),
             cuda_graph_bs=None,
             cuda_graph_max_bs=None,
         )
-        zero_state = SpecRuntimeState.for_decoupled_verify(
-            speculative_num_steps=0,
-            speculative_num_draft_tokens=1,
+        worker.adaptive_controller = None
+        state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
             target_attn_backend=object(),
             target_graph_runner=SimpleNamespace(capture_bs=[128]),
         )
-        ok_state = SpecRuntimeState.for_decoupled_verify(
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            target_attn_backend=object(),
-            target_graph_runner=SimpleNamespace(capture_bs=[16]),
-        )
-        bad_state = SpecRuntimeState.for_decoupled_verify(
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            target_attn_backend=object(),
-            target_graph_runner=SimpleNamespace(capture_bs=[17]),
-        )
 
-        VerifyWorker._validate_decoupled_runtime_state(worker, zero_state)
-        VerifyWorker._validate_decoupled_runtime_state(worker, ok_state)
-        with self.assertRaisesRegex(RuntimeError, "roofline budget violated"):
-            VerifyWorker._validate_decoupled_runtime_state(worker, bad_state)
+        VerifyWorker._validate_decoupled_runtime_state(worker, state)
 
-    def test_verify_worker_roofline_validation_uses_profiled_config(self):
+    def test_verify_worker_validation_rejects_unregistered_throughput_step(self):
+        from sglang.srt.speculative.decoupled_verify_throughput_controller import (
+            DecoupledVerifyThroughputAwareController,
+        )
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
+        worker.speculative_num_steps = 1
         worker.server_args = SimpleNamespace(
-            decoupled_spec_target_verify_token_budget="roofline",
-            _decoupled_verify_roofline_adaptive_config={
-                "16": {"candidate_steps": [0, 1]},
-                "32": {"candidate_steps": [0]},
-            },
+            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=None)),
+            cuda_graph_bs=None,
+            cuda_graph_max_bs=None,
         )
-        ok_state = SpecRuntimeState.for_decoupled_verify(
-            speculative_num_steps=1,
-            speculative_num_draft_tokens=2,
-            target_attn_backend=object(),
-            target_graph_runner=SimpleNamespace(capture_bs=[32]),
+        worker.adaptive_controller = DecoupledVerifyThroughputAwareController(
+            worker,
+            candidate_steps=[0, 1],
+            initial_steps=1,
         )
-        unselected_state = SpecRuntimeState.for_decoupled_verify(
+        state = SpecRuntimeState.for_decoupled_verify(
             speculative_num_steps=2,
             speculative_num_draft_tokens=3,
             target_attn_backend=object(),
             target_graph_runner=SimpleNamespace(capture_bs=[16]),
         )
-        unsupported_state = SpecRuntimeState.for_decoupled_verify(
-            speculative_num_steps=1,
-            speculative_num_draft_tokens=2,
-            target_attn_backend=object(),
-            target_graph_runner=SimpleNamespace(capture_bs=[8]),
-        )
 
-        VerifyWorker._validate_decoupled_runtime_state(worker, ok_state)
         with self.assertRaisesRegex(RuntimeError, "not selected"):
-            VerifyWorker._validate_decoupled_runtime_state(worker, unselected_state)
-        with self.assertRaisesRegex(RuntimeError, "captured graph bucket"):
-            VerifyWorker._validate_decoupled_runtime_state(worker, unsupported_state)
+            VerifyWorker._validate_decoupled_runtime_state(worker, state)
 
-    def test_roofline_profile_draft_buffers_populate_nonzero_steps(self):
+    def test_throughput_profile_draft_buffers_populate_nonzero_steps(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
@@ -611,29 +581,31 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             ]
         )
 
-        VerifyWorker._prepare_roofline_profile_draft_buffers(worker, batch, 3)
+        VerifyWorker._prepare_throughput_profile_draft_buffers(worker, batch, 3)
 
         self.assertEqual([len(req.draft_buffer) for req in batch.reqs], [3, 3])
         for req in batch.reqs:
             self.assertTrue(all(1 <= token_id < 100 for token_id in req.draft_buffer))
 
-    def test_roofline_profile_bs_candidates_pad_to_capture_buckets(self):
+    def test_throughput_profile_capture_bs_uses_decode_graph_buckets(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
-
-        profile_bs = VerifyWorker._filter_roofline_profile_bs_by_capture(
-            worker,
-            profile_bs_candidates=[32, 96, 160],
-            capture_bs=[64, 128],
+        worker.server_args = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[8, 4, 0], max_bs=None)
+            ),
+            cuda_graph_bs_decode=None,
         )
 
-        self.assertEqual(profile_bs, [32, 96])
+        capture_bs = VerifyWorker._resolve_throughput_profile_capture_bs(worker)
+
+        self.assertEqual(capture_bs, [4, 8])
         self.assertEqual(
-            VerifyWorker._roofline_padded_graph_bs(worker, 96, [64, 128]), 128
+            VerifyWorker._throughput_profile_padded_graph_bs(worker, 5, [4, 8]), 8
         )
 
-    def test_roofline_profile_decode_result_applies_accept_lens(self):
+    def test_throughput_profile_decode_result_applies_accept_lens(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
@@ -657,13 +629,121 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             new_seq_lens=torch.tensor([13, 21], dtype=torch.int64),
         )
 
-        VerifyWorker._apply_roofline_decode_result(worker, batch, result)
+        VerifyWorker._apply_throughput_decode_result(worker, batch, result)
 
         self.assertIs(batch.spec_info, next_draft_input)
         self.assertIsNone(batch.input_ids)
         self.assertEqual([len(req.output_ids) for req in batch.reqs], [4, 3])
         self.assertEqual(batch.seq_lens_cpu.tolist(), [13, 21])
         self.assertEqual(batch.seq_lens_sum, 34)
+
+    def test_throughput_profile_capture_uses_decode_graph_bs_and_steps(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.server_args = SimpleNamespace(
+            _decoupled_verify_max_speculative_steps=2,
+            speculative_num_steps=1,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=[8, 4], max_bs=None)
+            ),
+            cuda_graph_bs_decode=None,
+        )
+        captured = []
+
+        def build_state(speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs):
+            captured.append(
+                (
+                    speculative_num_steps,
+                    speculative_num_draft_tokens,
+                    list(cuda_graph_bs),
+                )
+            )
+            return SpecRuntimeState.for_decoupled_verify(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                target_attn_backend=object(),
+                target_graph_runner=SimpleNamespace(capture_bs=list(cuda_graph_bs)),
+            )
+
+        worker.build_adaptive_runtime_state = build_state
+
+        VerifyWorker._capture_throughput_profile_states(worker)
+
+        self.assertEqual(
+            captured,
+            [
+                (0, 1, [4, 8]),
+                (1, 2, [4, 8]),
+                (2, 3, [4, 8]),
+            ],
+        )
+        self.assertEqual(
+            worker._throughput_profile_bs_by_step,
+            {0: [4, 8], 1: [4, 8], 2: [4, 8]},
+        )
+
+    def test_startup_throughput_profile_writes_controller_cost_table(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.enable_adaptive_verify = True
+        worker.speculative_num_steps = 1
+        worker.speculative_num_draft_tokens = 2
+        worker.server_args = SimpleNamespace(
+            speculative_adaptive_strategy="throughput_aware",
+            _decoupled_verify_max_speculative_steps=2,
+        )
+        worker._throughput_profile_done = False
+        worker._throughput_profile_states_by_step = {
+            steps: SpecRuntimeState.for_decoupled_verify(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                target_attn_backend=object(),
+                target_graph_runner=SimpleNamespace(capture_bs=[4, 8]),
+            )
+            for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_capture_bs_by_step = {
+            steps: [4, 8] for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_bs_by_step = {
+            steps: [4, 8] for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_capture_bs = [4, 8]
+        profile_calls = []
+
+        def apply_runtime_state(state):
+            worker.speculative_num_steps = state.speculative_num_steps
+            worker.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+
+        def profile_shape(_worker, batch_size, steps, state, tree_cache):
+            profile_calls.append((batch_size, steps))
+            return float(batch_size + steps + 1)
+
+        worker.apply_runtime_state = apply_runtime_state
+
+        with (
+            patch.object(VerifyWorker, "_profile_throughput_shape", profile_shape),
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker.log_info_on_rank0"
+            ),
+        ):
+            VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
+
+        self.assertEqual(
+            profile_calls,
+            [(4, 0), (8, 0), (4, 1), (8, 1), (4, 2), (8, 2)],
+        )
+        self.assertEqual(worker.adaptive_controller.candidate_steps, [0, 1, 2])
+        self.assertEqual(
+            worker.adaptive_controller._cost_table.lookup(batch_size=5, steps=2),
+            11.0,
+        )
+        self.assertIn(
+            "(bs=8, steps=2): 11.0000ms",
+            worker.server_args._decoupled_verify_throughput_cost_table_summary,
+        )
 
     def test_zero_step_runtime_state_builds_decode_graph_runner(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
@@ -675,7 +755,6 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             speculative_num_draft_tokens=9,
             cuda_graph_bs_decode=None,
             cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=None)),
-            decoupled_spec_target_verify_token_budget=65,
         )
         model_runner = SimpleNamespace(
             gpu_id=0,
@@ -748,11 +827,11 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                 disable_piecewise_cuda_graph=False,
                 speculative_algorithm="DECOUPLED_VERIFY",
                 speculative_adaptive=True,
+                speculative_adaptive_strategy="ema",
                 speculative_adaptive_config=f.name,
                 speculative_num_steps=1,
                 speculative_num_draft_tokens=2,
                 speculative_eagle_topk=1,
-                decoupled_spec_target_verify_token_budget=65,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(backend=Backend.DISABLED),
                     decode=SimpleNamespace(backend=Backend.FULL),
@@ -761,7 +840,6 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
             DecoupledVerifySpecAlgo.validate_server_args(args)
 
-        self.assertEqual(args.decoupled_spec_target_verify_token_budget, 65)
         self.assertEqual(args.speculative_num_draft_tokens, 2)
         self.assertTrue(args.disable_radix_cache)
         self.assertEqual(args.mamba_radix_cache_strategy, "no_buffer")

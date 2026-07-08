@@ -22,10 +22,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-try:
-    from . import common
-except ImportError:
-    import common
+from sglang.srt.speculative.decoupled_speculation import common
 
 LOCAL_HOST = "127.0.0.1"
 DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
@@ -201,9 +198,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help=(
-            "Static speculative steps. With --speculative-adaptive on the "
-            "decoupled verifier, this is the maximum verify-length cap before "
-            "the token budget is applied."
+            "Static speculative steps. With decoupled verifier "
+            "--speculative-adaptive-strategy=throughput_aware, this is the "
+            "maximum candidate verify step."
         ),
     )
     parser.add_argument(
@@ -215,20 +212,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--speculative-adaptive-strategy",
+        choices=["ema", "throughput_aware"],
+        default="throughput_aware",
+        help=(
+            "Adaptive decoupled verifier strategy. throughput_aware profiles "
+            "verifier-only costs at startup; ema requires "
+            "--speculative-adaptive-config."
+        ),
+    )
+    parser.add_argument(
         "--speculative-adaptive-config",
         default=None,
         help=(
             "Optional adaptive speculative config JSON path for the target "
             "engine when --speculative-adaptive is enabled."
-        ),
-    )
-    parser.add_argument(
-        "--decoupled-spec-target-verify-token-budget",
-        type=int,
-        default=None,
-        help=(
-            "Strict target verify token budget used when "
-            "--speculative-adaptive is enabled for decoupled verification."
         ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -716,13 +714,16 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
-    if args.speculative_adaptive:
-        budget = args.decoupled_spec_target_verify_token_budget
-        if budget is None or budget <= 0:
-            raise ValueError(
-                "--decoupled-spec-target-verify-token-budget must be positive "
-                "when --speculative-adaptive is enabled"
-            )
+    if (
+        args.speculative_adaptive
+        and args.speculative_adaptive_strategy == "ema"
+        and args.speculative_adaptive_config is None
+    ):
+        raise ValueError(
+            "--speculative-adaptive-config is required when "
+            "--speculative-adaptive-strategy=ema is used with "
+            "--speculative-adaptive"
+        )
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
     if args.draft_ngpus is not None and args.draft_ngpus <= 0:
@@ -1099,8 +1100,8 @@ def create_verifier_engine(
         engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.speculative_adaptive:
         engine_kwargs["speculative_adaptive"] = True
-        engine_kwargs["decoupled_spec_target_verify_token_budget"] = (
-            args.decoupled_spec_target_verify_token_budget
+        engine_kwargs["speculative_adaptive_strategy"] = (
+            args.speculative_adaptive_strategy
         )
         if args.speculative_adaptive_config is not None:
             engine_kwargs["speculative_adaptive_config"] = (
@@ -1281,8 +1282,8 @@ def main() -> None:
     )
     if args.speculative_adaptive:
         print(
-            "  decoupled_spec_target_verify_token_budget: "
-            f"{args.decoupled_spec_target_verify_token_budget}",
+            "  speculative_adaptive_strategy: "
+            f"{args.speculative_adaptive_strategy}",
             flush=True,
         )
         if args.speculative_adaptive_config is not None:

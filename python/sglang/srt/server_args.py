@@ -103,21 +103,6 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 
-def parse_decoupled_verify_token_budget(value):
-    if isinstance(value, int):
-        return value
-    value_str = str(value).strip().lower()
-    if value_str == "roofline":
-        return "roofline"
-    try:
-        return int(value_str)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "--decoupled-spec-target-verify-token-budget must be a positive "
-            "integer or 'roofline'."
-        ) from exc
-
-
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 MIMO_V2_MODEL_ARCHS = (
@@ -1565,6 +1550,17 @@ class ServerArgs:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    speculative_adaptive_strategy: A[
+        str,
+        Arg(
+            help=(
+                "Adaptive speculative decoding strategy. 'ema' keeps the "
+                "acceptance-EMA step controller. 'throughput_aware' uses "
+                "runtime acceptance rates and a startup-profiled cost table."
+            ),
+            choices=["ema", "throughput_aware"],
+        ),
+    ] = "ema"
     decoupled_spec_rank_base: A[
         int,
         "Base global rank for dynamically configured decoupled-spec entry schedulers. The local DP rank is added to this value.",
@@ -1572,33 +1568,6 @@ class ServerArgs:
     spec_trace_dir: A[
         Optional[str],
         "Directory for speculative decoding CSV trace files. Tracing is enabled when this flag is provided.",
-    ] = None
-    decoupled_spec_target_verify_token_budget: A[
-        Optional[Union[int, Literal["roofline"]]],
-        Arg(
-            help=(
-                "Strict target verify token budget for adaptive DECOUPLED_VERIFY "
-                "target verification. The CUDA graph padded batch size times "
-                "verify_tokens_per_req must be smaller than this value. Pass "
-                "'roofline' to profile target verify CUDA Graphs across "
-                "(batch_size, speculative_steps) shapes at startup and derive "
-                "the adaptive config automatically."
-            ),
-            type_parser=parse_decoupled_verify_token_budget,
-        ),
-    ] = None
-    verifier_roofline_profile_bs_candidates: A[
-        Optional[List[int]],
-        Arg(
-            help=(
-                "Candidate verifier batch sizes to profile when "
-                "--decoupled-spec-target-verify-token-budget=roofline. These "
-                "batch sizes are combined with the default decode CUDA Graph "
-                "capture batch sizes before profiling. If unset, a default "
-                "roofline candidate list is used."
-            ),
-            type_parser=json_list_type,
-        ),
     ] = None
 
     # -------------------------------------------------------------------------
@@ -6665,13 +6634,20 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        if self.speculative_algorithm == "DECOUPLED_VERIFY":
+        if (
+            self.speculative_algorithm == "DECOUPLED_VERIFY"
+            and self.speculative_adaptive_strategy == "throughput_aware"
+        ):
             from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_decoupled_verify_candidate_steps_from_server_args,
+                resolve_decoupled_verify_throughput_aware_candidate_steps,
             )
 
-            candidate_steps = resolve_decoupled_verify_candidate_steps_from_server_args(
-                self
+            candidate_steps = resolve_decoupled_verify_throughput_aware_candidate_steps(
+                getattr(
+                    self,
+                    "_decoupled_verify_max_speculative_steps",
+                    self.speculative_num_steps,
+                )
             )
         else:
             from sglang.srt.speculative.adaptive_spec_params import (

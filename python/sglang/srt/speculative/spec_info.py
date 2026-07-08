@@ -269,10 +269,6 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
         from sglang.srt.model_executor.cuda_graph_config import Backend
-        from sglang.srt.speculative.adaptive_spec_params import (
-            is_decoupled_verify_roofline_budget,
-            normalize_decoupled_verify_roofline_bs_candidates,
-        )
 
         if server_args.pp_size != 1:
             raise ValueError("decoupled verifier currently requires pp_size == 1.")
@@ -354,48 +350,50 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
                 )
                 server_args.speculative_num_draft_tokens = expected_num_draft_tokens
 
-        budget = getattr(server_args, "decoupled_spec_target_verify_token_budget", None)
-        is_roofline_budget = is_decoupled_verify_roofline_budget(budget)
-        if is_roofline_budget and not dynamic_verify_enabled(server_args):
+        strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
+        if strategy == "throughput_aware" and not dynamic_verify_enabled(server_args):
             raise ValueError(
-                "--decoupled-spec-target-verify-token-budget=roofline requires "
+                "--speculative-adaptive-strategy=throughput_aware requires "
                 "adaptive DECOUPLED_VERIFY dynamic verify length."
             )
 
         if dynamic_verify_enabled(server_args):
-            budget = getattr(
-                server_args, "decoupled_spec_target_verify_token_budget", None
-            )
-            if is_roofline_budget:
-                if getattr(server_args, "speculative_adaptive_config", None) is not None:
+            if strategy == "throughput_aware":
+                if (
+                    getattr(server_args, "speculative_adaptive_config", None)
+                    is not None
+                ):
                     raise ValueError(
-                        "--decoupled-spec-target-verify-token-budget=roofline "
-                        "derives the adaptive config automatically and cannot be "
-                        "combined with --speculative-adaptive-config."
+                        "DECOUPLED_VERIFY throughput_aware adaptive uses the "
+                        "built-in controller defaults and cannot be combined with "
+                        "--speculative-adaptive-config."
                     )
-                server_args.verifier_roofline_profile_bs_candidates = (
-                    normalize_decoupled_verify_roofline_bs_candidates(
-                        getattr(
-                            server_args,
-                            "verifier_roofline_profile_bs_candidates",
-                            None,
-                        )
+                if (
+                    server_args.speculative_num_steps is None
+                    or int(server_args.speculative_num_steps) <= 0
+                ):
+                    raise ValueError(
+                        "DECOUPLED_VERIFY throughput_aware adaptive requires "
+                        "positive --speculative-num-steps as the maximum "
+                        "candidate step."
                     )
-                )
                 if server_args.cuda_graph_config.decode.backend != Backend.FULL:
                     raise ValueError(
-                        "--decoupled-spec-target-verify-token-budget=roofline "
-                        "requires full decode CUDA Graph."
+                        "DECOUPLED_VERIFY throughput_aware adaptive requires "
+                        "full decode CUDA Graph."
                     )
-                server_args.decoupled_spec_target_verify_token_budget = "roofline"
-            else:
-                if budget is None or int(budget) <= 0:
+            elif strategy == "ema":
+                if getattr(server_args, "speculative_adaptive_config", None) is None:
                     raise ValueError(
-                        "--decoupled-spec-target-verify-token-budget must be a "
-                        "positive integer when adaptive DECOUPLED_VERIFY dynamic "
-                        "verify length is enabled."
+                        "DECOUPLED_VERIFY adaptive strategy 'ema' requires "
+                        "--speculative-adaptive-config. Use "
+                        "--speculative-adaptive-strategy=throughput_aware for "
+                        "the built-in throughput-aware controller."
                     )
-                server_args.decoupled_spec_target_verify_token_budget = int(budget)
+            else:
+                raise ValueError(
+                    f"Unsupported DECOUPLED_VERIFY adaptive strategy: {strategy!r}."
+                )
             if server_args.cuda_graph_config.decode.backend == Backend.DISABLED:
                 raise ValueError(
                     "decoupled verifier dynamic verify length requires full CUDA "

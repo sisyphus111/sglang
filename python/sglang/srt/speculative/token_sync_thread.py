@@ -132,9 +132,16 @@ class TokenSyncThread:
             endpoints,
         )
 
-    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET)
-    def _drain_control_socket(self) -> bool | dict[str, Any]:
-        pending_controls_before = self._pending_control_count()
+    @trace_speculative(
+        SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_SOCKET,
+        inject_trace_enabled="trace_enabled",
+    )
+    def _drain_control_socket(
+        self, *, trace_enabled: bool = False
+    ) -> bool | dict[str, Any]:
+        pending_controls_before = (
+            self._pending_control_count() if trace_enabled else 0
+        )
         did_work = False
         if self.control_recv_socket is None:
             return did_work
@@ -153,6 +160,8 @@ class TokenSyncThread:
                 self._pending_control_inbox.add_control_batch_locked(control_batch)
         if not did_work:
             return False
+        if not trace_enabled:
+            return True
         return {
             "drafter_rank": int(self.drafter_rank),
             "pending_controls_before": pending_controls_before,
@@ -195,9 +204,14 @@ class TokenSyncThread:
         self._outgoing_results.put(queued_batch)
         self._wakeup.set()
 
-    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS)
-    def _drain_outgoing_results(self) -> bool | dict[str, Any]:
-        queue_size_before = self._outgoing_results_size()
+    @trace_speculative(
+        SpecTraceEvent.TOKEN_SYNC_DRAIN_OUTGOING_RESULTS,
+        inject_trace_enabled="trace_enabled",
+    )
+    def _drain_outgoing_results(
+        self, *, trace_enabled: bool = False
+    ) -> bool | dict[str, Any]:
+        queue_size_before = self._outgoing_results_size() if trace_enabled else 0
         did_work = False
         num_result_batches = 0
         num_stream_outputs = 0
@@ -207,11 +221,14 @@ class TokenSyncThread:
             except queue.Empty:
                 break
             did_work = True
-            num_result_batches += 1
-            num_stream_outputs += len(result_batch.outputs)
+            if trace_enabled:
+                num_result_batches += 1
+                num_stream_outputs += len(result_batch.outputs)
             self._send_draft_results(result_batch)
         if not did_work:
             return False
+        if not trace_enabled:
+            return True
         return {
             "drafter_rank": int(self.drafter_rank),
             "queue_size_before": queue_size_before,
@@ -258,16 +275,23 @@ class TokenSyncThread:
         with self._pending_lock:
             return self._pending_control_inbox.pending_control_count()
 
-    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_IDLE_WAIT)
-    def _idle_wait(self) -> dict[str, Any]:
-        queue_size_before = self._outgoing_results_size()
-        pending_controls_before = self._pending_control_count()
-        wakeup_set_before = self._wakeup.is_set()
+    @trace_speculative(
+        SpecTraceEvent.TOKEN_SYNC_IDLE_WAIT,
+        inject_trace_enabled="trace_enabled",
+    )
+    def _idle_wait(self, *, trace_enabled: bool = False) -> dict[str, Any] | None:
+        if trace_enabled:
+            queue_size_before = self._outgoing_results_size()
+            pending_controls_before = self._pending_control_count()
+            wakeup_set_before = self._wakeup.is_set()
         self._wakeup.wait(timeout=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S)
-        wakeup_set_after = self._wakeup.is_set()
-        queue_size_after = self._outgoing_results_size()
-        pending_controls_after = self._pending_control_count()
+        if trace_enabled:
+            wakeup_set_after = self._wakeup.is_set()
+            queue_size_after = self._outgoing_results_size()
+            pending_controls_after = self._pending_control_count()
         self._wakeup.clear()
+        if not trace_enabled:
+            return None
         return {
             "drafter_rank": int(self.drafter_rank),
             "wait_timeout_ms": TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S * 1_000,

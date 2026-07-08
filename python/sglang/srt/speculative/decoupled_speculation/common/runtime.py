@@ -595,6 +595,9 @@ class TargetActor:
         node_rank: int,
         dist_init_addr: str | None,
         speculative_num_steps: int | None = None,
+        speculative_adaptive: bool = False,
+        speculative_adaptive_strategy: str = "throughput_aware",
+        speculative_adaptive_config: str | None = None,
         rank_base: int = 0,
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
@@ -640,6 +643,15 @@ class TargetActor:
                 decoupled_spec_rank_base=rank_base,
                 disable_radix_cache=True,
             )
+            if speculative_adaptive:
+                engine_kwargs["speculative_adaptive"] = True
+                engine_kwargs["speculative_adaptive_strategy"] = (
+                    speculative_adaptive_strategy
+                )
+                if speculative_adaptive_config is not None:
+                    engine_kwargs["speculative_adaptive_config"] = (
+                        speculative_adaptive_config
+                    )
         elif mode == "decode":
             engine_kwargs["disable_overlap_schedule"] = True
         elif mode == "mtp":

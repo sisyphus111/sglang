@@ -394,6 +394,8 @@ class CppTokenSyncThread:
             self._flush_cpp_profile()
 
     def _flush_cpp_profile(self) -> None:
+        if not getattr(self.tracer, "enabled", False):
+            return
         _write_cpp_profile(self.tracer, "token_sync_thread", self._cpp.profile_json())
 
     def _maybe_flush_cpp_profile(self) -> None:
@@ -458,6 +460,8 @@ class CppDraftProxyThread:
             self._flush_cpp_profile()
 
     def _flush_cpp_profile(self) -> None:
+        if not getattr(self.tracer, "enabled", False):
+            return
         _write_cpp_profile(self.tracer, "draft_proxy", self._cpp.profile_json())
         _write_cpp_profile(
             self.tracer,

@@ -167,10 +167,15 @@ class SchedulerDecoupledVerifyMixin:
 
         self._snapshot_verify_inputs(batch)
 
-    @trace_speculative(SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH)
+    @trace_speculative(
+        SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH,
+        inject_trace_enabled="trace_enabled",
+    )
     def _prepare_zero_step_verify_inputs(
         self: Scheduler,
         batch: ScheduleBatch,
+        *,
+        trace_enabled: bool = False,
     ) -> dict | None:
         num_speculative_steps, verify_tokens_per_req = (
             self._active_decoupled_verify_config()
@@ -181,7 +186,8 @@ class SchedulerDecoupledVerifyMixin:
                 continue
             live_reqs.append(req)
             setattr(req, "draft_buffer", None)
-            setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+            if trace_enabled:
+                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
             setattr(
                 req,
                 "_decoupled_verify_pre_committed_len",
@@ -199,6 +205,8 @@ class SchedulerDecoupledVerifyMixin:
             )
         if not live_reqs:
             return None
+        if not trace_enabled:
+            return None
 
         raw_verify_tokens = len(live_reqs) * verify_tokens_per_req
 
@@ -208,7 +216,6 @@ class SchedulerDecoupledVerifyMixin:
             "dynamic_verify_length": dynamic_verify_enabled(self.server_args),
             "raw_batch_size": len(live_reqs),
             "captured_batch_size": "",
-            "target_verify_token_budget": "",
             "num_speculative_steps": num_speculative_steps,
             "verify_tokens_per_req": verify_tokens_per_req,
             "raw_verify_tokens": raw_verify_tokens,
@@ -515,6 +522,8 @@ class SchedulerDecoupledVerifyMixin:
         self,
         target_reqs: list[Req],
         snapshots: list[DraftTailSnapshot],
+        *,
+        collect_trace_stats: bool = False,
     ) -> int:
         """
         Bind one broadcast draft tail snapshot set to the local verifier batch.
@@ -545,14 +554,16 @@ class SchedulerDecoupledVerifyMixin:
             snapshot = snapshot_by_rid.get(req.rid)
             if snapshot is None:
                 setattr(req, "draft_buffer", None)
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+                if collect_trace_stats:
+                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                 continue
 
             committed_len = int(snapshot.committed_len)
             if committed_len < len(req.output_ids):
                 # the drafter has not caught up with the verifier req's committed output prefix
                 setattr(req, "draft_buffer", None)
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+                if collect_trace_stats:
+                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                 continue
             if committed_len > len(req.output_ids):
                 raise RuntimeError(
@@ -562,11 +573,14 @@ class SchedulerDecoupledVerifyMixin:
                     f"request_output_len={len(req.output_ids)}"
                 )
             setattr(req, "draft_buffer", list(snapshot.tail_tokens))
-            setattr(
-                req,
-                "_decoupled_verify_snapshot_raw_tail_tokens",
-                list(snapshot.raw_tail_tokens),
-            )
+            if collect_trace_stats:
+                setattr(
+                    req,
+                    "_decoupled_verify_snapshot_raw_tail_tokens",
+                    list(snapshot.raw_tail_tokens),
+                )
+        if not collect_trace_stats:
+            return 0
         return sum(
             1
             for req in target_reqs
@@ -574,8 +588,16 @@ class SchedulerDecoupledVerifyMixin:
             and int(snapshot_by_rid[req.rid].committed_len) < len(req.output_ids)
         )
 
-    @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH)
-    def _sync_verify_requests(self, batch: ScheduleBatch) -> dict | None:
+    @trace_speculative(
+        SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH,
+        inject_trace_enabled="trace_enabled",
+    )
+    def _sync_verify_requests(
+        self,
+        batch: ScheduleBatch,
+        *,
+        trace_enabled: bool = False,
+    ) -> dict | None:
         """
         Send DraftSync messages before verifier prefill/extend processing.
 
@@ -628,8 +650,12 @@ class SchedulerDecoupledVerifyMixin:
                 )
             )
             setattr(req, "draft_buffer", None)
-            setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
-        trace_payload = {
+            if trace_enabled:
+                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+        self._send_verify_control_batches(sync_messages=sync_messages)
+        if not trace_enabled:
+            return None
+        return {
             "forward_mode": str(batch.forward_mode),
             "batch_size": len(batch.reqs),
             "rids": [message.request_id for message in sync_messages],
@@ -643,13 +669,16 @@ class SchedulerDecoupledVerifyMixin:
                 int(message.dst_drafter_rank) for message in sync_messages
             ],
         }
-        self._send_verify_control_batches(sync_messages=sync_messages)
-        return trace_payload
 
-    @trace_speculative(SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH)
+    @trace_speculative(
+        SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH,
+        inject_trace_enabled="trace_enabled",
+    )
     def _snapshot_verify_inputs(
         self,
         batch: ScheduleBatch,
+        *,
+        trace_enabled: bool = False,
     ) -> dict | None:
         """
         Collect currently available draft tails, and bind them to a verifier request batch.
@@ -672,7 +701,8 @@ class SchedulerDecoupledVerifyMixin:
                 continue
             live_reqs.append(req)
             setattr(req, "draft_buffer", None)
-            setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+            if trace_enabled:
+                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
             setattr(
                 req,
                 "_decoupled_verify_pre_committed_len",
@@ -707,14 +737,18 @@ class SchedulerDecoupledVerifyMixin:
             local_snapshots = draft_tail_buffer.get_draft_snapshots(
                 target_reqs,
                 allow_partial=allow_partial,
-                include_raw_tail_tokens=True,
+                include_raw_tail_tokens=trace_enabled,
                 max_tail_len=snapshot_tail_cap,
             )
 
         synced_snapshots = self._broadcast_verify_snapshots(local_snapshots)
         num_stale_snapshots = self._bind_verify_snapshots(
-            target_reqs, synced_snapshots
+            target_reqs,
+            synced_snapshots,
+            collect_trace_stats=trace_enabled,
         )
+        if not trace_enabled:
+            return None
         snapshot_by_rid = {
             snapshot.request_id: snapshot for snapshot in synced_snapshots
         }
@@ -734,15 +768,6 @@ class SchedulerDecoupledVerifyMixin:
             "dynamic_verify_length": is_dynamic,
             "raw_batch_size": len(target_reqs) if is_dynamic else "",
             "captured_batch_size": "",
-            "target_verify_token_budget": (
-                getattr(
-                    self.server_args,
-                    "decoupled_spec_target_verify_token_budget",
-                    "",
-                )
-                if is_dynamic
-                else ""
-            ),
             "num_speculative_steps": active_spec_steps,
             "verify_tokens_per_req": active_verify_tokens,
             "raw_verify_tokens": len(target_reqs) * active_verify_tokens,
@@ -763,10 +788,15 @@ class SchedulerDecoupledVerifyMixin:
             "num_stale_snapshots": num_stale_snapshots,
         }
 
-    @trace_speculative(SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH)
+    @trace_speculative(
+        SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH,
+        inject_trace_enabled="trace_enabled",
+    )
     def submit_verify_updates(
         self,
         batch: ScheduleBatch,
+        *,
+        trace_enabled: bool = False,
     ) -> dict | None:
         """
         Send verifier commit or close messages after batch result processing.
@@ -818,10 +848,12 @@ class SchedulerDecoupledVerifyMixin:
                             reason="abort" if req.is_retracted else "finished",
                         )
                     )
-                    close_output_lens.append(len(req.output_ids))
+                    if trace_enabled:
+                        close_output_lens.append(len(req.output_ids))
                     self.release_drafter_rank(req.rid)
                 setattr(req, "draft_buffer", None)
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
+                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
                 continue
 
             if not has_request:
@@ -870,19 +902,26 @@ class SchedulerDecoupledVerifyMixin:
                     committed_token_ids=committed_token_ids,
                 )
             )
-            commit_pre_committed_lens.append(pre_verify_committed_len)
-            commit_draft_buffer_lens.append(len(draft_buffer))
-            commit_segment_lens.append(len(committed_token_ids))
-            commit_last_token_ids.append(int(committed_token_ids[-1]))
-            commit_committed_lens.append(
-                pre_verify_committed_len + len(committed_token_ids)
-            )
-            commit_output_lens.append(len(req.output_ids))
+            if trace_enabled:
+                commit_pre_committed_lens.append(pre_verify_committed_len)
+                commit_draft_buffer_lens.append(len(draft_buffer))
+                commit_segment_lens.append(len(committed_token_ids))
+                commit_last_token_ids.append(int(committed_token_ids[-1]))
+                commit_committed_lens.append(
+                    pre_verify_committed_len + len(committed_token_ids)
+                )
+                commit_output_lens.append(len(req.output_ids))
             if hasattr(req, "_decoupled_verify_pre_committed_len"):
                 delattr(req, "_decoupled_verify_pre_committed_len")
             if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
                 delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
-        trace_payload = {
+        self._send_verify_control_batches(
+            verify_commit_messages=verify_commit_messages,
+            close_messages=close_messages,
+        )
+        if not trace_enabled:
+            return None
+        return {
             "forward_mode": str(batch.forward_mode),
             "batch_size": len(batch.reqs),
             "commit_rids": [
@@ -905,11 +944,6 @@ class SchedulerDecoupledVerifyMixin:
                 int(message.dst_drafter_rank) for message in close_messages
             ],
         }
-        self._send_verify_control_batches(
-            verify_commit_messages=verify_commit_messages,
-            close_messages=close_messages,
-        )
-        return trace_payload
 
     def abort_verify_request(self, request_id: str) -> None:
         """

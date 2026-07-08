@@ -419,7 +419,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
-            documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            documentation="Speculative acceptance rate. Decoupled verifier uses valid draft tokens as the denominator.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )

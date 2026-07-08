@@ -20,10 +20,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-try:
-    from . import common
-except ImportError:
-    import common
+from sglang.srt.speculative.decoupled_speculation import common
 
 DEFAULT_RAY_NAMESPACE = "dspec"
 DEFAULT_PROMPT_COLUMN_CANDIDATES = common.DEFAULT_PROMPT_COLUMN_CANDIDATES
@@ -237,7 +234,42 @@ def parse_args() -> argparse.Namespace:
             "drafters, and decode/MTP baseline engines."
         ),
     )
-    parser.add_argument("--num-speculative-steps", type=int, default=3)
+    parser.add_argument(
+        "--num-speculative-steps",
+        type=int,
+        default=3,
+        help=(
+            "Static speculative steps. With decoupled verifier "
+            "--speculative-adaptive-strategy=throughput_aware, this is the "
+            "maximum candidate verify step."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive",
+        action="store_true",
+        help=(
+            "Enable adaptive decoupled verifier dynamic verify length on the "
+            "target engine."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive-strategy",
+        choices=["ema", "throughput_aware"],
+        default="throughput_aware",
+        help=(
+            "Adaptive decoupled verifier strategy. throughput_aware profiles "
+            "verifier-only costs at startup; ema requires "
+            "--speculative-adaptive-config."
+        ),
+    )
+    parser.add_argument(
+        "--speculative-adaptive-config",
+        default=None,
+        help=(
+            "Optional adaptive speculative config JSON path for the target "
+            "engine when --speculative-adaptive is enabled."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--deterministic",
@@ -704,6 +736,16 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
+    if (
+        args.speculative_adaptive
+        and args.speculative_adaptive_strategy == "ema"
+        and args.speculative_adaptive_config is None
+    ):
+        raise ValueError(
+            "--speculative-adaptive-config is required when "
+            "--speculative-adaptive-strategy=ema is used with "
+            "--speculative-adaptive"
+        )
     if args.verify_ngpus is not None and args.verify_ngpus <= 0:
         raise ValueError("verify-ngpus must be positive when set")
     if args.draft_ngpus is not None and args.draft_ngpus <= 0:
@@ -1112,6 +1154,9 @@ def launch_target_actors(
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
             speculative_num_steps=args.num_speculative_steps,
+            speculative_adaptive=args.speculative_adaptive,
+            speculative_adaptive_strategy=args.speculative_adaptive_strategy,
+            speculative_adaptive_config=args.speculative_adaptive_config,
             rank_base=rank_base,
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,

@@ -525,7 +525,7 @@ class Scheduler(
             page_size=self.page_size,
         )
 
-        # profile roofline bs for adaptive verifier in decoupled-spec
+        # Run optional startup profiling for adaptive speculative controllers.
         self.maybe_run_spec_startup_profiling()
 
         # Init running status

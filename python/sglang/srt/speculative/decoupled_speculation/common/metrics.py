@@ -449,11 +449,11 @@ def build_result(
             "draft_ngpus": args.draft_ngpus,
             "num_speculative_steps": args.num_speculative_steps,
             "speculative_adaptive": getattr(args, "speculative_adaptive", False),
+            "speculative_adaptive_strategy": getattr(
+                args, "speculative_adaptive_strategy", "ema"
+            ),
             "speculative_adaptive_config": getattr(
                 args, "speculative_adaptive_config", None
-            ),
-            "decoupled_spec_target_verify_token_budget": getattr(
-                args, "decoupled_spec_target_verify_token_budget", None
             ),
             "temperature": args.temperature,
             "deterministic": args.deterministic,
@@ -739,8 +739,8 @@ def print_summary(result: dict[str, Any]) -> None:
         f"{result['config'].get('speculative_adaptive', False)}"
     )
     print(
-        "decoupled_spec_target_verify_token_budget: "
-        f"{result['config'].get('decoupled_spec_target_verify_token_budget')}"
+        "speculative_adaptive_strategy: "
+        f"{result['config'].get('speculative_adaptive_strategy')}"
     )
     print(f"max_new_tokens: {result['config']['max_new_tokens']}")
     print(f"total_prompt_tokens: {result['dataset']['total_prompt_tokens']}")

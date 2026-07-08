@@ -486,24 +486,30 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
-        resolve_decoupled_verify_candidate_steps_from_server_args,
         resolve_candidate_steps_from_config,
     )
 
+    strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
     is_decoupled_verify = server_args.speculative_algorithm == "DECOUPLED_VERIFY"
-    is_auto_decoupled_verify = (
-        is_decoupled_verify and server_args.speculative_adaptive_config is None
+    is_decoupled_throughput_aware = (
+        is_decoupled_verify and strategy == "throughput_aware"
     )
-    if is_auto_decoupled_verify and not hasattr(
-        server_args, "_decoupled_verify_max_speculative_steps"
-    ):
-        server_args._decoupled_verify_max_speculative_steps = (
-            server_args.speculative_num_steps
+    if is_decoupled_throughput_aware:
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_decoupled_verify_throughput_aware_candidate_steps,
         )
 
-    if is_auto_decoupled_verify:
-        candidate_steps = resolve_decoupled_verify_candidate_steps_from_server_args(
-            server_args
+        if not hasattr(server_args, "_decoupled_verify_max_speculative_steps"):
+            server_args._decoupled_verify_max_speculative_steps = (
+                server_args.speculative_num_steps
+            )
+        candidate_steps = resolve_decoupled_verify_throughput_aware_candidate_steps(
+            server_args._decoupled_verify_max_speculative_steps
+        )
+    elif strategy == "throughput_aware":
+        raise ValueError(
+            "--speculative-adaptive-strategy=throughput_aware is currently "
+            "supported for DECOUPLED_VERIFY only in this branch."
         )
     else:
         candidate_steps = resolve_candidate_steps_from_config(
@@ -513,16 +519,15 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     if server_args.speculative_eagle_topk is None:
         server_args.speculative_eagle_topk = 1
 
-    if is_auto_decoupled_verify:
-        # The initial target CUDA graph is shared by all captured batch sizes, so
-        # start from the globally budget-safe width. Larger per-BS states are
-        # captured later by the decoupled verifier worker.
-        server_args.speculative_num_steps = min(candidate_steps)
+    if is_decoupled_throughput_aware:
+        server_args.speculative_num_steps = min(
+            step for step in candidate_steps if step > 0
+        )
     elif server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = candidate_steps[len(candidate_steps) // 2]
 
     if (
-        not is_auto_decoupled_verify
+        not is_decoupled_throughput_aware
         and server_args.speculative_num_steps not in candidate_steps
     ):
         raise ValueError(

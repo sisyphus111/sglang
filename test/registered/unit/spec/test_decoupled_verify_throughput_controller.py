@@ -98,7 +98,7 @@ class TestDecoupledVerifyScoring(unittest.TestCase):
 
 
 class TestDecoupledVerifyThroughputAwareController(unittest.TestCase):
-    def test_zero_step_probes_positive_candidate_to_collect_acceptance_data(self):
+    def test_initial_step_uses_smallest_positive_candidate(self):
         worker = _Worker(initial_steps=0)
         controller = DecoupledVerifyThroughputAwareController(
             worker,
@@ -111,6 +111,30 @@ class TestDecoupledVerifyThroughputAwareController(unittest.TestCase):
             controller.register(_state(steps), steps=steps)
             controller.set_profile_cost(batch_size=4, steps=steps, cost_ms=10.0)
         controller.init_states(cuda_graph_bs=[4])
+
+        self.assertEqual(worker.speculative_num_steps, 1)
+        self.assertEqual(worker.applied_steps[-1], 1)
+
+    def test_zero_step_probes_positive_candidate_to_collect_acceptance_data(self):
+        worker = _Worker(initial_steps=1)
+        controller = DecoupledVerifyThroughputAwareController(
+            worker,
+            candidate_steps=[0, 1],
+            initial_steps=1,
+            window_size=1,
+            update_interval=1,
+            switch_hysteresis=0.0,
+        )
+        for steps in [0, 1]:
+            controller.register(_state(steps), steps=steps)
+        controller.set_profile_cost(batch_size=4, steps=0, cost_ms=1.0)
+        controller.set_profile_cost(batch_size=4, steps=1, cost_ms=100.0)
+        controller.init_states(cuda_graph_bs=[4])
+
+        controller.on_verify_complete([0, 0], batch_size=4)
+        controller.activate_step_by_batch(4)
+
+        self.assertEqual(worker.speculative_num_steps, 0)
 
         controller.on_verify_complete([0, 0], batch_size=4)
         controller.activate_step_by_batch(4)
