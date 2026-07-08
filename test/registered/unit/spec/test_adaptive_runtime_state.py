@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    _SpecAdaptiveBase,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -98,6 +99,24 @@ class _Worker:
 
 
 class TestAdaptiveController(unittest.TestCase):
+    def test_base_register_activate_and_default_profiling_hook(self):
+        worker = _Worker()
+        base = _SpecAdaptiveBase(worker)
+        state = SpecRuntimeState.for_decoupled_verify(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            target_attn_backend=object(),
+            target_graph_runner=object(),
+        )
+
+        base.register(state)
+        result = base.run_profiling(tree_cache=object())
+        base._activate(2)
+
+        self.assertIsNone(result)
+        self.assertEqual(worker.speculative_num_steps, 2)
+        self.assertIs(worker.applied[-1], state)
+
     def test_activate_step_by_batch_applies_selected_state(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(

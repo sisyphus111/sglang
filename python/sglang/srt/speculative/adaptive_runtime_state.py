@@ -98,7 +98,34 @@ class AdaptiveSpecWorker(Protocol):
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
 
 
-class AdaptiveController:
+class _SpecAdaptiveBase:
+    """Shared runtime-state registry and activation for adaptive controllers."""
+
+    def __init__(self, worker: AdaptiveSpecWorker) -> None:
+        self.worker = worker
+        self._states: dict[int, SpecRuntimeState] = {}
+
+    def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
+        """Register a pre-built runtime state.
+
+        *steps* defaults to state.speculative_num_steps when not given.
+        """
+        key = steps if steps is not None else state.speculative_num_steps
+        self._states[key] = state
+
+    def run_profiling(self, tree_cache) -> None:
+        """Optional startup profiling hook for throughput-aware controllers."""
+
+    def _activate(self, speculative_num_steps: int) -> None:
+        state = self._states.get(speculative_num_steps)
+        if state is None:
+            raise ValueError(
+                f"Missing adaptive runtime state for steps={speculative_num_steps}"
+            )
+        self.worker.apply_runtime_state(state)
+
+
+class AdaptiveController(_SpecAdaptiveBase):
     """Facade that owns adaptive decision-making and runtime state switching.
 
     Works with any worker that implements AdaptiveSpecWorker protocol:
@@ -117,25 +144,16 @@ class AdaptiveController:
         config_path: str | None = None,
         config: dict | None = None,
     ):
-        self.worker = worker
+        super().__init__(worker)
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
             cfg_path=config_path,
             config=config,
         )
-        self._states: dict[int, SpecRuntimeState] = {}
 
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
-
-    def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
-        """Register a pre-built runtime state.
-
-        *steps* defaults to state.speculative_num_steps when not given.
-        """
-        key = steps if steps is not None else state.speculative_num_steps
-        self._states[key] = state
 
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps."""
@@ -170,11 +188,3 @@ class AdaptiveController:
         )
         if new_step is not None:
             self._activate(new_step)
-
-    def _activate(self, speculative_num_steps: int) -> None:
-        state = self._states.get(speculative_num_steps)
-        if state is None:
-            raise ValueError(
-                f"Missing adaptive runtime state for steps={speculative_num_steps}"
-            )
-        self.worker.apply_runtime_state(state)

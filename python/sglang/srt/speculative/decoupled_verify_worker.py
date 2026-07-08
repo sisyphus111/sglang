@@ -38,16 +38,18 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    _SpecAdaptiveBase,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
-    build_decoupled_verify_profiled_adaptive_config,
     is_decoupled_verify_roofline_budget,
     resolve_decoupled_verify_adaptive_config_from_server_args,
     resolve_decoupled_verify_roofline_capture_bs_candidates,
     resolve_decoupled_verify_roofline_profile_bs_candidates,
-    select_decoupled_verify_roofline_steps_by_bs,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.decoupled_verify_throughput_controller import (
+    DecoupledVerifyThroughputAwareController,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -73,7 +75,6 @@ logger = logging.getLogger(__name__)
 
 _ROOFLINE_PROFILE_WARMUP_ITERS = 5
 _ROOFLINE_PROFILE_MEASURE_ITERS = 1000
-_ROOFLINE_PROFILE_PLATEAU_RATIO = 0.95
 
 
 def _get_req_tail_token_id(req) -> int:
@@ -213,7 +214,7 @@ class VerifyWorker(BaseSpecWorker):
         )
         self.total_accept_length = 0
         self.total_num_verified_reqs = 0
-        self.adaptive_controller: Optional[AdaptiveController] = None
+        self.adaptive_controller: Optional[_SpecAdaptiveBase] = None
         self._roofline_zero_state: Optional[SpecRuntimeState] = None
         self._roofline_profile_states_by_step: dict[int, SpecRuntimeState] = {}
         self._roofline_profile_capture_bs_by_step: dict[int, List[int]] = {}
@@ -458,6 +459,13 @@ class VerifyWorker(BaseSpecWorker):
             f"measure_iters={_ROOFLINE_PROFILE_MEASURE_ITERS}",
         )
 
+        initial_steps = int(self.speculative_num_steps or 0)
+        controller = DecoupledVerifyThroughputAwareController(
+            self,
+            candidate_steps=sorted(self._roofline_profile_states_by_step),
+            initial_steps=initial_steps,
+        )
+
         profile_rows: list[tuple[int, int, float, float]] = []
         self._roofline_profile_in_progress = True
         try:
@@ -476,6 +484,11 @@ class VerifyWorker(BaseSpecWorker):
                     throughput = (
                         int(bs) * (int(steps) + 1) * 1000.0 / avg_decode_ms
                     )
+                    controller.set_profile_cost(
+                        batch_size=int(bs),
+                        steps=int(steps),
+                        cost_ms=avg_decode_ms,
+                    )
                     profile_rows.append(
                         (int(bs), int(steps), avg_decode_ms, throughput)
                     )
@@ -491,57 +504,19 @@ class VerifyWorker(BaseSpecWorker):
         finally:
             self._roofline_profile_in_progress = False
 
-        selected_steps_by_bs, selection_summaries, global_peak = (
-            select_decoupled_verify_roofline_steps_by_bs(
-                [
-                    (bs, steps, throughput)
-                    for bs, steps, _, throughput in profile_rows
-                ],
-                plateau_ratio=_ROOFLINE_PROFILE_PLATEAU_RATIO,
-            )
-        )
-        adaptive_config = build_decoupled_verify_profiled_adaptive_config(
-            selected_steps_by_bs
-        )
-        self.server_args._decoupled_verify_roofline_selected_steps_by_bs = dict(
-            selected_steps_by_bs
-        )
-        self.server_args._decoupled_verify_roofline_adaptive_config = adaptive_config
-
-        for bs, summary in sorted(selection_summaries.items()):
-            log_info_on_rank0(
-                logger,
-                "Decoupled verifier roofline selected step: "
-                f"bs={bs}, peak_step={summary['peak_step']}, "
-                f"peak_throughput={summary['peak_throughput']:.2f} tok/s, "
-                f"p95_threshold={summary['threshold']:.2f} tok/s, "
-                f"selected_step={summary['selected_step']}",
-            )
-        global_peak_bs, global_peak_step, global_peak_throughput = global_peak
-        log_info_on_rank0(
-            logger,
-            "Decoupled verifier multi-step roofline selected: "
-            f"global_peak_bs={global_peak_bs}, "
-            f"global_peak_step={global_peak_step}, "
-            f"global_peak_throughput={global_peak_throughput:.2f} tok/s, "
-            f"adaptive_config={adaptive_config}",
-        )
-
-        zero_state = self._roofline_profile_states_by_step.get(0)
-        if zero_state is None:
-            raise RuntimeError(
-                "Decoupled verifier roofline profiling has no captured step=0 "
-                "runtime state."
-            )
-        self.apply_runtime_state(zero_state)
-        self.adaptive_controller = AdaptiveController(self, config=adaptive_config)
         for steps, state in self._roofline_profile_states_by_step.items():
-            self.adaptive_controller.register(state, steps=steps)
-        self.adaptive_controller.init_states(cuda_graph_bs=profile_capture_bs)
+            controller.register(state, steps=steps)
+        self.adaptive_controller = controller
+        controller.init_states(cuda_graph_bs=profile_capture_bs)
+        self.server_args._decoupled_verify_roofline_cost_table_summary = (
+            controller.cost_table_summary()
+        )
         self._roofline_profile_done = True
         log_info_on_rank0(
             logger,
-            "Profile decoupled verifier multi-step roofline end.",
+            "Profile decoupled verifier multi-step roofline end: "
+            f"points={len(profile_rows)}, "
+            f"cost_table={controller.cost_table_summary()}",
         )
 
     def _roofline_max_speculative_steps(self) -> Optional[int]:
@@ -1057,6 +1032,20 @@ class VerifyWorker(BaseSpecWorker):
                 getattr(self, "_roofline_profile_capture_in_progress", False)
                 or getattr(self, "_roofline_profile_in_progress", False)
             ):
+                return
+
+            adaptive_controller = getattr(self, "adaptive_controller", None)
+            if isinstance(
+                adaptive_controller, DecoupledVerifyThroughputAwareController
+            ):
+                if int(state.speculative_num_steps) not in [
+                    int(step) for step in adaptive_controller.candidate_steps
+                ]:
+                    raise RuntimeError(
+                        "Decoupled verifier roofline runtime state "
+                        f"steps={state.speculative_num_steps} is not selected "
+                        "by the throughput-aware controller."
+                    )
                 return
 
             adaptive_config = getattr(
