@@ -15,6 +15,8 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftMeshMessageType,
     DraftTailStreamOutputBatch,
     ReadyDraftControls,
+    decoupled_spec_print_timing,
+    decoupled_spec_timing_start,
 )
 from sglang.srt.speculative.tracer import (
     SpecTraceEvent,
@@ -161,18 +163,34 @@ class TokenSyncThread:
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_RECV_CONTROL_BATCH)
     def _recv_control_batch_from_socket(self) -> DraftControlBatch | None:
-        message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
-        if not isinstance(message, DraftMeshMessage):
-            raise RuntimeError(f"Unexpected draft control message: {message}")
-        if (
-            message.message_type != DraftMeshMessageType.CONTROL_BATCH
-            or message.control_batch is None
-        ):
-            raise RuntimeError(f"Unexpected draft control message: {message}")
-        control_batch = message.control_batch
-        if int(control_batch.dst_drafter_rank) != int(self.drafter_rank):
-            return None
-        return control_batch
+        start_ns = decoupled_spec_timing_start()
+        item_count = 0
+        try:
+            message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
+            if not isinstance(message, DraftMeshMessage):
+                raise RuntimeError(f"Unexpected draft control message: {message}")
+            if (
+                message.message_type != DraftMeshMessageType.CONTROL_BATCH
+                or message.control_batch is None
+            ):
+                raise RuntimeError(f"Unexpected draft control message: {message}")
+            control_batch = message.control_batch
+            item_count = (
+                len(control_batch.sync_messages)
+                + len(control_batch.verify_commit_messages)
+                + len(control_batch.close_messages)
+            )
+            if int(control_batch.dst_drafter_rank) != int(self.drafter_rank):
+                return None
+            return control_batch
+        finally:
+            if item_count > 0:
+                decoupled_spec_print_timing(
+                    component="token_sync_thread",
+                    op="recv_control_batch",
+                    start_ns=start_ns,
+                    items=item_count,
+                )
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
     def collect_ready_draft_controls(
@@ -241,12 +259,21 @@ class TokenSyncThread:
         dst_verifier_rank: int,
         send_batch: DraftTailStreamOutputBatch,
     ) -> None:
-        socket = self.result_send_sockets.get(dst_verifier_rank)
-        if socket is None:
-            raise RuntimeError(
-                f"Missing result socket for dst_verifier_rank={dst_verifier_rank}"
+        start_ns = decoupled_spec_timing_start()
+        try:
+            socket = self.result_send_sockets.get(dst_verifier_rank)
+            if socket is None:
+                raise RuntimeError(
+                    f"Missing result socket for dst_verifier_rank={dst_verifier_rank}"
+                )
+            socket.send_pyobj(DraftMeshMessage.from_tail_stream_output_batch(send_batch))
+        finally:
+            decoupled_spec_print_timing(
+                component="token_sync_thread",
+                op="send_result_batch",
+                start_ns=start_ns,
+                items=len(send_batch.outputs),
             )
-        socket.send_pyobj(DraftMeshMessage.from_tail_stream_output_batch(send_batch))
 
     def _outgoing_results_size(self) -> int:
         try:

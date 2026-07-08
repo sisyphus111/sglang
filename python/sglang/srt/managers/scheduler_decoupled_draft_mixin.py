@@ -131,6 +131,52 @@ class SchedulerDecoupledDraftMixin:
         else:
             emit_candidate_indices = list(req_indices)
 
+        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+            stream_output_rows: list[tuple] = []
+            src_drafter_rank = self.get_decoupled_spec_rank()
+            for req_batch_idx in emit_candidate_indices:
+                if not (0 <= req_batch_idx < len(batch.reqs)):
+                    continue
+                req = batch.reqs[req_batch_idx]
+                if not req.output_ids:
+                    continue
+                state = self._get_draft_state_by_req(req)
+                token_pos = len(req.output_ids) - 1
+                token_id = int(req.output_ids[-1])
+                committed_len = int(state.verifier_committed_prefix_len)
+                if token_pos < committed_len:
+                    continue
+                stream_output_rows.append(
+                    (
+                        src_drafter_rank,
+                        int(state.key.src_verifier_rank),
+                        state.key.request_id,
+                        committed_len,
+                        token_pos,
+                        token_id,
+                    )
+                )
+
+            trace_payload = {
+                "num_emit_candidates": len(emit_candidate_indices),
+                "num_stream_outputs": len(stream_output_rows),
+                "committed_lens_by_req": [
+                    int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
+                    for req in batch.reqs
+                ],
+                "output_lens_by_req": [len(req.output_ids) for req in batch.reqs],
+            }
+            if stream_output_rows and self.is_draft_entry_rank():
+                submit_rows = getattr(
+                    self._get_token_sync_thread(), "submit_draft_result_rows", None
+                )
+                if submit_rows is None:
+                    raise RuntimeError(
+                        "C++ decoupled token sync thread does not expose row API"
+                    )
+                submit_rows(stream_output_rows)
+            return trace_payload
+
         stream_output_batch = DraftTailStreamOutputBatch()
         src_drafter_rank = self.get_decoupled_spec_rank()
         for req_batch_idx in emit_candidate_indices:
@@ -1068,7 +1114,9 @@ class SchedulerDecoupledDraftMixin:
         kv_truncations: list[DraftKVTruncation] = []
         batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
         applied_segments: list[VerifierCommitSegment] = []
-        commit_echo_batch = DraftTailStreamOutputBatch()
+        use_cpp_pybind = envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+        commit_echo_batch = None if use_cpp_pybind else DraftTailStreamOutputBatch()
+        commit_echo_rows: list[tuple] = []
         if not ready_commit_segments:
             return applied_segments, 0
 
@@ -1118,19 +1166,44 @@ class SchedulerDecoupledDraftMixin:
                 # Echo the last applied committed token so verifier-side
                 # pending expected tokens can advance when no comparable
                 # draft-tail anchor was available in its buffer.
-                commit_echo_batch.outputs.append(
-                    DraftTailStreamOutput(
-                        src_drafter_rank=self.get_decoupled_spec_rank(),
-                        dst_verifier_rank=int(segment.draft_key.src_verifier_rank),
-                        request_id=segment.draft_key.request_id,
-                        base_committed_len=committed_token_pos,
-                        new_token_pos=committed_token_pos,
-                        new_token_id=int(segment.committed_token_ids[-1]),
+                if use_cpp_pybind:
+                    commit_echo_rows.append(
+                        (
+                            self.get_decoupled_spec_rank(),
+                            int(segment.draft_key.src_verifier_rank),
+                            segment.draft_key.request_id,
+                            committed_token_pos,
+                            committed_token_pos,
+                            int(segment.committed_token_ids[-1]),
+                        )
                     )
-                )
+                else:
+                    assert commit_echo_batch is not None
+                    commit_echo_batch.outputs.append(
+                        DraftTailStreamOutput(
+                            src_drafter_rank=self.get_decoupled_spec_rank(),
+                            dst_verifier_rank=int(segment.draft_key.src_verifier_rank),
+                            request_id=segment.draft_key.request_id,
+                            base_committed_len=committed_token_pos,
+                            new_token_pos=committed_token_pos,
+                            new_token_id=int(segment.committed_token_ids[-1]),
+                        )
+                    )
 
         self._flush_draft_kv_truncations(kv_truncations)
         self._flush_draft_batch_metadata_updates(batch_metadata_updates)
+        if use_cpp_pybind:
+            if commit_echo_rows:
+                submit_rows = getattr(
+                    self._get_token_sync_thread(), "submit_draft_result_rows", None
+                )
+                if submit_rows is None:
+                    raise RuntimeError(
+                        "C++ decoupled token sync thread does not expose row API"
+                    )
+                submit_rows(commit_echo_rows)
+            return applied_segments, len(commit_echo_rows)
+        assert commit_echo_batch is not None
         if commit_echo_batch.outputs:
             self._get_token_sync_thread().submit_draft_results(commit_echo_batch)
         return applied_segments, len(commit_echo_batch.outputs)

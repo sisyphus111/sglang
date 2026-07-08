@@ -12,6 +12,8 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
     VerifyCommit,
+    decoupled_spec_print_timing,
+    decoupled_spec_timing_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -269,17 +271,30 @@ class DraftTailBuffer:
         *,
         collect_stats: bool = False,
     ) -> dict | None:
+        start_ns = decoupled_spec_timing_start()
         commit_stats: list[dict] = []
-        with self._condition:
-            for message in batch.sync_messages:
-                self._open_request_locked(message)
-            for message in batch.verify_commit_messages:
-                commit_stat = self._apply_commit_locked(message)
-                if collect_stats and commit_stat is not None:
-                    commit_stats.append(commit_stat)
-            for message in batch.close_messages:
-                self._close_request_locked(message)
-            self._condition.notify_all()
+        try:
+            with self._condition:
+                for message in batch.sync_messages:
+                    self._open_request_locked(message)
+                for message in batch.verify_commit_messages:
+                    commit_stat = self._apply_commit_locked(message)
+                    if collect_stats and commit_stat is not None:
+                        commit_stats.append(commit_stat)
+                for message in batch.close_messages:
+                    self._close_request_locked(message)
+                self._condition.notify_all()
+        finally:
+            decoupled_spec_print_timing(
+                component="draft_tail_buffer",
+                op="apply_control_batch",
+                start_ns=start_ns,
+                items=(
+                    len(batch.sync_messages)
+                    + len(batch.verify_commit_messages)
+                    + len(batch.close_messages)
+                ),
+            )
         if not collect_stats:
             return None
         return {
@@ -331,15 +346,24 @@ class DraftTailBuffer:
     ) -> dict | None:
         if not batch.outputs:
             return None
+        start_ns = decoupled_spec_timing_start()
         append_stats = self._new_append_stats(batch) if collect_stats else None
-        with self._condition:
-            for output in batch.outputs:
-                result = self._push_one_locked(batch, output)
+        try:
+            with self._condition:
+                for output in batch.outputs:
+                    result = self._push_one_locked(batch, output)
+                    if append_stats is not None:
+                        self._record_append_result_locked(append_stats, output, result)
                 if append_stats is not None:
-                    self._record_append_result_locked(append_stats, output, result)
-            if append_stats is not None:
-                self._fill_append_after_lens_locked(append_stats)
-            self._condition.notify_all()
+                    self._fill_append_after_lens_locked(append_stats)
+                self._condition.notify_all()
+        finally:
+            decoupled_spec_print_timing(
+                component="draft_tail_buffer",
+                op="append_draft_stream_batch",
+                start_ns=start_ns,
+                items=len(batch.outputs),
+            )
         return append_stats
 
     def _push_one_locked(
@@ -632,34 +656,45 @@ class DraftTailBuffer:
         include_raw_tail_tokens: bool = False,
         max_tail_len: int | None = None,
     ) -> list[DraftTailSnapshot]:
+        start_ns = decoupled_spec_timing_start()
         tail_cap = None if max_tail_len is None else max(0, int(max_tail_len))
-        with self._condition:
-            if not allow_partial:
-                required_tail_len = self.required_tail_len
-                if tail_cap is not None:
-                    required_tail_len = min(required_tail_len, tail_cap)
-                min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
-                self._wait_for_draft_tokens_locked(
-                    [req.rid for req in reqs], min_raw_tail_len
-                )
-
-            snapshots: list[DraftTailSnapshot] = []
-            for req in reqs:
-                state = self._states.get(req.rid)
-                assert state, f"unexpected request_id={req.rid}"
-                snapshots.append(
-                    DraftTailSnapshot(
-                        request_id=req.rid,
-                        committed_len=int(state.committed_len),
-                        tail_tokens=(
-                            state.consumable_tail_tokens()
-                            if tail_cap is None
-                            else state.consumable_tail_tokens()[:tail_cap]
-                        ),
-                        raw_tail_len=len(state.tail_tokens),
-                        raw_tail_tokens=(
-                            list(state.tail_tokens) if include_raw_tail_tokens else []
-                        ),
+        try:
+            with self._condition:
+                if not allow_partial:
+                    required_tail_len = self.required_tail_len
+                    if tail_cap is not None:
+                        required_tail_len = min(required_tail_len, tail_cap)
+                    min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
+                    self._wait_for_draft_tokens_locked(
+                        [req.rid for req in reqs], min_raw_tail_len
                     )
-                )
-            return snapshots
+
+                snapshots: list[DraftTailSnapshot] = []
+                for req in reqs:
+                    state = self._states.get(req.rid)
+                    assert state, f"unexpected request_id={req.rid}"
+                    snapshots.append(
+                        DraftTailSnapshot(
+                            request_id=req.rid,
+                            committed_len=int(state.committed_len),
+                            tail_tokens=(
+                                state.consumable_tail_tokens()
+                                if tail_cap is None
+                                else state.consumable_tail_tokens()[:tail_cap]
+                            ),
+                            raw_tail_len=len(state.tail_tokens),
+                            raw_tail_tokens=(
+                                list(state.tail_tokens)
+                                if include_raw_tail_tokens
+                                else []
+                            ),
+                        )
+                    )
+                return snapshots
+        finally:
+            decoupled_spec_print_timing(
+                component="draft_tail_buffer",
+                op="get_draft_snapshots",
+                start_ns=start_ns,
+                items=len(reqs),
+            )

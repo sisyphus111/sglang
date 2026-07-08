@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -26,12 +28,12 @@
 
 namespace {
 
+namespace py = pybind11;
+
 constexpr char kMagic[] = {'D', 'S', 'C', '1'};
 constexpr uint8_t kVersion = 1;
 constexpr uint8_t kKindControlBatch = 1;
 constexpr uint8_t kKindTailStreamBatch = 2;
-constexpr uint8_t kKindStringList = 3;
-constexpr uint8_t kKindExtractDecisions = 4;
 
 constexpr int kZmqPull = 7;
 constexpr int kZmqPush = 8;
@@ -51,6 +53,38 @@ int64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+bool env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return false;
+  std::string text(value);
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text != "0" && text != "false" && text != "off" && text != "no";
+}
+
+bool cpp_profile_enabled() {
+  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_CPP_PROFILE");
+  return enabled;
+}
+
+bool debug_timing_enabled() {
+  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_TIMING");
+  return enabled;
+}
+
+void print_debug_timing(const std::string& op, int64_t duration_ns, int64_t items) {
+  if (!debug_timing_enabled()) return;
+  if (op == "token_sync_thread.idle_wait") return;
+  std::fprintf(
+      stderr,
+      "[decoupled-spec-timing] impl=cpp component=cpp op=%s ns=%lld items=%lld\n",
+      op.c_str(),
+      static_cast<long long>(duration_ns),
+      static_cast<long long>(items));
+  std::fflush(stderr);
 }
 
 void json_escape(std::ostringstream& os, const std::string& value) {
@@ -90,16 +124,6 @@ void json_escape(std::ostringstream& os, const std::string& value) {
   os << '"';
 }
 
-template <typename T>
-void json_int_array(std::ostringstream& os, const std::vector<T>& values) {
-  os << '[';
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i) os << ',';
-    os << static_cast<int64_t>(values[i]);
-  }
-  os << ']';
-}
-
 struct ProfileStat {
   int64_t count = 0;
   int64_t total_ns = 0;
@@ -111,6 +135,7 @@ struct ProfileStat {
 class Profiler {
  public:
   void record(const std::string& op, int64_t duration_ns, int64_t items = 0) {
+    if (!cpp_profile_enabled()) return;
     std::lock_guard<std::mutex> guard(mu_);
     auto& stat = stats_[op];
     stat.count += 1;
@@ -123,6 +148,7 @@ class Profiler {
   }
 
   std::string to_json() {
+    if (!cpp_profile_enabled()) return "[]";
     std::lock_guard<std::mutex> guard(mu_);
     std::ostringstream os;
     os << '[';
@@ -161,14 +187,44 @@ class Profiler {
 class ScopedProfile {
  public:
   ScopedProfile(Profiler& profiler, std::string op, int64_t items = 0)
-      : profiler_(profiler), op_(std::move(op)), items_(items), start_ns_(now_ns()) {}
+      : profiler_(profiler),
+        op_(std::move(op)),
+        items_(items),
+        enabled_(cpp_profile_enabled() || debug_timing_enabled()),
+        start_ns_(enabled_ ? now_ns() : 0) {}
 
-  ~ScopedProfile() { profiler_.record(op_, now_ns() - start_ns_, items_); }
+  ~ScopedProfile() {
+    if (!enabled_) return;
+    int64_t duration_ns = now_ns() - start_ns_;
+    profiler_.record(op_, duration_ns, items_);
+    print_debug_timing(op_, duration_ns, items_);
+  }
 
  private:
   Profiler& profiler_;
   std::string op_;
   int64_t items_;
+  bool enabled_;
+  int64_t start_ns_;
+};
+
+class DebugTimingScope {
+ public:
+  DebugTimingScope(std::string op, int64_t items = 0)
+      : op_(std::move(op)),
+        items_(items),
+        enabled_(debug_timing_enabled()),
+        start_ns_(enabled_ ? now_ns() : 0) {}
+
+  ~DebugTimingScope() {
+    if (!enabled_) return;
+    print_debug_timing(op_, now_ns() - start_ns_, items_);
+  }
+
+ private:
+  std::string op_;
+  int64_t items_;
+  bool enabled_;
   int64_t start_ns_;
 };
 
@@ -303,6 +359,12 @@ struct DraftSyncCpp {
   DraftReqKeyCpp draft_key() const { return {src_verifier_rank, request_id}; }
 };
 
+struct DraftSyncOpenCpp {
+  std::string request_id;
+  int32_t dst_drafter_rank = 0;
+  int64_t committed_len = 0;
+};
+
 struct VerifyCommitCpp {
   std::string request_id;
   int32_t src_verifier_rank = 0;
@@ -433,52 +495,236 @@ std::string encode_tail_stream_batch(const DraftTailStreamOutputBatchCpp& batch)
   return writer.data();
 }
 
-std::vector<std::string> parse_string_list(const std::string& frame) {
-  BinaryReader reader(frame);
-  reader.expect_kind(kKindStringList);
-  uint32_t n = reader.read_u32();
-  std::vector<std::string> out;
-  out.reserve(n);
-  for (uint32_t i = 0; i < n; ++i) out.push_back(reader.read_string());
-  reader.finish();
+std::string encode_control_batch(const DraftControlBatchCpp& batch) {
+  BinaryWriter writer(kKindControlBatch);
+  writer.write_i32(batch.dst_drafter_rank);
+  writer.write_u32(static_cast<uint32_t>(batch.sync_messages.size()));
+  for (const auto& msg : batch.sync_messages) {
+    writer.write_string(msg.request_id);
+    writer.write_i32(msg.src_verifier_rank);
+    writer.write_i32(msg.dst_drafter_rank);
+    writer.write_u32(static_cast<uint32_t>(msg.prompt_token_ids.size()));
+    for (int32_t token : msg.prompt_token_ids) writer.write_i32(token);
+    writer.write_u32(static_cast<uint32_t>(msg.committed_output_ids.size()));
+    for (int32_t token : msg.committed_output_ids) writer.write_i32(token);
+  }
+  writer.write_u32(static_cast<uint32_t>(batch.verify_commit_messages.size()));
+  for (const auto& msg : batch.verify_commit_messages) {
+    writer.write_string(msg.request_id);
+    writer.write_i32(msg.src_verifier_rank);
+    writer.write_i32(msg.dst_drafter_rank);
+    writer.write_i64(msg.pre_verify_committed_len);
+    writer.write_u32(static_cast<uint32_t>(msg.committed_token_ids.size()));
+    for (int32_t token : msg.committed_token_ids) writer.write_i32(token);
+  }
+  writer.write_u32(static_cast<uint32_t>(batch.close_messages.size()));
+  for (const auto& msg : batch.close_messages) {
+    writer.write_string(msg.request_id);
+    writer.write_i32(msg.src_verifier_rank);
+    writer.write_i32(msg.dst_drafter_rank);
+    writer.write_string(msg.reason);
+  }
+  return writer.data();
+}
+
+py::object sequence_fast(const py::handle& value, const char* message) {
+  PyObject* seq = PySequence_Fast(value.ptr(), message);
+  if (seq == nullptr) throw py::error_already_set();
+  return py::reinterpret_steal<py::object>(seq);
+}
+
+int32_t py_int32_from_object(PyObject* item) {
+  long long value = PyLong_AsLongLong(item);
+  if (value == -1 && PyErr_Occurred()) throw py::error_already_set();
+  return static_cast<int32_t>(value);
+}
+
+void write_int_list_from_py(BinaryWriter& writer, const py::handle& value) {
+  py::object tokens = sequence_fast(value, "Expected an integer token sequence");
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(tokens.ptr());
+  writer.write_u32(static_cast<uint32_t>(n));
+  PyObject** items = PySequence_Fast_ITEMS(tokens.ptr());
+  for (Py_ssize_t i = 0; i < n; ++i) {
+    writer.write_i32(py_int32_from_object(items[i]));
+  }
+}
+
+std::string encode_control_batch_native_rows(
+    int64_t dst_drafter_rank,
+    const py::sequence& sync_rows,
+    const py::sequence& commit_rows,
+    const py::sequence& close_rows) {
+  BinaryWriter writer(kKindControlBatch);
+  writer.write_i32(static_cast<int32_t>(dst_drafter_rank));
+
+  writer.write_u32(static_cast<uint32_t>(py::len(sync_rows)));
+  for (const auto& item : sync_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("DraftSync native row must have 5 fields");
+    }
+    writer.write_string(row[0].cast<std::string>());
+    writer.write_i32(static_cast<int32_t>(row[1].cast<int64_t>()));
+    writer.write_i32(static_cast<int32_t>(row[2].cast<int64_t>()));
+    write_int_list_from_py(writer, row[3]);
+    write_int_list_from_py(writer, row[4]);
+  }
+
+  writer.write_u32(static_cast<uint32_t>(py::len(commit_rows)));
+  for (const auto& item : commit_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("VerifyCommit native row must have 5 fields");
+    }
+    writer.write_string(row[0].cast<std::string>());
+    writer.write_i32(static_cast<int32_t>(row[1].cast<int64_t>()));
+    writer.write_i32(static_cast<int32_t>(row[2].cast<int64_t>()));
+    writer.write_i64(row[3].cast<int64_t>());
+    write_int_list_from_py(writer, row[4]);
+  }
+
+  writer.write_u32(static_cast<uint32_t>(py::len(close_rows)));
+  for (const auto& item : close_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 4) {
+      throw std::runtime_error("DraftClose native row must have 4 fields");
+    }
+    writer.write_string(row[0].cast<std::string>());
+    writer.write_i32(static_cast<int32_t>(row[1].cast<int64_t>()));
+    writer.write_i32(static_cast<int32_t>(row[2].cast<int64_t>()));
+    writer.write_string(row[3].cast<std::string>());
+  }
+
+  return writer.data();
+}
+
+std::vector<int32_t> py_int32_vector(const py::handle& value) {
+  py::object tokens = sequence_fast(value, "Expected an integer token sequence");
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(tokens.ptr());
+  std::vector<int32_t> out;
+  out.reserve(static_cast<size_t>(n));
+  PyObject** items = PySequence_Fast_ITEMS(tokens.ptr());
+  for (Py_ssize_t i = 0; i < n; ++i) {
+    out.push_back(py_int32_from_object(items[i]));
+  }
   return out;
 }
 
-std::vector<ExtractDecisionCpp> parse_extract_decisions(const std::string& frame) {
-  BinaryReader reader(frame);
-  reader.expect_kind(kKindExtractDecisions);
-  uint32_t n = reader.read_u32();
+std::vector<std::string> py_string_vector(const py::handle& value) {
+  return py::cast<std::vector<std::string>>(value);
+}
+
+std::vector<DraftSyncOpenCpp> build_sync_open_rows_native(
+    const py::sequence& sync_rows) {
+  std::vector<DraftSyncOpenCpp> rows;
+  rows.reserve(py::len(sync_rows));
+  for (const auto& item : sync_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("DraftSync native row must have 5 fields");
+    }
+    DraftSyncOpenCpp open;
+    open.request_id = row[0].cast<std::string>();
+    open.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
+    open.committed_len = static_cast<int64_t>(py::len(row[4]));
+    rows.push_back(std::move(open));
+  }
+  return rows;
+}
+
+DraftControlBatchCpp build_control_batch_native(
+    int64_t dst_drafter_rank,
+    const py::sequence& sync_rows,
+    const py::sequence& commit_rows,
+    const py::sequence& close_rows) {
+  DraftControlBatchCpp batch;
+  batch.dst_drafter_rank = static_cast<int32_t>(dst_drafter_rank);
+
+  batch.sync_messages.reserve(py::len(sync_rows));
+  for (const auto& item : sync_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("DraftSync native row must have 5 fields");
+    }
+    DraftSyncCpp msg;
+    msg.request_id = row[0].cast<std::string>();
+    msg.src_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
+    msg.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
+    msg.prompt_token_ids = py_int32_vector(row[3]);
+    msg.committed_output_ids = py_int32_vector(row[4]);
+    batch.sync_messages.push_back(std::move(msg));
+  }
+
+  batch.verify_commit_messages.reserve(py::len(commit_rows));
+  for (const auto& item : commit_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("VerifyCommit native row must have 5 fields");
+    }
+    VerifyCommitCpp msg;
+    msg.request_id = row[0].cast<std::string>();
+    msg.src_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
+    msg.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
+    msg.pre_verify_committed_len = row[3].cast<int64_t>();
+    msg.committed_token_ids = py_int32_vector(row[4]);
+    batch.verify_commit_messages.push_back(std::move(msg));
+  }
+
+  batch.close_messages.reserve(py::len(close_rows));
+  for (const auto& item : close_rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 4) {
+      throw std::runtime_error("DraftClose native row must have 4 fields");
+    }
+    DraftCloseCpp msg;
+    msg.request_id = row[0].cast<std::string>();
+    msg.src_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
+    msg.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
+    msg.reason = row[3].cast<std::string>();
+    batch.close_messages.push_back(std::move(msg));
+  }
+  return batch;
+}
+
+DraftTailStreamOutputBatchCpp build_tail_stream_batch_native(
+    const py::sequence& rows) {
+  DraftTailStreamOutputBatchCpp batch;
+  batch.outputs.reserve(py::len(rows));
+  for (const auto& item : rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 6) {
+      throw std::runtime_error("DraftTailStreamOutput native row must have 6 fields");
+    }
+    DraftTailStreamOutputCpp output;
+    output.src_drafter_rank = static_cast<int32_t>(row[0].cast<int64_t>());
+    output.dst_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
+    output.request_id = row[2].cast<std::string>();
+    output.base_committed_len = row[3].cast<int64_t>();
+    output.new_token_pos = row[4].cast<int64_t>();
+    output.new_token_id = static_cast<int32_t>(row[5].cast<int64_t>());
+    batch.outputs.push_back(std::move(output));
+  }
+  return batch;
+}
+
+std::vector<ExtractDecisionCpp> build_extract_decisions_native(
+    const py::sequence& rows) {
   std::vector<ExtractDecisionCpp> out;
-  out.reserve(n);
-  for (uint32_t i = 0; i < n; ++i) {
+  out.reserve(py::len(rows));
+  for (const auto& item : rows) {
+    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
+    if (py::len(row) != 5) {
+      throw std::runtime_error("ExtractDecision native row must have 5 fields");
+    }
     ExtractDecisionCpp decision;
-    decision.key.request_id = reader.read_string();
-    decision.key.src_verifier_rank = reader.read_i32();
-    decision.dst_drafter_rank = reader.read_i32();
-    decision.pre_verify_committed_len = reader.read_i64();
-    decision.consumable_len = reader.read_i64();
+    decision.key.request_id = row[0].cast<std::string>();
+    decision.key.src_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
+    decision.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
+    decision.pre_verify_committed_len = row[3].cast<int64_t>();
+    decision.consumable_len = row[4].cast<int64_t>();
     out.push_back(std::move(decision));
   }
-  reader.finish();
   return out;
-}
-
-void json_draft_key(std::ostringstream& os, const DraftReqKeyCpp& key) {
-  os << "{\"src_verifier_rank\":" << key.src_verifier_rank << ",\"request_id\":";
-  json_escape(os, key.request_id);
-  os << '}';
-}
-
-void json_sync(std::ostringstream& os, const DraftSyncCpp& msg) {
-  os << "{\"request_id\":";
-  json_escape(os, msg.request_id);
-  os << ",\"src_verifier_rank\":" << msg.src_verifier_rank;
-  os << ",\"dst_drafter_rank\":" << msg.dst_drafter_rank;
-  os << ",\"prompt_token_ids\":";
-  json_int_array(os, msg.prompt_token_ids);
-  os << ",\"committed_output_ids\":";
-  json_int_array(os, msg.committed_output_ids);
-  os << '}';
 }
 
 struct VerifierCommitSegmentCpp {
@@ -521,42 +767,11 @@ struct VerifierCommitSegmentCpp {
   }
 };
 
-void json_segment(std::ostringstream& os, const VerifierCommitSegmentCpp& segment) {
-  os << "{\"draft_key\":";
-  json_draft_key(os, segment.draft_key);
-  os << ",\"dst_drafter_rank\":" << segment.dst_drafter_rank;
-  os << ",\"pre_verify_committed_len\":" << segment.pre_verify_committed_len;
-  os << ",\"committed_token_ids\":";
-  json_int_array(os, segment.committed_token_ids);
-  os << '}';
-}
-
 struct ReadyDraftControlsCpp {
   std::vector<DraftSyncCpp> sync_messages;
   std::vector<DraftReqKeyCpp> close_keys;
   std::vector<VerifierCommitSegmentCpp> ready_commit_segments;
 };
-
-std::string ready_controls_json(const ReadyDraftControlsCpp& ready) {
-  std::ostringstream os;
-  os << "{\"sync_messages\":[";
-  for (size_t i = 0; i < ready.sync_messages.size(); ++i) {
-    if (i) os << ',';
-    json_sync(os, ready.sync_messages[i]);
-  }
-  os << "],\"close_keys\":[";
-  for (size_t i = 0; i < ready.close_keys.size(); ++i) {
-    if (i) os << ',';
-    json_draft_key(os, ready.close_keys[i]);
-  }
-  os << "],\"ready_commit_segments\":[";
-  for (size_t i = 0; i < ready.ready_commit_segments.size(); ++i) {
-    if (i) os << ',';
-    json_segment(os, ready.ready_commit_segments[i]);
-  }
-  os << "]}";
-  return os.str();
-}
 
 struct RequestDraftTailStateCpp {
   int32_t drafter_rank = 0;
@@ -576,6 +791,14 @@ struct RequestDraftTailStateCpp {
   }
 };
 
+struct DraftTailSnapshotCpp {
+  std::string request_id;
+  int64_t committed_len = 0;
+  std::vector<int32_t> tail_tokens;
+  int64_t raw_tail_len = 0;
+  std::vector<int32_t> raw_tail_tokens;
+};
+
 struct CommitStatCpp {
   std::string request_id;
   int64_t pre_committed_len = 0;
@@ -592,41 +815,6 @@ struct CommitStatCpp {
   int64_t pending_expected_len_after = 0;
   int64_t pending_expected_added = 0;
 };
-
-std::string control_stats_json(const std::vector<CommitStatCpp>& stats) {
-  auto field = [&](const char* name, auto getter) {
-    std::ostringstream out;
-    out << '"' << name << "\":[";
-    for (size_t i = 0; i < stats.size(); ++i) {
-      if (i) out << ',';
-      out << getter(stats[i]);
-    }
-    out << ']';
-    return out.str();
-  };
-  std::ostringstream os;
-  os << "{\"commit_rids\":[";
-  for (size_t i = 0; i < stats.size(); ++i) {
-    if (i) os << ',';
-    json_escape(os, stats[i].request_id);
-  }
-  os << "],";
-  os << field("pre_committed_lens_by_req", [](const CommitStatCpp& s) { return s.pre_committed_len; }) << ',';
-  os << field("committed_segment_lens_by_req", [](const CommitStatCpp& s) { return s.committed_segment_len; }) << ',';
-  os << field("last_committed_token_ids_by_req", [](const CommitStatCpp& s) { return s.last_committed_token_id; }) << ',';
-  os << field("matched_tail_lens_by_req", [](const CommitStatCpp& s) { return s.matched_tail_len; }) << ',';
-  os << field("raw_tail_lens_before_by_req", [](const CommitStatCpp& s) { return s.raw_tail_len_before; }) << ',';
-  os << field("mismatch_tail_token_ids_by_req", [](const CommitStatCpp& s) { return s.mismatch_tail_token_id; }) << ',';
-  os << field("mismatch_committed_token_ids_by_req", [](const CommitStatCpp& s) { return s.mismatch_committed_token_id; }) << ',';
-  os << field("preserved_suffix_lens_by_req", [](const CommitStatCpp& s) { return s.preserved_suffix_len; }) << ',';
-  os << field("tail_lens_after_by_req", [](const CommitStatCpp& s) { return s.tail_len_after; }) << ',';
-  os << field("committed_lens_after_by_req", [](const CommitStatCpp& s) { return s.committed_len_after; }) << ',';
-  os << field("pending_expected_lens_before_by_req", [](const CommitStatCpp& s) { return s.pending_expected_len_before; }) << ',';
-  os << field("pending_expected_lens_after_by_req", [](const CommitStatCpp& s) { return s.pending_expected_len_after; }) << ',';
-  os << field("pending_expected_added_by_req", [](const CommitStatCpp& s) { return s.pending_expected_added; });
-  os << '}';
-  return os.str();
-}
 
 struct AppendStatsCpp {
   std::vector<std::string> rids;
@@ -648,41 +836,109 @@ struct AppendStatsCpp {
   std::vector<int64_t> pending_expected_lens_after_by_req;
 };
 
-std::string append_stats_json(const AppendStatsCpp& stats) {
-  auto array_field = [&](const char* name, const std::vector<int64_t>& values) {
-    std::ostringstream out;
-    out << '"' << name << "\":[";
-    for (size_t i = 0; i < values.size(); ++i) {
-      if (i) out << ',';
-      out << values[i];
-    }
-    out << ']';
-    return out.str();
-  };
-  std::ostringstream os;
-  os << "{\"rids\":[";
-  for (size_t i = 0; i < stats.rids.size(); ++i) {
-    if (i) os << ',';
-    json_escape(os, stats.rids[i]);
+py::dict control_stats_py(const std::vector<CommitStatCpp>& stats) {
+  py::dict out;
+  std::vector<std::string> commit_rids;
+  std::vector<int64_t> pre_committed_lens;
+  std::vector<int64_t> committed_segment_lens;
+  std::vector<int64_t> last_committed_token_ids;
+  std::vector<int64_t> matched_tail_lens;
+  std::vector<int64_t> raw_tail_lens_before;
+  std::vector<int64_t> mismatch_tail_token_ids;
+  std::vector<int64_t> mismatch_committed_token_ids;
+  std::vector<int64_t> preserved_suffix_lens;
+  std::vector<int64_t> tail_lens_after;
+  std::vector<int64_t> committed_lens_after;
+  std::vector<int64_t> pending_expected_lens_before;
+  std::vector<int64_t> pending_expected_lens_after;
+  std::vector<int64_t> pending_expected_added;
+  commit_rids.reserve(stats.size());
+  for (const auto& stat : stats) {
+    commit_rids.push_back(stat.request_id);
+    pre_committed_lens.push_back(stat.pre_committed_len);
+    committed_segment_lens.push_back(stat.committed_segment_len);
+    last_committed_token_ids.push_back(stat.last_committed_token_id);
+    matched_tail_lens.push_back(stat.matched_tail_len);
+    raw_tail_lens_before.push_back(stat.raw_tail_len_before);
+    mismatch_tail_token_ids.push_back(stat.mismatch_tail_token_id);
+    mismatch_committed_token_ids.push_back(stat.mismatch_committed_token_id);
+    preserved_suffix_lens.push_back(stat.preserved_suffix_len);
+    tail_lens_after.push_back(stat.tail_len_after);
+    committed_lens_after.push_back(stat.committed_len_after);
+    pending_expected_lens_before.push_back(stat.pending_expected_len_before);
+    pending_expected_lens_after.push_back(stat.pending_expected_len_after);
+    pending_expected_added.push_back(stat.pending_expected_added);
   }
-  os << "],";
-  os << array_field("draft_token_lens_by_req", stats.draft_token_lens_by_req) << ',';
-  os << array_field("appended_token_lens_by_req", stats.appended_token_lens_by_req) << ',';
-  os << "\"num_appended_outputs\":" << stats.num_appended_outputs << ',';
-  os << "\"num_duplicate_outputs\":" << stats.num_duplicate_outputs << ',';
-  os << "\"num_stale_base_outputs\":" << stats.num_stale_base_outputs << ',';
-  os << "\"num_already_committed_outputs\":" << stats.num_already_committed_outputs << ',';
-  os << "\"num_stale_gap_outputs\":" << stats.num_stale_gap_outputs << ',';
-  os << "\"num_unknown_request_outputs\":" << stats.num_unknown_request_outputs << ',';
-  os << "\"num_pending_expected_match_outputs\":" << stats.num_pending_expected_match_outputs << ',';
-  os << "\"num_pending_expected_reject_outputs\":" << stats.num_pending_expected_reject_outputs << ',';
-  os << "\"num_pending_expected_gap_outputs\":" << stats.num_pending_expected_gap_outputs << ',';
-  os << array_field("tail_lens_after_by_req", stats.tail_lens_after_by_req) << ',';
-  os << array_field("consumable_tail_lens_after_by_req", stats.consumable_tail_lens_after_by_req) << ',';
-  os << array_field("committed_lens_after_by_req", stats.committed_lens_after_by_req) << ',';
-  os << array_field("pending_expected_lens_after_by_req", stats.pending_expected_lens_after_by_req);
-  os << '}';
-  return os.str();
+  out["commit_rids"] = py::cast(commit_rids);
+  out["pre_committed_lens_by_req"] = py::cast(pre_committed_lens);
+  out["committed_segment_lens_by_req"] = py::cast(committed_segment_lens);
+  out["last_committed_token_ids_by_req"] = py::cast(last_committed_token_ids);
+  out["matched_tail_lens_by_req"] = py::cast(matched_tail_lens);
+  out["raw_tail_lens_before_by_req"] = py::cast(raw_tail_lens_before);
+  out["mismatch_tail_token_ids_by_req"] = py::cast(mismatch_tail_token_ids);
+  out["mismatch_committed_token_ids_by_req"] = py::cast(mismatch_committed_token_ids);
+  out["preserved_suffix_lens_by_req"] = py::cast(preserved_suffix_lens);
+  out["tail_lens_after_by_req"] = py::cast(tail_lens_after);
+  out["committed_lens_after_by_req"] = py::cast(committed_lens_after);
+  out["pending_expected_lens_before_by_req"] = py::cast(pending_expected_lens_before);
+  out["pending_expected_lens_after_by_req"] = py::cast(pending_expected_lens_after);
+  out["pending_expected_added_by_req"] = py::cast(pending_expected_added);
+  return out;
+}
+
+py::dict append_stats_py(const AppendStatsCpp& stats) {
+  py::dict out;
+  out["rids"] = py::cast(stats.rids);
+  out["draft_token_lens_by_req"] = py::cast(stats.draft_token_lens_by_req);
+  out["appended_token_lens_by_req"] = py::cast(stats.appended_token_lens_by_req);
+  out["num_appended_outputs"] = stats.num_appended_outputs;
+  out["num_duplicate_outputs"] = stats.num_duplicate_outputs;
+  out["num_stale_base_outputs"] = stats.num_stale_base_outputs;
+  out["num_already_committed_outputs"] = stats.num_already_committed_outputs;
+  out["num_stale_gap_outputs"] = stats.num_stale_gap_outputs;
+  out["num_unknown_request_outputs"] = stats.num_unknown_request_outputs;
+  out["num_pending_expected_match_outputs"] = stats.num_pending_expected_match_outputs;
+  out["num_pending_expected_reject_outputs"] = stats.num_pending_expected_reject_outputs;
+  out["num_pending_expected_gap_outputs"] = stats.num_pending_expected_gap_outputs;
+  out["tail_lens_after_by_req"] = py::cast(stats.tail_lens_after_by_req);
+  out["consumable_tail_lens_after_by_req"] = py::cast(stats.consumable_tail_lens_after_by_req);
+  out["committed_lens_after_by_req"] = py::cast(stats.committed_lens_after_by_req);
+  out["pending_expected_lens_after_by_req"] = py::cast(stats.pending_expected_lens_after_by_req);
+  return out;
+}
+
+py::tuple draft_key_row(const DraftReqKeyCpp& key) {
+  return py::make_tuple(key.request_id, key.src_verifier_rank);
+}
+
+py::tuple sync_row(const DraftSyncCpp& msg) {
+  return py::make_tuple(
+      msg.request_id,
+      msg.src_verifier_rank,
+      msg.dst_drafter_rank,
+      msg.prompt_token_ids,
+      msg.committed_output_ids);
+}
+
+py::tuple segment_row(const VerifierCommitSegmentCpp& segment) {
+  return py::make_tuple(
+      segment.draft_key.request_id,
+      segment.draft_key.src_verifier_rank,
+      segment.dst_drafter_rank,
+      segment.pre_verify_committed_len,
+      segment.committed_token_ids);
+}
+
+py::tuple ready_controls_native_rows(const ReadyDraftControlsCpp& ready) {
+  py::list sync_rows;
+  py::list close_rows;
+  py::list segment_rows;
+  for (const auto& msg : ready.sync_messages) sync_rows.append(sync_row(msg));
+  for (const auto& key : ready.close_keys) close_rows.append(draft_key_row(key));
+  for (const auto& segment : ready.ready_commit_segments) {
+    segment_rows.append(segment_row(segment));
+  }
+  return py::make_tuple(sync_rows, close_rows, segment_rows);
 }
 
 class DraftTailBufferCore {
@@ -709,7 +965,9 @@ class DraftTailBufferCore {
     return it == states_.end() ? -1 : it->second.committed_len;
   }
 
-  std::string apply_control_batch(const DraftControlBatchCpp& batch, bool collect_stats) {
+  std::vector<CommitStatCpp> apply_control_batch_native(
+      const DraftControlBatchCpp& batch,
+      bool collect_stats) {
     ScopedProfile timer(profiler_, "tail_buffer.apply_control_batch",
                         static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                              batch.close_messages.size()));
@@ -724,12 +982,28 @@ class DraftTailBufferCore {
       for (const auto& msg : batch.close_messages) close_request_locked(msg);
       cv_.notify_all();
     }
-    if (!collect_stats) return "";
-    return control_stats_json(commit_stats);
+    return commit_stats;
   }
 
-  std::string append_draft_stream_batch(const DraftTailStreamOutputBatchCpp& batch, bool collect_stats) {
-    if (batch.outputs.empty()) return "";
+  void open_request_rows_native(std::vector<DraftSyncOpenCpp> rows) {
+    ScopedProfile timer(profiler_, "tail_buffer.open_request_rows",
+                        static_cast<int64_t>(rows.size()));
+    std::lock_guard<std::mutex> guard(mu_);
+    states_.reserve(states_.size() + rows.size());
+    for (auto& row : rows) {
+      RequestDraftTailStateCpp state;
+      state.drafter_rank = row.dst_drafter_rank;
+      state.committed_len = row.committed_len;
+      state.can_accept_prefix_len = state.committed_len;
+      states_.insert_or_assign(std::move(row.request_id), std::move(state));
+    }
+    cv_.notify_all();
+  }
+
+  std::optional<AppendStatsCpp> append_draft_stream_batch_native(
+      const DraftTailStreamOutputBatchCpp& batch,
+      bool collect_stats) {
+    if (batch.outputs.empty()) return std::nullopt;
     ScopedProfile timer(profiler_, "tail_buffer.append_draft_stream_batch",
                         static_cast<int64_t>(batch.outputs.size()));
     AppendStatsCpp stats;
@@ -743,7 +1017,8 @@ class DraftTailBufferCore {
       if (collect_stats) fill_append_after_lens_locked(stats);
       cv_.notify_all();
     }
-    return collect_stats ? append_stats_json(stats) : "";
+    if (!collect_stats) return std::nullopt;
+    return stats;
   }
 
   void wait_for_draft_tokens(const std::vector<std::string>& rids, int64_t min_draft_tokens) {
@@ -758,7 +1033,7 @@ class DraftTailBufferCore {
     }
   }
 
-  std::string get_draft_snapshots(
+  std::vector<DraftTailSnapshotCpp> get_draft_snapshots_native(
       const std::vector<std::string>& rids,
       bool allow_partial,
       bool include_raw_tail_tokens,
@@ -782,35 +1057,26 @@ class DraftTailBufferCore {
       }
     }
 
-    std::ostringstream os;
-    os << '[';
-    for (size_t i = 0; i < rids.size(); ++i) {
-      auto it = states_.find(rids[i]);
+    std::vector<DraftTailSnapshotCpp> snapshots;
+    snapshots.reserve(rids.size());
+    for (const auto& rid : rids) {
+      auto it = states_.find(rid);
       if (it == states_.end()) {
-        throw std::runtime_error("unexpected request_id=" + rids[i]);
+        throw std::runtime_error("unexpected request_id=" + rid);
       }
-      if (i) os << ',';
       const auto& state = it->second;
-      os << "{\"request_id\":";
-      json_escape(os, rids[i]);
-      os << ",\"committed_len\":" << state.committed_len;
-      os << ",\"tail_tokens\":";
-      auto consumable = state.consumable_tail_tokens();
-      if (tail_cap >= 0 && static_cast<int64_t>(consumable.size()) > tail_cap) {
-        consumable.resize(static_cast<size_t>(tail_cap));
+      DraftTailSnapshotCpp snapshot;
+      snapshot.request_id = rid;
+      snapshot.committed_len = state.committed_len;
+      snapshot.tail_tokens = state.consumable_tail_tokens();
+      if (tail_cap >= 0 && static_cast<int64_t>(snapshot.tail_tokens.size()) > tail_cap) {
+        snapshot.tail_tokens.resize(static_cast<size_t>(tail_cap));
       }
-      json_int_array(os, consumable);
-      os << ",\"raw_tail_len\":" << state.tail_tokens.size();
-      os << ",\"raw_tail_tokens\":";
-      if (include_raw_tail_tokens) {
-        json_int_array(os, state.tail_tokens);
-      } else {
-        os << "[]";
-      }
-      os << '}';
+      snapshot.raw_tail_len = static_cast<int64_t>(state.tail_tokens.size());
+      if (include_raw_tail_tokens) snapshot.raw_tail_tokens = state.tail_tokens;
+      snapshots.push_back(std::move(snapshot));
     }
-    os << ']';
-    return os.str();
+    return snapshots;
   }
 
   std::string profile_json() { return profiler_.to_json(); }
@@ -1068,6 +1334,10 @@ class DraftControlInboxCore {
                         static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                              batch.close_messages.size()));
     std::lock_guard<std::mutex> guard(mu_);
+    close_keys_.reserve(close_keys_.size() + batch.close_messages.size());
+    sync_messages_.reserve(sync_messages_.size() + batch.sync_messages.size());
+    verifier_commit_segments_.reserve(
+        verifier_commit_segments_.size() + batch.verify_commit_messages.size());
     for (const auto& msg : batch.close_messages) add_close_key_locked(msg.draft_key());
     for (const auto& msg : batch.sync_messages) {
       if (close_keys_.count(msg.draft_key().map_key()) == 0) sync_messages_.push_back(msg);
@@ -1075,22 +1345,18 @@ class DraftControlInboxCore {
     for (const auto& msg : batch.verify_commit_messages) add_verify_commit_locked(msg);
   }
 
-  std::string snapshot_pending_commit_segments() {
+  std::vector<VerifierCommitSegmentCpp> snapshot_pending_commit_segments_native() {
     ScopedProfile timer(profiler_, "control_inbox.snapshot_pending_commit_segments");
     std::lock_guard<std::mutex> guard(mu_);
-    std::ostringstream os;
-    os << '[';
-    bool first = true;
+    std::vector<VerifierCommitSegmentCpp> out;
+    out.reserve(verifier_commit_segments_.size());
     for (const auto& kv : verifier_commit_segments_) {
-      if (!first) os << ',';
-      first = false;
-      json_segment(os, kv.second);
+      out.push_back(kv.second);
     }
-    os << ']';
-    return os.str();
+    return out;
   }
 
-  std::string extract_ready_controls(const std::vector<ExtractDecisionCpp>& decisions) {
+  ReadyDraftControlsCpp extract_ready_controls_native(const std::vector<ExtractDecisionCpp>& decisions) {
     ScopedProfile timer(profiler_, "control_inbox.extract_ready_controls",
                         static_cast<int64_t>(decisions.size()));
     ReadyDraftControlsCpp ready;
@@ -1112,7 +1378,7 @@ class DraftControlInboxCore {
       ready.ready_commit_segments.push_back(segment.extract_prefix(decision.consumable_len));
       if (segment.committed_token_ids.empty()) verifier_commit_segments_.erase(it);
     }
-    return ready_controls_json(ready);
+    return ready;
   }
 
   std::string profile_json() { return profiler_.to_json(); }
@@ -1413,28 +1679,86 @@ class DecoupledSpecDraftTailBuffer {
   bool has_request(const std::string& request_id) { return core_->has_request(request_id); }
   int64_t get_committed_len(const std::string& request_id) { return core_->get_committed_len(request_id); }
 
-  std::string apply_control_batch(const std::string& frame, bool collect_stats) {
-    return core_->apply_control_batch(parse_control_batch(frame), collect_stats);
+  py::object apply_control_batch_native(
+      int64_t dst_drafter_rank,
+      const py::sequence& sync_rows,
+      const py::sequence& commit_rows,
+      const py::sequence& close_rows,
+      bool collect_stats) {
+    DebugTimingScope debug_timer(
+        "pybind.tail_buffer.apply_control_batch_native",
+        static_cast<int64_t>(py::len(sync_rows) + py::len(commit_rows) + py::len(close_rows)));
+    if (!collect_stats && py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
+      auto rows = build_sync_open_rows_native(sync_rows);
+      {
+        py::gil_scoped_release release;
+        core_->open_request_rows_native(std::move(rows));
+      }
+      return py::none();
+    }
+    auto batch = build_control_batch_native(dst_drafter_rank, sync_rows, commit_rows, close_rows);
+    std::vector<CommitStatCpp> commit_stats;
+    {
+      py::gil_scoped_release release;
+      commit_stats = core_->apply_control_batch_native(batch, collect_stats);
+    }
+    if (!collect_stats) return py::none();
+    return control_stats_py(commit_stats);
   }
 
-  std::string append_draft_stream_batch(const std::string& frame, bool collect_stats) {
-    return core_->append_draft_stream_batch(parse_tail_stream_batch(frame), collect_stats);
+  py::object append_draft_stream_batch_native(
+      const py::sequence& rows,
+      bool collect_stats) {
+    DebugTimingScope debug_timer(
+        "pybind.tail_buffer.append_draft_stream_batch_native",
+        static_cast<int64_t>(py::len(rows)));
+    auto batch = build_tail_stream_batch_native(rows);
+    std::optional<AppendStatsCpp> stats;
+    {
+      py::gil_scoped_release release;
+      stats = core_->append_draft_stream_batch_native(batch, collect_stats);
+    }
+    if (!stats.has_value()) return py::none();
+    return append_stats_py(*stats);
   }
 
-  void wait_for_draft_tokens(const std::string& frame, int64_t min_draft_tokens) {
-    core_->wait_for_draft_tokens(parse_string_list(frame), min_draft_tokens);
+  void wait_for_draft_tokens_native(const py::sequence& rids, int64_t min_draft_tokens) {
+    DebugTimingScope debug_timer(
+        "pybind.tail_buffer.wait_for_draft_tokens_native",
+        static_cast<int64_t>(py::len(rids)));
+    auto rid_vec = py_string_vector(rids);
+    py::gil_scoped_release release;
+    core_->wait_for_draft_tokens(rid_vec, min_draft_tokens);
   }
 
-  std::string get_draft_snapshots(
-      const std::string& frame,
+  py::list get_draft_snapshots_native(
+      const py::sequence& rids,
       bool allow_partial,
       bool include_raw_tail_tokens,
       int64_t max_tail_len) {
-    return core_->get_draft_snapshots(
-        parse_string_list(frame),
-        allow_partial,
-        include_raw_tail_tokens,
-        max_tail_len);
+    DebugTimingScope debug_timer(
+        "pybind.tail_buffer.get_draft_snapshots_native",
+        static_cast<int64_t>(py::len(rids)));
+    auto rid_vec = py_string_vector(rids);
+    std::vector<DraftTailSnapshotCpp> snapshots;
+    {
+      py::gil_scoped_release release;
+      snapshots = core_->get_draft_snapshots_native(
+          rid_vec,
+          allow_partial,
+          include_raw_tail_tokens,
+          max_tail_len);
+    }
+    py::list out;
+    for (const auto& snapshot : snapshots) {
+      out.append(py::make_tuple(
+          snapshot.request_id,
+          snapshot.committed_len,
+          snapshot.tail_tokens,
+          snapshot.raw_tail_len,
+          snapshot.raw_tail_tokens));
+    }
+    return out;
   }
 
   std::string profile_json() { return core_->profile_json(); }
@@ -1470,9 +1794,17 @@ class DecoupledSpecDraftProxyThread {
 
   std::string result_bind_endpoint() const { return result_bind_endpoint_; }
 
-  void configure_peer_endpoints(const std::string& frame) {
+  void configure_peer_endpoints_native(const py::sequence& endpoint_rows) {
+    DebugTimingScope debug_timer(
+        "pybind.draft_proxy.configure_peer_endpoints_native",
+        static_cast<int64_t>(py::len(endpoint_rows)));
     check_thread_error();
-    auto endpoints = parse_string_list(frame);
+    auto endpoints = py_string_vector(endpoint_rows);
+    py::gil_scoped_release release;
+    configure_peer_endpoints_vector(std::move(endpoints));
+  }
+
+  void configure_peer_endpoints_vector(std::vector<std::string> endpoints) {
     if (endpoints.empty()) {
       throw std::runtime_error("Decoupled verify requires at least one drafter control endpoint");
     }
@@ -1511,11 +1843,46 @@ class DecoupledSpecDraftProxyThread {
     if (zmq_) zmq_->close_context();
   }
 
-  void submit_control_batch(std::string frame) {
+  void submit_control_batch_native(
+      int64_t dst_drafter_rank,
+      const py::sequence& sync_rows,
+      const py::sequence& commit_rows,
+      const py::sequence& close_rows) {
+    DebugTimingScope debug_timer(
+        "pybind.draft_proxy.submit_control_batch_native",
+        static_cast<int64_t>(py::len(sync_rows) + py::len(commit_rows) + py::len(close_rows)));
     check_thread_error();
+    if (py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
+      auto rows = build_sync_open_rows_native(sync_rows);
+      auto frame = encode_control_batch_native_rows(
+          dst_drafter_rank,
+          sync_rows,
+          commit_rows,
+          close_rows);
+      {
+        py::gil_scoped_release release;
+        draft_tail_buffer_->open_request_rows_native(std::move(rows));
+        {
+          std::lock_guard<std::mutex> guard(queue_mu_);
+          send_queue_.push_back(std::move(frame));
+        }
+      }
+      queue_cv_.notify_one();
+      return;
+    }
+    auto batch = build_control_batch_native(
+        dst_drafter_rank,
+        sync_rows,
+        commit_rows,
+        close_rows);
     {
-      std::lock_guard<std::mutex> guard(queue_mu_);
-      send_queue_.push_back(std::move(frame));
+      py::gil_scoped_release release;
+      draft_tail_buffer_->apply_control_batch_native(batch, false);
+      auto frame = encode_control_batch(batch);
+      {
+        std::lock_guard<std::mutex> guard(queue_mu_);
+        send_queue_.push_back(std::move(frame));
+      }
     }
     queue_cv_.notify_one();
   }
@@ -1608,7 +1975,7 @@ class DecoupledSpecDraftProxyThread {
         throw std::runtime_error("Draft proxy received a tail stream batch for the wrong verifier");
       }
     }
-    draft_tail_buffer_->append_draft_stream_batch(batch, false);
+    draft_tail_buffer_->append_draft_stream_batch_native(batch, false);
   }
 
   int32_t verifier_rank_;
@@ -1648,9 +2015,17 @@ class DecoupledSpecTokenSyncThread {
 
   std::string control_bind_endpoint() const { return control_bind_endpoint_; }
 
-  void configure_peer_endpoints(const std::string& frame) {
+  void configure_peer_endpoints_native(const py::sequence& endpoint_rows) {
+    DebugTimingScope debug_timer(
+        "pybind.token_sync.configure_peer_endpoints_native",
+        static_cast<int64_t>(py::len(endpoint_rows)));
     check_thread_error();
-    auto endpoints = parse_string_list(frame);
+    auto endpoints = py_string_vector(endpoint_rows);
+    py::gil_scoped_release release;
+    configure_peer_endpoints_vector(std::move(endpoints));
+  }
+
+  void configure_peer_endpoints_vector(std::vector<std::string> endpoints) {
     if (endpoints.empty()) {
       throw std::runtime_error("Decoupled drafter requires at least one verifier result endpoint");
     }
@@ -1689,11 +2064,20 @@ class DecoupledSpecTokenSyncThread {
     if (zmq_) zmq_->close_context();
   }
 
-  void submit_draft_results(std::string frame) {
+  void submit_draft_results_native(const py::sequence& rows) {
+    DebugTimingScope debug_timer(
+        "pybind.token_sync.submit_draft_results_native",
+        static_cast<int64_t>(py::len(rows)));
     check_thread_error();
+    auto batch = build_tail_stream_batch_native(rows);
+    if (batch.outputs.empty()) return;
     {
-      std::lock_guard<std::mutex> guard(queue_mu_);
-      outgoing_results_.push_back(std::move(frame));
+      py::gil_scoped_release release;
+      auto frame = encode_tail_stream_batch(batch);
+      {
+        std::lock_guard<std::mutex> guard(queue_mu_);
+        outgoing_results_.push_back(std::move(frame));
+      }
     }
     queue_cv_.notify_one();
   }
@@ -1703,14 +2087,33 @@ class DecoupledSpecTokenSyncThread {
     return inbox_.pending_control_count();
   }
 
-  std::string snapshot_pending_commit_segments() {
+  py::list snapshot_pending_commit_segments_native() {
+    DebugTimingScope debug_timer("pybind.token_sync.snapshot_pending_commit_segments_native");
     check_thread_error();
-    return inbox_.snapshot_pending_commit_segments();
+    std::vector<VerifierCommitSegmentCpp> segments;
+    {
+      py::gil_scoped_release release;
+      segments = inbox_.snapshot_pending_commit_segments_native();
+    }
+    py::list out;
+    for (const auto& segment : segments) {
+      out.append(segment_row(segment));
+    }
+    return out;
   }
 
-  std::string extract_ready_controls(const std::string& frame) {
+  py::tuple extract_ready_controls_native(const py::sequence& rows) {
+    DebugTimingScope debug_timer(
+        "pybind.token_sync.extract_ready_controls_native",
+        static_cast<int64_t>(py::len(rows)));
     check_thread_error();
-    return inbox_.extract_ready_controls(parse_extract_decisions(frame));
+    auto decisions = build_extract_decisions_native(rows);
+    ReadyDraftControlsCpp ready;
+    {
+      py::gil_scoped_release release;
+      ready = inbox_.extract_ready_controls_native(decisions);
+    }
+    return ready_controls_native_rows(ready);
   }
 
   std::string profile_json() {
@@ -1845,31 +2248,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("has_request", &DecoupledSpecDraftTailBuffer::has_request, py::arg("request_id"))
       .def("get_committed_len", &DecoupledSpecDraftTailBuffer::get_committed_len, py::arg("request_id"))
       .def(
-          "apply_control_batch",
-          &DecoupledSpecDraftTailBuffer::apply_control_batch,
-          py::arg("frame"),
-          py::arg("collect_stats"),
-          py::call_guard<py::gil_scoped_release>())
+          "apply_control_batch_native",
+          &DecoupledSpecDraftTailBuffer::apply_control_batch_native,
+          py::arg("dst_drafter_rank"),
+          py::arg("sync_rows"),
+          py::arg("commit_rows"),
+          py::arg("close_rows"),
+          py::arg("collect_stats"))
       .def(
-          "append_draft_stream_batch",
-          &DecoupledSpecDraftTailBuffer::append_draft_stream_batch,
-          py::arg("frame"),
-          py::arg("collect_stats"),
-          py::call_guard<py::gil_scoped_release>())
+          "append_draft_stream_batch_native",
+          &DecoupledSpecDraftTailBuffer::append_draft_stream_batch_native,
+          py::arg("rows"),
+          py::arg("collect_stats"))
       .def(
-          "wait_for_draft_tokens",
-          &DecoupledSpecDraftTailBuffer::wait_for_draft_tokens,
-          py::arg("frame"),
-          py::arg("min_draft_tokens"),
-          py::call_guard<py::gil_scoped_release>())
+          "wait_for_draft_tokens_native",
+          &DecoupledSpecDraftTailBuffer::wait_for_draft_tokens_native,
+          py::arg("rids"),
+          py::arg("min_draft_tokens"))
       .def(
-          "get_draft_snapshots",
-          &DecoupledSpecDraftTailBuffer::get_draft_snapshots,
-          py::arg("frame"),
+          "get_draft_snapshots_native",
+          &DecoupledSpecDraftTailBuffer::get_draft_snapshots_native,
+          py::arg("rids"),
           py::arg("allow_partial"),
           py::arg("include_raw_tail_tokens"),
-          py::arg("max_tail_len"),
-          py::call_guard<py::gil_scoped_release>())
+          py::arg("max_tail_len"))
       .def("profile_json", &DecoupledSpecDraftTailBuffer::profile_json);
 
   py::class_<DecoupledSpecDraftProxyThread>(m, "DraftProxyThread")
@@ -1880,40 +2282,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("draft_tail_buffer"))
       .def("result_bind_endpoint", &DecoupledSpecDraftProxyThread::result_bind_endpoint)
       .def(
-          "configure_peer_endpoints",
-          &DecoupledSpecDraftProxyThread::configure_peer_endpoints,
-          py::arg("frame"),
-          py::call_guard<py::gil_scoped_release>())
+          "configure_peer_endpoints_native",
+          &DecoupledSpecDraftProxyThread::configure_peer_endpoints_native,
+          py::arg("endpoints"))
       .def("start", &DecoupledSpecDraftProxyThread::start, py::call_guard<py::gil_scoped_release>())
       .def("close", &DecoupledSpecDraftProxyThread::close, py::call_guard<py::gil_scoped_release>())
       .def(
-          "submit_control_batch",
-          &DecoupledSpecDraftProxyThread::submit_control_batch,
-          py::arg("frame"),
-          py::call_guard<py::gil_scoped_release>())
+          "submit_control_batch_native",
+          &DecoupledSpecDraftProxyThread::submit_control_batch_native,
+          py::arg("dst_drafter_rank"),
+          py::arg("sync_rows"),
+          py::arg("commit_rows"),
+          py::arg("close_rows"))
       .def("profile_json", &DecoupledSpecDraftProxyThread::profile_json);
 
   py::class_<DecoupledSpecTokenSyncThread>(m, "TokenSyncThread")
       .def(py::init<int64_t, const std::string&>(), py::arg("drafter_rank"), py::arg("bind_endpoint_or_host"))
       .def("control_bind_endpoint", &DecoupledSpecTokenSyncThread::control_bind_endpoint)
       .def(
-          "configure_peer_endpoints",
-          &DecoupledSpecTokenSyncThread::configure_peer_endpoints,
-          py::arg("frame"),
-          py::call_guard<py::gil_scoped_release>())
+          "configure_peer_endpoints_native",
+          &DecoupledSpecTokenSyncThread::configure_peer_endpoints_native,
+          py::arg("endpoints"))
       .def("start", &DecoupledSpecTokenSyncThread::start, py::call_guard<py::gil_scoped_release>())
       .def("close", &DecoupledSpecTokenSyncThread::close, py::call_guard<py::gil_scoped_release>())
       .def(
-          "submit_draft_results",
-          &DecoupledSpecTokenSyncThread::submit_draft_results,
-          py::arg("frame"),
-          py::call_guard<py::gil_scoped_release>())
+          "submit_draft_results_native",
+          &DecoupledSpecTokenSyncThread::submit_draft_results_native,
+          py::arg("rows"))
       .def("pending_control_count", &DecoupledSpecTokenSyncThread::pending_control_count)
-      .def("snapshot_pending_commit_segments", &DecoupledSpecTokenSyncThread::snapshot_pending_commit_segments)
       .def(
-          "extract_ready_controls",
-          &DecoupledSpecTokenSyncThread::extract_ready_controls,
-          py::arg("frame"),
-          py::call_guard<py::gil_scoped_release>())
+          "snapshot_pending_commit_segments_native",
+          &DecoupledSpecTokenSyncThread::snapshot_pending_commit_segments_native)
+      .def(
+          "extract_ready_controls_native",
+          &DecoupledSpecTokenSyncThread::extract_ready_controls_native,
+          py::arg("rows"))
       .def("profile_json", &DecoupledSpecTokenSyncThread::profile_json);
 }

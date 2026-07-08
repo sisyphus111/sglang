@@ -5,6 +5,7 @@ from sglang.srt.speculative.cpp_decoupled_spec import (
     CppDraftProxyThread,
     CppDraftTailBuffer,
     CppTokenSyncThread,
+    _load_decoupled_spec_cpp_module,
 )
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
@@ -93,6 +94,58 @@ def _exercise_tail_buffer(buffer):
 
 
 class TestDecoupledSpecCppPybind(unittest.TestCase):
+    def test_pybind_data_plane_exposes_native_rows_only(self):
+        module = _load_decoupled_spec_cpp_module()
+        buffer = module.DraftTailBuffer(0, 2)
+        proxy = None
+        token_sync = None
+        try:
+            old_buffer_methods = [
+                "apply_control_batch",
+                "append_draft_stream_batch",
+                "wait_for_draft_tokens",
+                "get_draft_snapshots",
+            ]
+            for name in old_buffer_methods:
+                self.assertFalse(hasattr(buffer, name), name)
+
+            buffer.apply_control_batch_native(
+                0,
+                [("req-native", 0, 0, [1, 2], [3])],
+                [],
+                [],
+                False,
+            )
+            buffer.append_draft_stream_batch_native(
+                [(0, 0, "req-native", 1, 1, 10)],
+                False,
+            )
+            snapshots = buffer.get_draft_snapshots_native(
+                ["req-native"], True, True, -1
+            )
+            self.assertEqual(snapshots[0][0], "req-native")
+            self.assertEqual(snapshots[0][2], [10])
+
+            proxy = module.DraftProxyThread(0, "127.0.0.1", buffer)
+            for name in ["configure_peer_endpoints", "submit_control_batch"]:
+                self.assertFalse(hasattr(proxy, name), name)
+
+            token_sync = module.TokenSyncThread(0, "127.0.0.1")
+            old_token_sync_methods = [
+                "configure_peer_endpoints",
+                "submit_draft_results",
+                "snapshot_pending_commit_segments",
+                "extract_ready_controls",
+            ]
+            for name in old_token_sync_methods:
+                self.assertFalse(hasattr(token_sync, name), name)
+        finally:
+            if token_sync is not None:
+                token_sync.close()
+            if proxy is not None:
+                proxy.close()
+            buffer.close()
+
     def test_draft_tail_buffer_matches_python_state_machine(self):
         py_buffer = DraftTailBuffer(verifier_rank=0, required_tail_len=2)
         cpp_buffer = CppDraftTailBuffer(verifier_rank=0, required_tail_len=2)

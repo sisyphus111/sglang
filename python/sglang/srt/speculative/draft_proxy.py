@@ -12,6 +12,8 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftMeshMessage,
     DraftMeshMessageType,
     DraftTailStreamOutputBatch,
+    decoupled_spec_print_timing,
+    decoupled_spec_timing_start,
 )
 from sglang.srt.speculative.tracer import (
     SpecTraceEvent,
@@ -143,29 +145,40 @@ class DraftProxyThread:
     def _recv_tail_stream_output_batch_from_socket(
         self,
     ) -> DraftTailStreamOutputBatch:
-        message = self.result_recv_socket.recv_pyobj()
-        if not isinstance(message, DraftMeshMessage):
-            raise RuntimeError(f"Unexpected draft proxy message: {message}")
-        if (
-            message.message_type != DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
-            or message.tail_stream_output_batch is None
-        ):
-            raise RuntimeError(f"Unexpected draft proxy message: {message}")
+        start_ns = decoupled_spec_timing_start()
+        output_count = 0
+        try:
+            message = self.result_recv_socket.recv_pyobj()
+            if not isinstance(message, DraftMeshMessage):
+                raise RuntimeError(f"Unexpected draft proxy message: {message}")
+            if (
+                message.message_type != DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
+                or message.tail_stream_output_batch is None
+            ):
+                raise RuntimeError(f"Unexpected draft proxy message: {message}")
 
-        output_batch = message.tail_stream_output_batch
-        mismatched_outputs = [
-            output
-            for output in output_batch.outputs
-            if int(output.dst_verifier_rank) != self.verifier_rank
-        ]
-        if mismatched_outputs:
-            raise RuntimeError(
-                "Draft proxy received a tail stream batch for the wrong verifier: "
-                f"verifier_rank={self.verifier_rank} "
-                f"dst_verifier_ranks={[int(output.dst_verifier_rank) for output in output_batch.outputs]} "
-                f"request_ids={[output.request_id for output in output_batch.outputs]}"
+            output_batch = message.tail_stream_output_batch
+            output_count = len(output_batch.outputs)
+            mismatched_outputs = [
+                output
+                for output in output_batch.outputs
+                if int(output.dst_verifier_rank) != self.verifier_rank
+            ]
+            if mismatched_outputs:
+                raise RuntimeError(
+                    "Draft proxy received a tail stream batch for the wrong verifier: "
+                    f"verifier_rank={self.verifier_rank} "
+                    f"dst_verifier_ranks={[int(output.dst_verifier_rank) for output in output_batch.outputs]} "
+                    f"request_ids={[output.request_id for output in output_batch.outputs]}"
+                )
+            return output_batch
+        finally:
+            decoupled_spec_print_timing(
+                component="draft_proxy",
+                op="recv_tail_stream_batch",
+                start_ns=start_ns,
+                items=output_count,
             )
-        return output_batch
 
     @trace_speculative(
         SpecTraceEvent.DRAFT_PROXY_APPEND_TAIL_STREAM_BATCH,
@@ -184,13 +197,26 @@ class DraftProxyThread:
 
     @trace_speculative(SpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH)
     def _send_control_batch(self, batch: DraftControlBatch) -> None:
+        start_ns = decoupled_spec_timing_start()
         dst_drafter_rank = int(batch.dst_drafter_rank)
-        socket = self.control_send_sockets.get(dst_drafter_rank)
-        if socket is None:
-            raise RuntimeError(
-                f"Missing control socket for dst_drafter_rank={dst_drafter_rank}"
+        try:
+            socket = self.control_send_sockets.get(dst_drafter_rank)
+            if socket is None:
+                raise RuntimeError(
+                    f"Missing control socket for dst_drafter_rank={dst_drafter_rank}"
+                )
+            socket.send_pyobj(DraftMeshMessage.from_control_batch(batch))
+        finally:
+            decoupled_spec_print_timing(
+                component="draft_proxy",
+                op="send_control_batch",
+                start_ns=start_ns,
+                items=(
+                    len(batch.sync_messages)
+                    + len(batch.verify_commit_messages)
+                    + len(batch.close_messages)
+                ),
             )
-        socket.send_pyobj(DraftMeshMessage.from_control_batch(batch))
 
     def _run(self) -> None:
         while not self._closed.is_set():

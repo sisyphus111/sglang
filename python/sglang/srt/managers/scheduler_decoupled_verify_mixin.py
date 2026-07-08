@@ -463,6 +463,49 @@ class SchedulerDecoupledVerifyMixin:
         for batch in batches.values():
             self._submit_verify_control_batch(batch)
 
+    def _send_verify_control_rows(
+        self,
+        *,
+        sync_rows: list[tuple] | None = None,
+        commit_rows: list[tuple] | None = None,
+        close_rows: list[tuple] | None = None,
+    ) -> None:
+        if not self.is_verify_entry_rank():
+            return
+
+        if self.draft_proxy_thread is None:
+            raise RuntimeError(
+                "Draft proxy thread is not initialized on decoupled_verify entry rank"
+            )
+
+        batches: dict[int, dict[str, list[tuple]]] = {}
+
+        def get_batch(dst_drafter_rank: int) -> dict[str, list[tuple]]:
+            dst_drafter_rank = int(dst_drafter_rank)
+            batch = batches.get(dst_drafter_rank)
+            if batch is None:
+                batch = {"sync": [], "commit": [], "close": []}
+                batches[dst_drafter_rank] = batch
+            return batch
+
+        for row in sync_rows or []:
+            get_batch(int(row[2]))["sync"].append(row)
+        for row in commit_rows or []:
+            get_batch(int(row[2]))["commit"].append(row)
+        for row in close_rows or []:
+            get_batch(int(row[2]))["close"].append(row)
+
+        submit_rows = getattr(self.draft_proxy_thread, "submit_control_rows", None)
+        if submit_rows is None:
+            raise RuntimeError("C++ decoupled verify proxy does not expose row API")
+        for dst_drafter_rank, rows in batches.items():
+            submit_rows(
+                dst_drafter_rank,
+                rows["sync"],
+                rows["commit"],
+                rows["close"],
+            )
+
     def _broadcast_verify_snapshots(
         self, local_snapshots: list[DraftTailSnapshot] | None
     ) -> list[DraftTailSnapshot]:
@@ -600,6 +643,47 @@ class SchedulerDecoupledVerifyMixin:
 
         draft_tail_buffer = self.draft_tail_buffer
         assert draft_tail_buffer is not None
+
+        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+            sync_rows: list[tuple] = []
+            for req in batch.reqs:
+                if not req.is_retracted and not req.finished():
+                    setattr(
+                        req,
+                        "_decoupled_verify_pre_committed_len",
+                        len(req.output_ids),
+                    )
+                if (
+                    getattr(req, "inflight_middle_chunks", getattr(req, "is_chunked", 0))
+                    > 0
+                    or req.is_retracted
+                    or req.finished()
+                ):
+                    continue
+                if draft_tail_buffer.has_request(req.rid):
+                    continue
+                dst_drafter_rank = self.assign_drafter_rank(req.rid)
+                sync_rows.append(
+                    (
+                        req.rid,
+                        self.get_decoupled_spec_rank(),
+                        dst_drafter_rank,
+                        [int(token_id) for token_id in req.origin_input_ids],
+                        [int(token_id) for token_id in req.output_ids],
+                    )
+                )
+                setattr(req, "draft_buffer", None)
+                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+            trace_payload = {
+                "forward_mode": str(batch.forward_mode),
+                "batch_size": len(batch.reqs),
+                "rids": [row[0] for row in sync_rows],
+                "committed_lens_by_req": [len(row[4]) for row in sync_rows],
+                "output_lens_by_req": [len(row[4]) for row in sync_rows],
+                "dst_drafter_ranks": [int(row[2]) for row in sync_rows],
+            }
+            self._send_verify_control_rows(sync_rows=sync_rows)
+            return trace_payload
 
         sync_messages: list[DraftSync] = []
         for req in batch.reqs:
@@ -795,6 +879,117 @@ class SchedulerDecoupledVerifyMixin:
         draft_tail_buffer = self.draft_tail_buffer
         assert draft_tail_buffer is not None
 
+        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+            commit_rows: list[tuple] = []
+            close_rows: list[tuple] = []
+            commit_pre_committed_lens: list[int] = []
+            commit_draft_buffer_lens: list[int] = []
+            commit_segment_lens: list[int] = []
+            commit_last_token_ids: list[int] = []
+            commit_committed_lens: list[int] = []
+            commit_output_lens: list[int] = []
+            close_output_lens: list[int] = []
+            for req in batch.reqs:
+                has_request = draft_tail_buffer.has_request(req.rid)
+
+                if req.is_retracted or req.finished():
+                    if has_request:
+                        dst_drafter_rank = self.get_drafter_rank(req.rid)
+                        close_rows.append(
+                            (
+                                req.rid,
+                                self.get_decoupled_spec_rank(),
+                                dst_drafter_rank,
+                                "abort" if req.is_retracted else "finished",
+                            )
+                        )
+                        close_output_lens.append(len(req.output_ids))
+                        self.release_drafter_rank(req.rid)
+                    setattr(req, "draft_buffer", None)
+                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
+                    continue
+
+                if not has_request:
+                    continue
+                if not req.output_ids:
+                    continue
+
+                pre_verify_committed_len = getattr(
+                    req,
+                    "_decoupled_verify_pre_committed_len",
+                    None,
+                )
+                if pre_verify_committed_len is None:
+                    pre_verify_committed_len = draft_tail_buffer.get_committed_len(req.rid)
+                if pre_verify_committed_len is None:
+                    continue
+                pre_verify_committed_len = int(pre_verify_committed_len)
+                if pre_verify_committed_len > len(req.output_ids):
+                    raise RuntimeError(
+                        "Verifier VerifyCommit pre-commit prefix is beyond the "
+                        "current output ids: "
+                        f"request_id={req.rid} "
+                        f"pre_verify_committed_len={pre_verify_committed_len} "
+                        f"output_len={len(req.output_ids)}"
+                    )
+                if pre_verify_committed_len == len(req.output_ids):
+                    if hasattr(req, "_decoupled_verify_pre_committed_len"):
+                        delattr(req, "_decoupled_verify_pre_committed_len")
+                    if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
+                        delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
+                    continue
+
+                draft_buffer = list(getattr(req, "draft_buffer", None) or [])
+                committed_token_ids = [
+                    int(token_id)
+                    for token_id in req.output_ids[pre_verify_committed_len:]
+                ]
+                dst_drafter_rank = self.get_drafter_rank(req.rid)
+                commit_rows.append(
+                    (
+                        req.rid,
+                        self.get_decoupled_spec_rank(),
+                        dst_drafter_rank,
+                        pre_verify_committed_len,
+                        committed_token_ids,
+                    )
+                )
+                commit_pre_committed_lens.append(pre_verify_committed_len)
+                commit_draft_buffer_lens.append(len(draft_buffer))
+                commit_segment_lens.append(len(committed_token_ids))
+                commit_last_token_ids.append(int(committed_token_ids[-1]))
+                commit_committed_lens.append(
+                    pre_verify_committed_len + len(committed_token_ids)
+                )
+                commit_output_lens.append(len(req.output_ids))
+                if hasattr(req, "_decoupled_verify_pre_committed_len"):
+                    delattr(req, "_decoupled_verify_pre_committed_len")
+                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
+                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
+
+            trace_payload = {
+                "forward_mode": str(batch.forward_mode),
+                "batch_size": len(batch.reqs),
+                "commit_rids": [row[0] for row in commit_rows],
+                "close_rids": [row[0] for row in close_rows],
+                "num_commit": len(commit_rows),
+                "num_close": len(close_rows),
+                "pre_committed_lens_by_req": commit_pre_committed_lens,
+                "draft_buffer_lens_by_req": commit_draft_buffer_lens,
+                "committed_segment_lens_by_req": commit_segment_lens,
+                "last_committed_token_ids_by_req": commit_last_token_ids,
+                "committed_lens_by_req": commit_committed_lens,
+                "commit_output_lens_by_req": commit_output_lens,
+                "commit_dst_drafter_ranks": [int(row[2]) for row in commit_rows],
+                "close_output_lens_by_req": close_output_lens,
+                "close_dst_drafter_ranks": [int(row[2]) for row in close_rows],
+            }
+            self._send_verify_control_rows(
+                commit_rows=commit_rows,
+                close_rows=close_rows,
+            )
+            return trace_payload
+
         verify_commit_messages: list[VerifyCommit] = []
         close_messages: list[DraftClose] = []
         commit_pre_committed_lens: list[int] = []
@@ -933,6 +1128,19 @@ class SchedulerDecoupledVerifyMixin:
         assert draft_tail_buffer is not None
         if draft_tail_buffer.has_request(request_id):
             dst_drafter_rank = self.get_drafter_rank(request_id)
+            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+                self._send_verify_control_rows(
+                    close_rows=[
+                        (
+                            request_id,
+                            self.get_decoupled_spec_rank(),
+                            dst_drafter_rank,
+                            "abort",
+                        )
+                    ]
+                )
+                self.release_drafter_rank(request_id)
+                return
             self._send_verify_control_batches(
                 close_messages=[
                     DraftClose(

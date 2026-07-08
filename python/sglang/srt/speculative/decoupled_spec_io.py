@@ -1,8 +1,38 @@
 from __future__ import annotations
 
+import os
+import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
+
+
+def _decoupled_spec_env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    if not value:
+        return False
+    return value.lower() not in ("0", "false", "off", "no")
+
+
+def decoupled_spec_timing_start() -> int:
+    if not _decoupled_spec_env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_TIMING"):
+        return 0
+    return time.perf_counter_ns()
+
+
+def decoupled_spec_print_timing(
+    *, component: str, op: str, start_ns: int, items: int = 0
+) -> None:
+    if start_ns <= 0:
+        return
+    duration_ns = time.perf_counter_ns() - start_ns
+    print(
+        "[decoupled-spec-timing] "
+        f"impl=py component={component} op={op} ns={duration_ns} items={items}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class DraftMeshMessageType(str, Enum):
@@ -266,13 +296,26 @@ class DraftControlInbox:
         )
 
     def add_control_batch_locked(self, batch: DraftControlBatch) -> None:
-        for message in batch.close_messages:
-            self.add_close_key_locked(message.draft_key)
-        for message in batch.sync_messages:
-            if message.draft_key not in self.close_keys:
-                self.sync_messages.append(message)
-        for message in batch.verify_commit_messages:
-            self.add_verify_commit_locked(message)
+        start_ns = decoupled_spec_timing_start()
+        try:
+            for message in batch.close_messages:
+                self.add_close_key_locked(message.draft_key)
+            for message in batch.sync_messages:
+                if message.draft_key not in self.close_keys:
+                    self.sync_messages.append(message)
+            for message in batch.verify_commit_messages:
+                self.add_verify_commit_locked(message)
+        finally:
+            decoupled_spec_print_timing(
+                component="control_inbox",
+                op="add_control_batch",
+                start_ns=start_ns,
+                items=(
+                    len(batch.sync_messages)
+                    + len(batch.verify_commit_messages)
+                    + len(batch.close_messages)
+                ),
+            )
 
     def add_close_key_locked(self, draft_key: DraftReqKey) -> None:
         self.close_keys.add(draft_key)
@@ -302,28 +345,37 @@ class DraftControlInbox:
         self,
         consumable_commit_len: Callable[[VerifierCommitSegment], int],
     ) -> "ReadyDraftControls":
-        ready_controls = ReadyDraftControls()
+        start_ns = decoupled_spec_timing_start()
+        try:
+            ready_controls = ReadyDraftControls()
 
-        if self.close_keys:
-            ready_controls.close_keys = self.close_keys
-            self.close_keys = set()
+            if self.close_keys:
+                ready_controls.close_keys = self.close_keys
+                self.close_keys = set()
 
-        if self.sync_messages:
-            ready_controls.sync_messages = self.sync_messages
-            self.sync_messages = []
+            if self.sync_messages:
+                ready_controls.sync_messages = self.sync_messages
+                self.sync_messages = []
 
-        for draft_key, segment in list(self.verifier_commit_segments.items()):
-            consumable_len = consumable_commit_len(segment)
-            if consumable_len <= 0:
-                continue
+            for draft_key, segment in list(self.verifier_commit_segments.items()):
+                consumable_len = consumable_commit_len(segment)
+                if consumable_len <= 0:
+                    continue
 
-            ready_controls.ready_commit_segments.append(
-                segment.extract_prefix(consumable_len)
+                ready_controls.ready_commit_segments.append(
+                    segment.extract_prefix(consumable_len)
+                )
+                if not segment.committed_token_ids:
+                    self.verifier_commit_segments.pop(draft_key, None)
+
+            return ready_controls
+        finally:
+            decoupled_spec_print_timing(
+                component="control_inbox",
+                op="extract_ready_controls",
+                start_ns=start_ns,
+                items=len(self.verifier_commit_segments),
             )
-            if not segment.committed_token_ids:
-                self.verifier_commit_segments.pop(draft_key, None)
-
-        return ready_controls
 
 
 @dataclass
