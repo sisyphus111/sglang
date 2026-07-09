@@ -128,6 +128,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
+        worker.gpu_id = 0
         worker.enable_adaptive_verify = True
         worker.speculative_num_steps = 1
         worker.speculative_num_draft_tokens = 2
@@ -135,6 +136,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             speculative_adaptive_strategy="throughput_aware",
             _decoupled_verify_max_speculative_steps=2,
             decoupled_verify_throughput_profile_path=cache_path,
+            decoupled_verify_throughput_profile_ctx_lens="256",
             model_path="/models/target-model",
             tp_size=4,
             dp_size=1,
@@ -165,11 +167,21 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         worker.apply_runtime_state = apply_runtime_state
         return worker
 
-    def _throughput_profile_cache_payload(self, worker, *, omit_last=False):
+    def _throughput_profile_cache_payload(
+        self,
+        worker,
+        *,
+        omit_last=False,
+        invalid_last=False,
+        fingerprint=None,
+        include_fingerprint=True,
+        include_costs=True,
+    ):
         costs = [
             {
                 "batch_size": bs,
                 "steps": steps,
+                "ctx_len": 256,
                 "cost_ms": float(bs + steps + 1),
             }
             for steps in (0, 1, 2)
@@ -177,12 +189,23 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         ]
         if omit_last:
             costs.pop()
-        return {
-            "schema_version": 1,
-            "summary": "cached",
-            "fingerprint": worker._throughput_profile_fingerprint([4, 8]),
-            "costs": costs,
-        }
+        if invalid_last:
+            costs[-1] = {
+                "batch_size": 8,
+                "steps": 2,
+                "ctx_len": 256,
+                "cost_ms": -1.0,
+            }
+        payload = {"summary": "cached"}
+        if include_fingerprint:
+            payload["fingerprint"] = (
+                worker._throughput_profile_fingerprint()
+                if fingerprint is None
+                else fingerprint
+            )
+        if include_costs:
+            payload["costs"] = costs
+        return payload
 
     def test_throughput_aware_validation_accepts_adaptive_full_cuda_graph(self):
         args = self._make_validate_args()
@@ -750,12 +773,15 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
+        worker.gpu_id = 0
         worker.enable_adaptive_verify = True
         worker.speculative_num_steps = 1
         worker.speculative_num_draft_tokens = 2
         worker.server_args = SimpleNamespace(
             speculative_adaptive_strategy="throughput_aware",
             _decoupled_verify_max_speculative_steps=2,
+            decoupled_verify_throughput_profile_path=None,
+            decoupled_verify_throughput_profile_ctx_lens="256",
         )
         worker._throughput_profile_done = False
         worker._throughput_profile_states_by_step = {
@@ -780,8 +806,8 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             worker.speculative_num_steps = state.speculative_num_steps
             worker.speculative_num_draft_tokens = state.speculative_num_draft_tokens
 
-        def profile_shape(_worker, batch_size, steps, state, tree_cache):
-            profile_calls.append((batch_size, steps))
+        def profile_shape(_worker, batch_size, steps, ctx_len, state, tree_cache):
+            profile_calls.append((batch_size, steps, ctx_len))
             return float(batch_size + steps + 1)
 
         worker.apply_runtime_state = apply_runtime_state
@@ -796,34 +822,49 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
         self.assertEqual(
             profile_calls,
-            [(4, 0), (8, 0), (4, 1), (8, 1), (4, 2), (8, 2)],
+            [
+                (4, 0, 256),
+                (8, 0, 256),
+                (4, 1, 256),
+                (8, 1, 256),
+                (4, 2, 256),
+                (8, 2, 256),
+            ],
         )
         self.assertEqual(worker.adaptive_controller.candidate_steps, [0, 1, 2])
         self.assertEqual(
-            worker.adaptive_controller._cost_table.lookup(batch_size=5, steps=2),
+            worker.adaptive_controller._cost_table.lookup(
+                batch_size=5, steps=2, ctx_len=256
+            ),
             11.0,
         )
         self.assertIn(
-            "(bs=8, steps=2): 11.0000ms",
+            "(bs=8, steps=2, ctx=256): 11.0000ms",
             worker.server_args._decoupled_verify_throughput_cost_table_summary,
         )
 
     def test_startup_throughput_profile_loads_matching_cache_without_measurement(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                return_value="NVIDIA H100",
+            ),
+        ):
             worker = self._make_throughput_profile_worker()
-            basename = VerifyWorker._expected_throughput_profile_cache_basename(
-                worker, [4, 8]
-            )
-            fingerprint = VerifyWorker._throughput_profile_fingerprint(worker, [4, 8])
-            self.assertNotIn("draft", basename)
+            fingerprint = VerifyWorker._throughput_profile_fingerprint(worker)
             self.assertNotIn("draft_model_path", fingerprint)
             self.assertNotIn("draft_tp_size", fingerprint)
-            cache_path = os.path.join(tmpdir, basename)
+            self.assertEqual(fingerprint["gpu_name"], "NVIDIA H100")
+            cache_path = os.path.join(tmpdir, "any-cache-file-name.json")
             worker.server_args.decoupled_verify_throughput_profile_path = cache_path
             with open(cache_path, "w") as f:
-                json.dump(self._throughput_profile_cache_payload(worker), f)
+                payload = self._throughput_profile_cache_payload(worker)
+                payload["fingerprint"]["extra_ignored"] = "ok"
+                payload["top_level_extra_ignored"] = "ok"
+                json.dump(payload, f)
 
             with (
                 patch.object(
@@ -839,11 +880,13 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
         self.assertEqual(worker.adaptive_controller.candidate_steps, [0, 1, 2])
         self.assertEqual(
-            worker.adaptive_controller._cost_table.lookup(batch_size=5, steps=2),
+            worker.adaptive_controller._cost_table.lookup(
+                batch_size=5, steps=2, ctx_len=256
+            ),
             11.0,
         )
         self.assertIn(
-            "(bs=8, steps=2): 11.0000ms",
+            "(bs=8, steps=2, ctx=256): 11.0000ms",
             worker.server_args._decoupled_verify_throughput_cost_table_summary,
         )
         self.assertTrue(
@@ -853,37 +896,166 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             )
         )
 
+    def test_startup_throughput_profile_reuses_partial_cache(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                return_value="NVIDIA H100",
+            ),
+        ):
+            worker = self._make_throughput_profile_worker()
+            cache_path = os.path.join(tmpdir, "partial.json")
+            worker.server_args.decoupled_verify_throughput_profile_path = cache_path
+            with open(cache_path, "w") as f:
+                json.dump(
+                    self._throughput_profile_cache_payload(worker, omit_last=True),
+                    f,
+                )
+
+            profile_calls = []
+
+            def profile_shape(_worker, batch_size, steps, ctx_len, state, tree_cache):
+                profile_calls.append((batch_size, steps, ctx_len))
+                return float(batch_size + steps + 1)
+
+            with (
+                patch.object(
+                    VerifyWorker,
+                    "_profile_throughput_shape",
+                    profile_shape,
+                ),
+                patch(
+                    "sglang.srt.speculative.decoupled_verify_worker."
+                    "log_info_on_rank0"
+                ),
+            ):
+                VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
+
+            self.assertEqual(profile_calls, [(8, 2, 256)])
+            self.assertEqual(
+                worker.adaptive_controller._cost_table.lookup(
+                    batch_size=5, steps=2, ctx_len=256
+                ),
+                11.0,
+            )
+            with open(cache_path) as f:
+                payload = json.load(f)
+            self.assertNotIn("schema_version", payload)
+            self.assertEqual(len(payload["costs"]), 6)
+
+    def test_startup_throughput_profile_skips_invalid_cache_row(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                return_value="NVIDIA H100",
+            ),
+        ):
+            worker = self._make_throughput_profile_worker()
+            cache_path = os.path.join(tmpdir, "invalid-row.json")
+            worker.server_args.decoupled_verify_throughput_profile_path = cache_path
+            with open(cache_path, "w") as f:
+                json.dump(
+                    self._throughput_profile_cache_payload(worker, invalid_last=True),
+                    f,
+                )
+
+            profile_calls = []
+
+            def profile_shape(_worker, batch_size, steps, ctx_len, state, tree_cache):
+                profile_calls.append((batch_size, steps, ctx_len))
+                return float(batch_size + steps + 1)
+
+            with (
+                patch.object(
+                    VerifyWorker,
+                    "_profile_throughput_shape",
+                    profile_shape,
+                ),
+                patch(
+                    "sglang.srt.speculative.decoupled_verify_worker."
+                    "log_info_on_rank0"
+                ) as log_mock,
+            ):
+                VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
+
+            self.assertEqual(profile_calls, [(8, 2, 256)])
+            self.assertTrue(
+                any(
+                    "skipped_invalid_entries=1" in call.args[1]
+                    for call in log_mock.call_args_list
+                )
+            )
+            with open(cache_path) as f:
+                payload = json.load(f)
+            self.assertNotIn("schema_version", payload)
+            self.assertEqual(len(payload["costs"]), 6)
+
     def test_startup_throughput_profile_cache_misses_profile_and_rewrite(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
-        cases = ("missing", "basename_mismatch", "malformed_json", "incomplete")
+        cases = (
+            "missing",
+            "malformed_json",
+            "missing_fingerprint",
+            "missing_costs",
+            "metadata_mismatch",
+            "gpu_mismatch",
+        )
         for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as tmpdir,
+                patch(
+                    "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                    return_value="NVIDIA H100",
+                ),
+            ):
                 worker = self._make_throughput_profile_worker()
-                basename = VerifyWorker._expected_throughput_profile_cache_basename(
-                    worker, [4, 8]
-                )
-                cache_path = os.path.join(
-                    tmpdir,
-                    "wrong-name.json" if case == "basename_mismatch" else basename,
-                )
+                cache_path = os.path.join(tmpdir, f"{case}.json")
                 worker.server_args.decoupled_verify_throughput_profile_path = cache_path
                 if case == "malformed_json":
                     with open(cache_path, "w") as f:
                         f.write("{not-json")
-                elif case == "incomplete":
+                elif case == "missing_fingerprint":
                     with open(cache_path, "w") as f:
                         json.dump(
                             self._throughput_profile_cache_payload(
-                                worker, omit_last=True
+                                worker, include_fingerprint=False
+                            ),
+                            f,
+                        )
+                elif case == "missing_costs":
+                    with open(cache_path, "w") as f:
+                        json.dump(
+                            self._throughput_profile_cache_payload(
+                                worker, include_costs=False
+                            ),
+                            f,
+                        )
+                elif case in ("metadata_mismatch", "gpu_mismatch"):
+                    fingerprint = worker._throughput_profile_fingerprint()
+                    if case == "metadata_mismatch":
+                        fingerprint["target_model_path"] = "/models/other-target"
+                    else:
+                        fingerprint["gpu_name"] = "NVIDIA A100"
+                    with open(cache_path, "w") as f:
+                        json.dump(
+                            self._throughput_profile_cache_payload(
+                                worker, fingerprint=fingerprint
                             ),
                             f,
                         )
 
                 profile_calls = []
 
-                def profile_shape(_worker, batch_size, steps, state, tree_cache):
-                    profile_calls.append((batch_size, steps))
+                def profile_shape(_worker, batch_size, steps, ctx_len, state, tree_cache):
+                    profile_calls.append((batch_size, steps, ctx_len))
                     return float(batch_size + steps + 1)
 
                 with (
@@ -903,11 +1075,19 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
                 self.assertEqual(
                     profile_calls,
-                    [(4, 0), (8, 0), (4, 1), (8, 1), (4, 2), (8, 2)],
+                    [
+                        (4, 0, 256),
+                        (8, 0, 256),
+                        (4, 1, 256),
+                        (8, 1, 256),
+                        (4, 2, 256),
+                        (8, 2, 256),
+                    ],
                 )
                 with open(cache_path) as f:
                     payload = json.load(f)
-                self.assertEqual(payload["schema_version"], 1)
+                self.assertNotIn("schema_version", payload)
+                self.assertEqual(payload["fingerprint"]["gpu_name"], "NVIDIA H100")
                 self.assertEqual(len(payload["costs"]), 6)
 
     def test_zero_step_runtime_state_builds_decode_graph_runner(self):
