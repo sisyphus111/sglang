@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -80,6 +81,7 @@ class DraftTailBuffer:
         self._condition = threading.Condition(self._lock)
         self._closed = False
         self._states: dict[str, RequestDraftTailState] = {}
+        self.last_draft_wait_ns = 0
 
     def close(self) -> None:
         with self._condition:
@@ -722,18 +724,22 @@ class DraftTailBuffer:
 
     def _wait_for_draft_tokens_locked(
         self, rids: list[str], min_draft_tokens: int
-    ) -> None:
+    ) -> int:
         min_draft_tokens = max(0, int(min_draft_tokens))
         if min_draft_tokens <= 0:
-            return
+            return 0
+        wait_ns = 0
         while not self._closed and not self._has_min_draft_tokens_locked(
             rids, min_draft_tokens
         ):
+            wait_start_ns = time.perf_counter_ns()
             self._condition.wait()
+            wait_ns += time.perf_counter_ns() - wait_start_ns
         if self._closed:
             raise RuntimeError(
                 "DraftTailBuffer closed while waiting for draft tail tokens."
             )
+        return wait_ns
 
     def wait_for_draft_tokens(self, rids: list[str], min_draft_tokens: int) -> None:
         """Wait until every request has at least N raw draft tokens buffered."""
@@ -752,12 +758,13 @@ class DraftTailBuffer:
         tail_cap = None if max_tail_len is None else max(0, int(max_tail_len))
         try:
             with self._condition:
+                self.last_draft_wait_ns = 0
                 if not allow_partial:
                     required_tail_len = self.required_tail_len
                     if tail_cap is not None:
                         required_tail_len = min(required_tail_len, tail_cap)
                     min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
-                    self._wait_for_draft_tokens_locked(
+                    self.last_draft_wait_ns = self._wait_for_draft_tokens_locked(
                         [req.rid for req in reqs], min_raw_tail_len
                     )
 

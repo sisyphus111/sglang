@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WINDOW_SIZE = 50
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_UPDATE_INTERVAL = 5
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS = 0.1
+DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS = 3.0
 
 
 def parse_decoupled_verify_throughput_profile_ctx_lens(
@@ -58,6 +59,12 @@ def parse_decoupled_verify_throughput_profile_ctx_lens(
 
 def _ta_debug_enabled() -> bool:
     return os.environ.get("SGLANG_TA_DEBUG") == "1"
+
+
+def _with_runtime_cpu_overhead_ms(profile_cost_ms: Optional[float]) -> Optional[float]:
+    if profile_cost_ms is None:
+        return None
+    return float(profile_cost_ms) + DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS
 
 
 class PositionAcceptanceTracker:
@@ -256,9 +263,10 @@ def score_decoupled_verify_candidates(
         steps = int(raw_steps)
         position_accept_rates = tracker.snapshot_position_rates(steps)
         expected = tracker.get_expected_tokens(steps)
-        cost_ms, matched_batch_size, matched_ctx_len = cost_table.lookup_with_match(
-            batch_size, steps, ctx_len
+        profile_cost_ms, matched_batch_size, matched_ctx_len = (
+            cost_table.lookup_with_match(batch_size, steps, ctx_len)
         )
+        cost_ms = _with_runtime_cpu_overhead_ms(profile_cost_ms)
         score = (
             expected / cost_ms
             if expected is not None and cost_ms is not None and cost_ms > 0
@@ -269,6 +277,12 @@ def score_decoupled_verify_candidates(
                 "steps": steps,
                 "expected": expected,
                 "cost_ms": cost_ms,
+                "profile_cost_ms": profile_cost_ms,
+                "runtime_cpu_overhead_ms": (
+                    DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS
+                    if profile_cost_ms is not None
+                    else None
+                ),
                 "ctx_len": ctx_len,
                 "matched_batch_size": matched_batch_size,
                 "matched_ctx_len": matched_ctx_len,
@@ -329,6 +343,8 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         marker = "*" if int(row["steps"]) == int(best_steps) else ""
         expected = row["expected"]
         cost_ms = row["cost_ms"]
+        profile_cost_ms = row.get("profile_cost_ms")
+        runtime_cpu_overhead_ms = row.get("runtime_cpu_overhead_ms")
         score = row["score"]
         ctx_len = row.get("ctx_len")
         matched_ctx_len = row.get("matched_ctx_len")
@@ -349,9 +365,15 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         if score is None:
             parts.append(f"S={row['steps']}:score=?{ctx_text}{rate_text}{marker}")
         else:
+            cost_source_text = ""
+            if profile_cost_ms is not None and runtime_cpu_overhead_ms is not None:
+                cost_source_text = (
+                    f",profile_cost={profile_cost_ms:.4f}ms"
+                    f",cpu_overhead={runtime_cpu_overhead_ms:.4f}ms"
+                )
             parts.append(
                 f"S={row['steps']}:E={expected:.3f}/cost={cost_ms:.4f}ms"
-                f"={score:.6f}{ctx_text}{rate_text}{marker}"
+                f"={score:.6f}{cost_source_text}{ctx_text}{rate_text}{marker}"
             )
     return "[" + ", ".join(parts) + "]"
 
@@ -434,6 +456,34 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
 
     def cost_table_items(self) -> list[tuple[int, int, int, float]]:
         return self._cost_table.items()
+
+    def get_modeled_throughput(
+        self, *, batch_size: int, ctx_len: int, accept_length: float
+    ) -> Optional[dict]:
+        ctx_len = max(1, int(ctx_len))
+        profile_cost_ms, matched_batch_size, matched_ctx_len = (
+            self._cost_table.lookup_with_match(batch_size, self._current_steps, ctx_len)
+        )
+        cost_ms = _with_runtime_cpu_overhead_ms(profile_cost_ms)
+        accept_length = float(accept_length)
+        if (
+            cost_ms is None
+            or cost_ms <= 0
+            or not math.isfinite(accept_length)
+            or accept_length < 0
+        ):
+            return None
+        return {
+            "modeled_throughput": int(batch_size) * accept_length * 1000.0 / cost_ms,
+            "batch_size": int(batch_size),
+            "steps": int(self._current_steps),
+            "ctx_len": ctx_len,
+            "matched_batch_size": matched_batch_size,
+            "matched_ctx_len": matched_ctx_len,
+            "cost_ms": cost_ms,
+            "profile_cost_ms": profile_cost_ms,
+            "runtime_cpu_overhead_ms": DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS,
+        }
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

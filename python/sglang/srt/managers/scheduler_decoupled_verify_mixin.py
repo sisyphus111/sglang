@@ -133,6 +133,26 @@ class SchedulerDecoupledVerifyMixin:
             ),
         )
 
+    def _decoupled_verify_modeled_throughput(
+        self: Scheduler, batch: ScheduleBatch, accept_length: float
+    ) -> Optional[dict]:
+        if (
+            batch is None
+            or not dynamic_verify_enabled(self.server_args)
+            or not self.spec_algorithm.is_decoupled_verify()
+        ):
+            return None
+        get_modeled_throughput = getattr(
+            self.model_worker, "get_modeled_throughput", None
+        )
+        if get_modeled_throughput is None:
+            return None
+        return get_modeled_throughput(
+            batch.batch_size(),
+            self._decoupled_verify_avg_ctx_len(batch),
+            accept_length,
+        )
+
     def _maybe_log_decoupled_verify_state_selection(
         self: Scheduler, raw_batch_size: int
     ) -> None:
@@ -838,6 +858,9 @@ class SchedulerDecoupledVerifyMixin:
                 include_raw_tail_tokens=trace_enabled,
                 max_tail_len=snapshot_tail_cap,
             )
+            self._decoupled_verify_draft_wait_ns_since_log = getattr(
+                self, "_decoupled_verify_draft_wait_ns_since_log", 0
+            ) + int(draft_tail_buffer.last_draft_wait_ns)
 
         synced_snapshots = self._broadcast_verify_snapshots(local_snapshots)
         num_stale_snapshots = self._bind_verify_snapshots(

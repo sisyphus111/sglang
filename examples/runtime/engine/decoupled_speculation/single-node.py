@@ -194,6 +194,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=None,
+        help="Override SGLang mem_fraction_static for all engines in this run.",
+    )
+    parser.add_argument(
+        "--chunked-prefill-size",
+        type=int,
+        default=None,
+        help="Override SGLang chunked_prefill_size for all engines in this run.",
+    )
+    parser.add_argument(
+        "--max-prefill-tokens",
+        type=int,
+        default=None,
+        help="Override SGLang max_prefill_tokens for all engines in this run.",
+    )
+    parser.add_argument(
         "--num-speculative-steps",
         type=int,
         default=3,
@@ -235,6 +253,23 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional JSON cost-table cache file for decoupled verifier "
             "throughput-aware startup profiling."
+        ),
+    )
+    parser.add_argument(
+        "--decoupled-verify-throughput-profile-ctx-lens",
+        default=None,
+        help=(
+            "Comma-separated verifier context lengths for decoupled verifier "
+            "throughput-aware startup profiling."
+        ),
+    )
+    parser.add_argument(
+        "--decode-log-interval",
+        type=int,
+        default=None,
+        help=(
+            "Override SGLang decode_log_interval for the verifier, drafter, "
+            "and baseline engines."
         ),
     )
     parser.add_argument(
@@ -730,6 +765,14 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
+    if args.mem_fraction_static is not None and not (0 < args.mem_fraction_static < 1):
+        raise ValueError("mem-fraction-static must be in (0, 1) when set")
+    if args.chunked_prefill_size == 0:
+        raise ValueError("chunked-prefill-size must be non-zero when set")
+    if args.max_prefill_tokens is not None and args.max_prefill_tokens <= 0:
+        raise ValueError("max-prefill-tokens must be positive when set")
+    if args.decode_log_interval is not None and args.decode_log_interval <= 0:
+        raise ValueError("decode-log-interval must be positive when set")
     if args.cuda_graph_bs_decode is not None:
         args.cuda_graph_bs_decode = [
             int(item)
@@ -819,8 +862,13 @@ def run_draft_engine_process(
     tp_size: int,
     speculative_num_steps: int,
     max_running_requests: int | None,
+    cuda_graph_bs_decode: list[int] | None,
     deterministic: bool,
     spec_trace_dir: str | None,
+    decode_log_interval: int | None,
+    mem_fraction_static: float | None,
+    chunked_prefill_size: int | None,
+    max_prefill_tokens: int | None,
     ready_queue,
     control_reader,
 ) -> None:
@@ -839,8 +887,18 @@ def run_draft_engine_process(
             spec_trace_dir=spec_trace_dir,
             decoupled_spec_rank_base=rank,
         )
+        if cuda_graph_bs_decode is not None:
+            engine_kwargs["cuda_graph_bs_decode"] = cuda_graph_bs_decode
         if max_running_requests is not None:
             engine_kwargs["max_running_requests"] = max_running_requests
+        if decode_log_interval is not None:
+            engine_kwargs["decode_log_interval"] = decode_log_interval
+        if mem_fraction_static is not None:
+            engine_kwargs["mem_fraction_static"] = mem_fraction_static
+        if chunked_prefill_size is not None:
+            engine_kwargs["chunked_prefill_size"] = chunked_prefill_size
+        if max_prefill_tokens is not None:
+            engine_kwargs["max_prefill_tokens"] = max_prefill_tokens
         engine = sgl.Engine(**engine_kwargs)
         endpoint_infos = engine.get_decoupled_spec_endpoint_infos()
         ready_queue.put(
@@ -998,8 +1056,13 @@ def start_draft_engines(
                     tp_size=args.draft_tp_size,
                     speculative_num_steps=args.num_speculative_steps,
                     max_running_requests=args.max_running_requests,
+                    cuda_graph_bs_decode=args.cuda_graph_bs_decode,
                     deterministic=args.deterministic,
                     spec_trace_dir=args.spec_trace_dir,
+                    decode_log_interval=args.decode_log_interval,
+                    mem_fraction_static=args.mem_fraction_static,
+                    chunked_prefill_size=args.chunked_prefill_size,
+                    max_prefill_tokens=args.max_prefill_tokens,
                     ready_queue=ready_queue,
                     control_reader=control_reader,
                 ),
@@ -1095,6 +1158,23 @@ def shutdown_draft_engines(processes: list[mp.Process], stop_senders) -> None:
         process.join(timeout=10)
 
 
+def apply_common_engine_overrides(
+    engine_kwargs: dict[str, Any], args: argparse.Namespace
+) -> None:
+    if args.cuda_graph_bs_decode is not None:
+        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
+    if args.max_running_requests is not None:
+        engine_kwargs["max_running_requests"] = args.max_running_requests
+    if args.decode_log_interval is not None:
+        engine_kwargs["decode_log_interval"] = args.decode_log_interval
+    if args.mem_fraction_static is not None:
+        engine_kwargs["mem_fraction_static"] = args.mem_fraction_static
+    if args.chunked_prefill_size is not None:
+        engine_kwargs["chunked_prefill_size"] = args.chunked_prefill_size
+    if args.max_prefill_tokens is not None:
+        engine_kwargs["max_prefill_tokens"] = args.max_prefill_tokens
+
+
 def create_verifier_engine(
     args: argparse.Namespace,
     *,
@@ -1121,10 +1201,7 @@ def create_verifier_engine(
         log_level="info",
         decoupled_spec_rank_base=0,
     )
-    if args.cuda_graph_bs_decode is not None:
-        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
-    if args.max_running_requests is not None:
-        engine_kwargs["max_running_requests"] = args.max_running_requests
+    apply_common_engine_overrides(engine_kwargs, args)
     if args.speculative_adaptive:
         engine_kwargs["speculative_adaptive"] = True
         engine_kwargs["speculative_adaptive_strategy"] = (
@@ -1137,6 +1214,10 @@ def create_verifier_engine(
         if args.decoupled_verify_throughput_profile_path is not None:
             engine_kwargs["decoupled_verify_throughput_profile_path"] = (
                 args.decoupled_verify_throughput_profile_path
+            )
+        if args.decoupled_verify_throughput_profile_ctx_lens is not None:
+            engine_kwargs["decoupled_verify_throughput_profile_ctx_lens"] = (
+                args.decoupled_verify_throughput_profile_ctx_lens
             )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
@@ -1169,10 +1250,7 @@ def create_decode_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
-    if args.cuda_graph_bs_decode is not None:
-        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
-    if args.max_running_requests is not None:
-        engine_kwargs["max_running_requests"] = args.max_running_requests
+    apply_common_engine_overrides(engine_kwargs, args)
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:
@@ -1210,10 +1288,7 @@ def create_mtp_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
-    if args.cuda_graph_bs_decode is not None:
-        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
-    if args.max_running_requests is not None:
-        engine_kwargs["max_running_requests"] = args.max_running_requests
+    apply_common_engine_overrides(engine_kwargs, args)
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
         if available_ports is not None:

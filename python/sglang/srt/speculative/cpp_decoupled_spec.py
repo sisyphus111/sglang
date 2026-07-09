@@ -205,6 +205,7 @@ class CppDraftTailBuffer:
         self._cpp = module.DraftTailBuffer(int(verifier_rank), int(required_tail_len))
         self.verifier_rank = int(verifier_rank)
         self.required_tail_len = max(0, int(required_tail_len))
+        self.last_draft_wait_ns = 0
 
     def close(self) -> None:
         self._cpp.close()
@@ -291,12 +292,13 @@ class CppDraftTailBuffer:
     ) -> list[DraftTailSnapshot]:
         rids = [str(req.rid) for req in reqs]
         tail_cap = -1 if max_tail_len is None else max(0, int(max_tail_len))
-        rows = self._cpp.get_draft_snapshots_native(
+        rows, wait_ns = self._cpp.get_draft_snapshots_native(
             rids,
             bool(allow_partial),
             bool(include_raw_tail_tokens),
             int(tail_cap),
         )
+        self.last_draft_wait_ns = int(wait_ns)
         return [
             DraftTailSnapshot(
                 request_id=str(row[0]),

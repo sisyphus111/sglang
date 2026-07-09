@@ -885,6 +885,11 @@ struct DraftTailSnapshotCpp {
   std::vector<int32_t> raw_tail_tokens;
 };
 
+struct DraftTailSnapshotBatchCpp {
+  std::vector<DraftTailSnapshotCpp> snapshots;
+  int64_t wait_ns = 0;
+};
+
 struct CommitStatCpp {
   std::string request_id;
   int64_t pre_committed_len = 0;
@@ -1127,7 +1132,7 @@ class DraftTailBufferCore {
     }
   }
 
-  std::vector<DraftTailSnapshotCpp> get_draft_snapshots_native(
+  DraftTailSnapshotBatchCpp get_draft_snapshots_native(
       const std::vector<std::string>& rids,
       bool allow_partial,
       bool include_raw_tail_tokens,
@@ -1136,6 +1141,7 @@ class DraftTailBufferCore {
                         static_cast<int64_t>(rids.size()));
     int64_t tail_cap = std::max<int64_t>(-1, max_tail_len);
     std::unique_lock<std::mutex> lock(mu_);
+    int64_t wait_ns = 0;
     if (!allow_partial) {
       int64_t required_tail_len = required_tail_len_;
       if (tail_cap >= 0) {
@@ -1143,9 +1149,11 @@ class DraftTailBufferCore {
       }
       int64_t min_raw_tail_len =
           std::max<int64_t>(tail_cap == 0 ? 0 : 1, required_tail_len);
-      cv_.wait(lock, [&] {
-        return closed_ || has_min_draft_tokens_locked(rids, min_raw_tail_len);
-      });
+      while (!closed_ && !has_min_draft_tokens_locked(rids, min_raw_tail_len)) {
+        int64_t wait_start_ns = now_ns();
+        cv_.wait(lock);
+        wait_ns += now_ns() - wait_start_ns;
+      }
       if (closed_) {
         throw std::runtime_error("DraftTailBuffer closed while waiting for draft tail tokens.");
       }
@@ -1191,7 +1199,7 @@ class DraftTailBufferCore {
         snapshot_returned_total,
         snapshot_returned_max,
         allow_partial);
-    return snapshots;
+    return {std::move(snapshots), wait_ns};
   }
 
   std::string profile_json() { return profiler_.to_json(); }
@@ -1927,7 +1935,7 @@ class DecoupledSpecDraftTailBuffer {
     core_->wait_for_draft_tokens(rid_vec, min_draft_tokens);
   }
 
-  py::list get_draft_snapshots_native(
+  py::tuple get_draft_snapshots_native(
       const py::sequence& rids,
       bool allow_partial,
       bool include_raw_tail_tokens,
@@ -1936,17 +1944,17 @@ class DecoupledSpecDraftTailBuffer {
         "pybind.tail_buffer.get_draft_snapshots_native",
         static_cast<int64_t>(py::len(rids)));
     auto rid_vec = py_string_vector(rids);
-    std::vector<DraftTailSnapshotCpp> snapshots;
+    DraftTailSnapshotBatchCpp snapshot_batch;
     {
       py::gil_scoped_release release;
-      snapshots = core_->get_draft_snapshots_native(
+      snapshot_batch = core_->get_draft_snapshots_native(
           rid_vec,
           allow_partial,
           include_raw_tail_tokens,
           max_tail_len);
     }
     py::list out;
-    for (const auto& snapshot : snapshots) {
+    for (const auto& snapshot : snapshot_batch.snapshots) {
       out.append(py::make_tuple(
           snapshot.request_id,
           snapshot.committed_len,
@@ -1954,7 +1962,7 @@ class DecoupledSpecDraftTailBuffer {
           snapshot.raw_tail_len,
           snapshot.raw_tail_tokens));
     }
-    return out;
+    return py::make_tuple(out, snapshot_batch.wait_ns);
   }
 
   std::string profile_json() { return core_->profile_json(); }

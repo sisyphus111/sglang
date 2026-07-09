@@ -1,3 +1,4 @@
+import threading
 import time
 import unittest
 
@@ -120,11 +121,12 @@ class TestDecoupledSpecCppPybind(unittest.TestCase):
                 [(0, 0, "req-native", 1, 1, 10)],
                 False,
             )
-            snapshots = buffer.get_draft_snapshots_native(
+            snapshots, wait_ns = buffer.get_draft_snapshots_native(
                 ["req-native"], True, True, -1
             )
             self.assertEqual(snapshots[0][0], "req-native")
             self.assertEqual(snapshots[0][2], [10])
+            self.assertEqual(wait_ns, 0)
 
             proxy = module.DraftProxyThread(0, "127.0.0.1", buffer)
             for name in ["configure_peer_endpoints", "submit_control_batch"]:
@@ -157,6 +159,38 @@ class TestDecoupledSpecCppPybind(unittest.TestCase):
         finally:
             py_buffer.close()
             cpp_buffer.close()
+
+    def test_draft_tail_buffer_reports_only_blocked_wait_time(self):
+        for buffer_cls in (DraftTailBuffer, CppDraftTailBuffer):
+            with self.subTest(buffer_cls=buffer_cls.__name__):
+                rid = f"wait-{buffer_cls.__name__}"
+                buffer = buffer_cls(verifier_rank=0, required_tail_len=1)
+                try:
+                    buffer.open_requests([DraftSync(rid, 0, 0, [1, 2], [3])])
+                    timer = threading.Timer(
+                        0.02,
+                        buffer.append_draft_stream_batch,
+                        args=(
+                            DraftTailStreamOutputBatch(
+                                [DraftTailStreamOutput(0, 0, rid, 1, 1, 10)]
+                            ),
+                        ),
+                    )
+                    timer.start()
+                    snapshots = buffer.get_draft_snapshots(
+                        [_Req(rid)], allow_partial=False, max_tail_len=1
+                    )
+                    timer.join()
+
+                    self.assertEqual(snapshots[0].tail_tokens, [10])
+                    self.assertGreater(buffer.last_draft_wait_ns, 0)
+
+                    buffer.get_draft_snapshots(
+                        [_Req(rid)], allow_partial=True, max_tail_len=1
+                    )
+                    self.assertEqual(buffer.last_draft_wait_ns, 0)
+                finally:
+                    buffer.close()
 
     def test_cpp_proxy_token_sync_roundtrip(self):
         buffer = CppDraftTailBuffer(verifier_rank=0, required_tail_len=2)

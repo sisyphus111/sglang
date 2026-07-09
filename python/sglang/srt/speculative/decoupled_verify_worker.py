@@ -21,7 +21,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -735,9 +735,9 @@ class VerifyWorker(BaseSpecWorker):
 
         try:
             keep_alive_refs = []
-            keep_alive_refs.extend(
-                self._run_throughput_profile_prefill(batch).extra_keep_alive_refs
-                or []
+            self._prepare_throughput_profile_decode_state(
+                batch=batch,
+                seq_len=ctx_len,
             )
             for _ in range(_THROUGHPUT_PROFILE_WARMUP_ITERS):
                 self._prepare_throughput_profile_draft_buffers(batch, steps)
@@ -774,9 +774,9 @@ class VerifyWorker(BaseSpecWorker):
         seq_len: int,
         tree_cache,
     ) -> tuple[list[Req], ScheduleBatch]:
-        seq_len = int(seq_len)
+        profile_seq_len = int(seq_len)
         self._validate_throughput_profile_prompt_len(
-            seq_len=seq_len,
+            seq_len=profile_seq_len,
             batch_size=batch_size,
         )
         vocab_size = int(getattr(self.model_config, "vocab_size", 32000) or 32000)
@@ -794,18 +794,18 @@ class VerifyWorker(BaseSpecWorker):
         for i in range(int(batch_size)):
             token_ids = array(
                 "q",
-                [((i + j) % token_mod) + 1 for j in range(seq_len)],
+                [((i + j) % token_mod) + 1 for j in range(1)],
             )
             req = Req(
                 rid=(
-                    f"decoupled-throughput-profile-{batch_size}-{seq_len}-"
+                    f"decoupled-throughput-profile-{batch_size}-{profile_seq_len}-"
                     f"{i}-{time.time_ns()}"
                 ),
                 origin_input_text="",
                 origin_input_ids=token_ids,
                 sampling_params=sampling_params,
                 extra_key=(
-                    f"decoupled-throughput-profile-{batch_size}-{seq_len}-"
+                    f"decoupled-throughput-profile-{batch_size}-{profile_seq_len}-"
                     f"{i}-{time.time_ns()}"
                 ),
             )
@@ -824,6 +824,64 @@ class VerifyWorker(BaseSpecWorker):
             spec_algorithm=self.speculative_algorithm,
         )
         return reqs, batch
+
+    def _prepare_throughput_profile_decode_state(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_len: int,
+    ) -> None:
+        """Build a decode-shaped profile batch without profiling full prefill.
+
+        Throughput-aware profile measures verifier decode latency. Running an
+        eager full prefill for every (bs, ctx_len) point makes high-bs/high-ctx
+        profile points dominated by synthetic setup memory instead of verifier
+        decode cost. This initializes the scheduler/KV metadata needed by the
+        normal verify path while avoiding that full prefill forward.
+        """
+        if self.page_size != 1:
+            raise RuntimeError(
+                "Decoupled verifier throughput-aware synthetic profile state "
+                "currently requires page_size == 1."
+            )
+
+        seq_len = int(seq_len)
+        batch.prepare_for_extend()
+        bs = batch.batch_size()
+        if bs == 0:
+            return
+
+        if seq_len > 1:
+            extra_len = seq_len - 1
+            extra_locs = alloc_token_slots(batch.tree_cache, bs * extra_len)
+            extra_locs = extra_locs.reshape(bs, extra_len).to(torch.int32)
+            for req_index, req in enumerate(batch.reqs):
+                batch.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(1, seq_len)),
+                    extra_locs[req_index],
+                )
+
+        seq_lens_cpu = torch.full((bs,), seq_len, dtype=torch.int64)
+        batch.seq_lens_cpu = seq_lens_cpu
+        batch.seq_lens = seq_lens_cpu.to(batch.device, non_blocking=True)
+        batch.orig_seq_lens = torch.full(
+            (bs,), seq_len, dtype=torch.int32, device=batch.device
+        )
+        batch.seq_lens_sum = int(seq_len * bs)
+        batch.input_ids = None
+        batch.prefill_input_ids_cpu = None
+
+        for req in batch.reqs:
+            req.fill_len = seq_len
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
+        bonus_tokens = torch.tensor(
+            [_get_req_tail_token_id(req) for req in batch.reqs],
+            dtype=torch.int32,
+            device=batch.device,
+        )
+        batch.spec_info = _build_next_draft_input_stub(bonus_tokens, self.topk)
 
     def _throughput_profile_decode_headroom(self, *, extra_iters: int) -> int:
         max_steps = self._throughput_max_speculative_steps()
@@ -867,23 +925,9 @@ class VerifyWorker(BaseSpecWorker):
             else None
         )
 
-        prefill_budget_candidates = [
-            int(value)
-            for value in (
-                getattr(self.server_args, "chunked_prefill_size", None),
-                getattr(self.server_args, "max_prefill_tokens", None),
-            )
-            if value is not None and int(value) > 0
-        ]
-        prefill_limited_len = (
-            min(prefill_budget_candidates) // batch_size
-            if prefill_budget_candidates
-            else None
-        )
         details = {
             "context_limit": context_limited_len,
             "kv_pool_limit": pool_limited_len,
-            "prefill_limit": prefill_limited_len,
         }
         return min(value for value in details.values() if value is not None), details
 
@@ -1060,7 +1104,23 @@ class VerifyWorker(BaseSpecWorker):
             if req.req_pool_idx is None and getattr(req, "mamba_pool_idx", None) is None:
                 continue
             try:
-                release_kv_cache(req, tree_cache, is_insert=False)
+                if len(req.prefix_indices) != 0:
+                    raise RuntimeError(
+                        "Decoupled verifier throughput-aware profile request "
+                        "unexpectedly matched prefix cache; profile teardown "
+                        f"cannot safely own prefix KV slots. rid={req.rid}, "
+                        f"prefix_len={len(req.prefix_indices)}"
+                    )
+                if req.req_pool_idx is not None:
+                    allocated_len = int(req.kv_allocated_len)
+                    if allocated_len > 0:
+                        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, :allocated_len
+                        ]
+                        tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+                    tree_cache.req_to_token_pool.free(req)
+                if getattr(req, "mamba_pool_idx", None) is not None:
+                    tree_cache.req_to_token_pool.free_mamba_cache(req)
             except Exception:
                 logger.exception(
                     "Failed to release decoupled verifier throughput-aware "
@@ -1093,6 +1153,19 @@ class VerifyWorker(BaseSpecWorker):
                 self.adaptive_controller.activate_step_by_batch(batch_size, ctx_len)
             else:
                 self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def get_modeled_throughput(
+        self, batch_size: int, ctx_len: int, accept_length: float
+    ) -> Optional[dict]:
+        if isinstance(
+            self.adaptive_controller, DecoupledVerifyThroughputAwareController
+        ):
+            return self.adaptive_controller.get_modeled_throughput(
+                batch_size=batch_size,
+                ctx_len=ctx_len,
+                accept_length=accept_length,
+            )
+        return None
 
     def build_adaptive_runtime_state(
         self,

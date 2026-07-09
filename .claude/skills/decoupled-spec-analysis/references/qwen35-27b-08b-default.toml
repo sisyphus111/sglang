@@ -1,0 +1,44 @@
+# Copy this file into a result directory and adjust only the requested experiment.
+
+[paths]
+repo = "/opt/tiger/sglang"
+entrypoint = "examples/runtime/engine/decoupled_speculation/single-node.py"
+dataset = "/mnt/hdfs/ssd_dtgl/datasets/DAPO-Math-17k/data/dapo-math-17k.parquet"
+target_model = "/mnt/hdfs/ssd_dtgl/models/Qwen/Qwen3.5-27B"
+draft_model = "/mnt/hdfs/ssd_dtgl/models/Qwen/Qwen3.5-0.8B"
+profile = "/opt/tiger/sglang/decoupled_verify_throughput_qwen35_27b_tp4.json"
+
+[parallelism]
+target_tp_size = 4
+draft_tp_size = 1
+n_gpu_per_node = 5
+verify_ngpus = 4
+draft_ngpus = 1
+
+[workload]
+dataset_format = "dapo_math_17k"
+batch_size = 64
+max_running_requests = 65
+max_new_tokens = 32768
+temperature = 1.0
+enable_thinking = true
+ignore_eos = false
+decode_log_interval = 1
+
+[profile]
+capture_bs = [1, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+ctx_lens = [1024, 2048, 4096, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
+steps = [0, 1, 2, 3, 4, 5]
+runtime_cpu_overhead_ms = 3.0
+mem_fraction_static = 0.74
+
+[matrix]
+static_steps = [0, 1, 2, 3]
+dynamic_max_steps = [1, 2, 3]
+allow_partial = [true, false]
+
+[environment]
+# Scheduler INFO remains enabled; these high-volume debug streams are deliberately off.
+SGLANG_TA_DEBUG = ""
+SGLANG_LOG_FORWARD_ITERS = ""
+SGLANG_RECORD_STEP_TIME = ""

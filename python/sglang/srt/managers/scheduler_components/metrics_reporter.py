@@ -690,6 +690,9 @@ class SchedulerMetricsReporter:
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        iter_latency_ms = (
+            gap_latency * 1000.0 / self.scheduler.server_args.decode_log_interval
+        )
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -708,7 +711,10 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, "
+            f"{token_usage_msg}iter latency (ms): {iter_latency_ms:.4f}, "
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -758,6 +764,41 @@ class SchedulerMetricsReporter:
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
+        modeled_throughput_msg = ""
+        get_modeled_throughput = getattr(
+            self.scheduler, "_decoupled_verify_modeled_throughput", None
+        )
+        if get_modeled_throughput is not None:
+            modeled = get_modeled_throughput(batch, spec_accept_length)
+            if modeled is not None:
+                modeled_throughput_msg = (
+                    "modeled throughput (token/s): "
+                    f"{modeled['modeled_throughput']:.2f}, "
+                    f"modeled step: {modeled['steps']}, "
+                    f"modeled cost (ms): {modeled['cost_ms']:.4f}, "
+                    f"profile cost (ms): {modeled['profile_cost_ms']:.4f}, "
+                    f"modeled ctx: {modeled['ctx_len']}->{modeled['matched_ctx_len']}, "
+                    f"modeled bs: {modeled['batch_size']}->"
+                    f"{modeled['matched_batch_size']}, "
+                )
+
+        draft_wait_msg = ""
+        if self.scheduler.spec_algorithm.is_decoupled_verify():
+            draft_wait_ns = int(
+                getattr(
+                    self.scheduler,
+                    "_decoupled_verify_draft_wait_ns_since_log",
+                    0,
+                )
+            )
+            draft_wait_ms = (
+                draft_wait_ns
+                / self.scheduler.server_args.decode_log_interval
+                / 1_000_000.0
+            )
+            draft_wait_msg = f"draft wait (ms): {draft_wait_ms:.4f}, "
+            self.scheduler._decoupled_verify_draft_wait_ns_since_log = 0
+
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -777,6 +818,8 @@ class SchedulerMetricsReporter:
 
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+            f"{modeled_throughput_msg}"
+            f"{draft_wait_msg}"
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )

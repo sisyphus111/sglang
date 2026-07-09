@@ -68,7 +68,7 @@ class _Scheduler(SchedulerDecoupledVerifyMixin):
             disable_cuda_graph=False,
         )
 
-        def activate_step_by_batch(batch_size):
+        def activate_step_by_batch(batch_size, avg_ctx_len=0):
             self.activations.append(batch_size)
 
         self.model_worker = SimpleNamespace(
@@ -841,6 +841,36 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertIn(
             "(bs=8, steps=2, ctx=256): 11.0000ms",
             worker.server_args._decoupled_verify_throughput_cost_table_summary,
+        )
+
+    def test_throughput_profile_prompt_limit_ignores_prefill_budget(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.speculative_num_steps = 5
+        worker.server_args = SimpleNamespace(
+            _decoupled_verify_max_speculative_steps=5,
+            chunked_prefill_size=8192,
+            max_prefill_tokens=16384,
+        )
+        worker.model_config = SimpleNamespace(context_len=262144)
+        decode_headroom = VerifyWorker._throughput_profile_decode_headroom(
+            worker, extra_iters=8
+        )
+        target_ctx_len = 24576
+        batch_size = 48
+        worker.token_to_kv_pool_allocator = SimpleNamespace(
+            available_size=lambda: batch_size * (target_ctx_len + decode_headroom + 1)
+        )
+
+        max_profile_len, details = VerifyWorker._throughput_profile_prompt_limit_details(
+            worker, batch_size=batch_size
+        )
+
+        self.assertNotIn("prefill_limit", details)
+        self.assertGreaterEqual(max_profile_len, target_ctx_len)
+        VerifyWorker._validate_throughput_profile_prompt_len(
+            worker, seq_len=target_ctx_len, batch_size=batch_size
         )
 
     def test_startup_throughput_profile_loads_matching_cache_without_measurement(self):

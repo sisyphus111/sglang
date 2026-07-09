@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Spec Analysis"
+  short_description: "Run and analyze decoupled speculation experiments"
+  default_prompt: "Use $decoupled-spec-analysis to analyze decoupled speculation logs against a throughput profile."
