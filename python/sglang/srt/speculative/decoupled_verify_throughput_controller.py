@@ -53,10 +53,6 @@ class PositionAcceptanceTracker:
             accepted = num_reqs - cumulative_rejected_or_stopped
             self._windows[position].append(accepted / num_reqs)
 
-    def clear_positions_above(self, steps: int) -> None:
-        for position in range(max(0, int(steps)), self.max_steps):
-            self._windows[position].clear()
-
     def all_positions_warmed(self, target_steps: int) -> bool:
         target_steps = min(max(0, int(target_steps)), self.max_steps)
         return all(
@@ -424,8 +420,6 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             if best_score is not None and current_score is not None and current_score > 0
             else None
         )
-        if best_steps < old_steps:
-            self._tracker.clear_positions_above(best_steps)
         self._current_steps = best_steps
         if _ta_debug_enabled():
             log_info_on_rank0(

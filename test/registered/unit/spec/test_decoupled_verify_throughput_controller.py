@@ -154,6 +154,29 @@ class TestDecoupledVerifyThroughputAwareController(unittest.TestCase):
         self.assertEqual(worker.speculative_num_steps, 1)
         self.assertEqual(worker.applied_steps[-1], 1)
 
+    def test_shrink_preserves_higher_position_windows(self):
+        worker = _Worker(initial_steps=3)
+        controller = DecoupledVerifyThroughputAwareController(
+            worker,
+            candidate_steps=[1, 3],
+            initial_steps=3,
+            window_size=1,
+            update_interval=1,
+            switch_hysteresis=0.0,
+        )
+        for steps in [1, 3]:
+            controller.register(_state(steps), steps=steps)
+        controller.set_profile_cost(batch_size=4, steps=1, cost_ms=1.0)
+        controller.set_profile_cost(batch_size=4, steps=3, cost_ms=100.0)
+        controller.init_states(cuda_graph_bs=[4])
+
+        controller.on_verify_complete([3, 3], batch_size=2)
+        controller.activate_step_by_batch(4)
+
+        self.assertEqual(worker.speculative_num_steps, 1)
+        self.assertFalse(controller._tracker.is_position_extrapolated(1))
+        self.assertFalse(controller._tracker.is_position_extrapolated(2))
+
 
 if __name__ == "__main__":
     unittest.main()
