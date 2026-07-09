@@ -22,6 +22,40 @@ DEFAULT_DECOUPLED_VERIFY_TP_AWARE_UPDATE_INTERVAL = 5
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS = 0.1
 
 
+def parse_decoupled_verify_throughput_profile_ctx_lens(
+    raw: Optional[str],
+) -> Optional[list[int]]:
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(
+                "decoupled verifier throughput profile ctx lens must be a "
+                f"comma-separated list of positive integers, got {raw!r}."
+            )
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(
+                "decoupled verifier throughput profile ctx lens must be a "
+                f"comma-separated list of positive integers, got {raw!r}."
+            ) from exc
+        if value <= 0:
+            raise ValueError(
+                "decoupled verifier throughput profile ctx lens must be positive, "
+                f"got {value} in {raw!r}."
+            )
+        values.append(value)
+
+    return sorted(set(values))
+
+
 def _ta_debug_enabled() -> bool:
     return os.environ.get("SGLANG_TA_DEBUG") == "1"
 
@@ -114,44 +148,83 @@ class PositionAcceptanceTracker:
 
 
 class BatchSizeCostTable:
-    """Stores verifier decode cost in milliseconds for (batch_size, steps)."""
+    """Stores verifier decode cost in milliseconds for (batch_size, steps, ctx)."""
 
     def __init__(self) -> None:
-        self._data: dict[tuple[int, int], float] = {}
+        self._data: dict[tuple[int, int, int], float] = {}
         self._batch_sizes_by_step: dict[int, list[int]] = {}
+        self._ctx_lens_by_step_bs: dict[tuple[int, int], list[int]] = {}
 
-    def set(self, batch_size: int, steps: int, cost_ms: float) -> None:
+    def set(self, batch_size: int, steps: int, ctx_len: int, cost_ms: float) -> None:
         batch_size = int(batch_size)
         steps = int(steps)
+        ctx_len = int(ctx_len)
         cost_ms = float(cost_ms)
-        if batch_size <= 0 or steps < 0 or not math.isfinite(cost_ms) or cost_ms <= 0:
+        if (
+            batch_size <= 0
+            or steps < 0
+            or ctx_len <= 0
+            or not math.isfinite(cost_ms)
+            or cost_ms <= 0
+        ):
             raise ValueError(
                 "Cost table entries require positive batch size, non-negative "
-                f"steps, and positive finite cost, got bs={batch_size}, "
-                f"steps={steps}, cost_ms={cost_ms}."
+                "steps, positive ctx_len, and positive finite cost, got "
+                f"bs={batch_size}, steps={steps}, ctx_len={ctx_len}, "
+                f"cost_ms={cost_ms}."
             )
 
-        self._data[(batch_size, steps)] = cost_ms
+        self._data[(batch_size, steps, ctx_len)] = cost_ms
         self._batch_sizes_by_step[steps] = sorted(
             set(self._batch_sizes_by_step.get(steps, [])) | {batch_size}
         )
+        self._ctx_lens_by_step_bs[(steps, batch_size)] = sorted(
+            set(self._ctx_lens_by_step_bs.get((steps, batch_size), [])) | {ctx_len}
+        )
 
-    def lookup(self, batch_size: int, steps: int) -> Optional[float]:
+    def lookup(self, batch_size: int, steps: int, ctx_len: int) -> Optional[float]:
+        cost_ms, _, _ = self.lookup_with_match(batch_size, steps, ctx_len)
+        return cost_ms
+
+    def lookup_with_match(
+        self, batch_size: int, steps: int, ctx_len: int
+    ) -> tuple[Optional[float], Optional[int], Optional[int]]:
+        steps = int(steps)
         batch_sizes = self._batch_sizes_by_step.get(int(steps))
         if not batch_sizes:
-            return None
+            return None, None, None
         index = bisect.bisect_left(batch_sizes, int(batch_size))
         if index >= len(batch_sizes):
             index = len(batch_sizes) - 1
-        return self._data.get((batch_sizes[index], int(steps)))
+        matched_batch_size = batch_sizes[index]
 
-    def has_exact(self, batch_size: int, steps: int) -> bool:
-        return (int(batch_size), int(steps)) in self._data
+        ctx_lens = self._ctx_lens_by_step_bs.get((steps, matched_batch_size))
+        if not ctx_lens:
+            return None, matched_batch_size, None
+        ctx_index = bisect.bisect_left(ctx_lens, int(ctx_len))
+        if ctx_index <= 0:
+            matched_ctx_len = ctx_lens[0]
+        elif ctx_index >= len(ctx_lens):
+            matched_ctx_len = ctx_lens[-1]
+        else:
+            lower = ctx_lens[ctx_index - 1]
+            upper = ctx_lens[ctx_index]
+            matched_ctx_len = (
+                lower if int(ctx_len) - lower <= upper - int(ctx_len) else upper
+            )
+        return (
+            self._data.get((matched_batch_size, steps, matched_ctx_len)),
+            matched_batch_size,
+            matched_ctx_len,
+        )
 
-    def items(self) -> list[tuple[int, int, float]]:
+    def has_exact(self, batch_size: int, steps: int, ctx_len: int) -> bool:
+        return (int(batch_size), int(steps), int(ctx_len)) in self._data
+
+    def items(self) -> list[tuple[int, int, int, float]]:
         return [
-            (batch_size, steps, cost_ms)
-            for (batch_size, steps), cost_ms in sorted(self._data.items())
+            (batch_size, steps, ctx_len, cost_ms)
+            for (batch_size, steps, ctx_len), cost_ms in sorted(self._data.items())
         ]
 
     def is_empty(self) -> bool:
@@ -163,8 +236,8 @@ class BatchSizeCostTable:
         return (
             "{"
             + ", ".join(
-                f"(bs={bs}, steps={steps}): {cost:.4f}ms"
-                for (bs, steps), cost in sorted(self._data.items())
+                f"(bs={bs}, steps={steps}, ctx={ctx_len}): {cost:.4f}ms"
+                for (bs, steps, ctx_len), cost in sorted(self._data.items())
             )
             + "}"
         )
@@ -175,13 +248,17 @@ def score_decoupled_verify_candidates(
     cost_table: BatchSizeCostTable,
     candidate_steps: list[int],
     batch_size: int,
+    ctx_len: int,
 ) -> list[dict]:
     rows = []
+    ctx_len = max(1, int(ctx_len))
     for raw_steps in candidate_steps:
         steps = int(raw_steps)
         position_accept_rates = tracker.snapshot_position_rates(steps)
         expected = tracker.get_expected_tokens(steps)
-        cost_ms = cost_table.lookup(batch_size, steps)
+        cost_ms, matched_batch_size, matched_ctx_len = cost_table.lookup_with_match(
+            batch_size, steps, ctx_len
+        )
         score = (
             expected / cost_ms
             if expected is not None and cost_ms is not None and cost_ms > 0
@@ -192,6 +269,9 @@ def score_decoupled_verify_candidates(
                 "steps": steps,
                 "expected": expected,
                 "cost_ms": cost_ms,
+                "ctx_len": ctx_len,
+                "matched_batch_size": matched_batch_size,
+                "matched_ctx_len": matched_ctx_len,
                 "score": score,
                 "position_accept_rates": position_accept_rates,
                 "position_accept_sources": [
@@ -250,6 +330,12 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         expected = row["expected"]
         cost_ms = row["cost_ms"]
         score = row["score"]
+        ctx_len = row.get("ctx_len")
+        matched_ctx_len = row.get("matched_ctx_len")
+        ctx_text = ""
+        if ctx_len is not None:
+            matched_text = "?" if matched_ctx_len is None else str(int(matched_ctx_len))
+            ctx_text = f",ctx={int(ctx_len)}->{matched_text}"
         accept_rates = row.get("position_accept_rates") or []
         accept_sources = row.get("position_accept_sources") or []
         rate_parts = []
@@ -261,11 +347,11 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
                 rate_parts.append(f"p{position + 1}={rate:.3f}:{source}")
         rate_text = f",rates=[{','.join(rate_parts)}]" if rate_parts else ""
         if score is None:
-            parts.append(f"S={row['steps']}:score=?{rate_text}{marker}")
+            parts.append(f"S={row['steps']}:score=?{ctx_text}{rate_text}{marker}")
         else:
             parts.append(
                 f"S={row['steps']}:E={expected:.3f}/cost={cost_ms:.4f}ms"
-                f"={score:.6f}{rate_text}{marker}"
+                f"={score:.6f}{ctx_text}{rate_text}{marker}"
             )
     return "[" + ", ".join(parts) + "]"
 
@@ -338,13 +424,15 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             )
         self._activate(self._current_steps)
 
-    def set_profile_cost(self, *, batch_size: int, steps: int, cost_ms: float) -> None:
-        self._cost_table.set(batch_size, steps, cost_ms)
+    def set_profile_cost(
+        self, *, batch_size: int, steps: int, ctx_len: int, cost_ms: float
+    ) -> None:
+        self._cost_table.set(batch_size, steps, ctx_len, cost_ms)
 
     def cost_table_summary(self) -> str:
         return self._cost_table.summary()
 
-    def cost_table_items(self) -> list[tuple[int, int, float]]:
+    def cost_table_items(self) -> list[tuple[int, int, int, float]]:
         return self._cost_table.items()
 
     def on_verify_complete(
@@ -355,9 +443,9 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
         self._tracker.update(num_correct_drafts_per_req, self._current_steps)
         self._batch_count += 1
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(self, batch_size: int, ctx_len: int) -> None:
         if self._should_reevaluate():
-            self._reevaluate_and_switch(batch_size)
+            self._reevaluate_and_switch(batch_size, ctx_len)
         if self._current_steps != self.worker.speculative_num_steps:
             self._activate(self._current_steps)
 
@@ -372,13 +460,20 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             return True
         return self._tracker.all_positions_warmed(self._current_steps)
 
-    def _reevaluate_and_switch(self, batch_size: int) -> None:
-        if self._current_steps == 0 and not self._has_positive_score(batch_size):
+    def _reevaluate_and_switch(self, batch_size: int, ctx_len: int) -> None:
+        ctx_len = max(1, int(ctx_len))
+        if self._current_steps == 0 and not self._has_positive_score(
+            batch_size, ctx_len
+        ):
             best_steps = self._positive_candidate_steps()[0]
             rows = []
         else:
             rows = score_decoupled_verify_candidates(
-                self._tracker, self._cost_table, self._candidate_steps, batch_size
+                self._tracker,
+                self._cost_table,
+                self._candidate_steps,
+                batch_size,
+                ctx_len,
             )
             best_steps = pick_best_step_with_hysteresis(
                 rows,
@@ -400,6 +495,7 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
                 logger,
                 "[TA-VERIFY-SCORE] "
                 f"batch_count={self._batch_count}, bs={int(batch_size)}, "
+                f"avg_ctx_len={ctx_len}, "
                 f"active_steps={self._current_steps}, "
                 f"scores={format_score_rows(rows, best_steps)}, "
                 f"best_steps={best_steps}, "
@@ -426,6 +522,7 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
                 logger,
                 "[TA-VERIFY-SWITCH] "
                 f"batch_count={self._batch_count}, bs={int(batch_size)}, "
+                f"avg_ctx_len={ctx_len}, "
                 f"from_steps={old_steps}, to_steps={best_steps}, "
                 f"current_score={_format_optional_score(current_score)}, "
                 f"best_score={_format_optional_score(best_score)}, "
@@ -437,6 +534,7 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             logger,
             "Decoupled verifier throughput-aware step switch: "
             f"steps {old_steps} -> {best_steps}, bs={int(batch_size)}, "
+            f"avg_ctx_len={ctx_len}, "
             f"batch_count={self._batch_count}, "
             f"current_score={_format_optional_score(current_score)}, "
             f"best_score={_format_optional_score(best_score)}, "
@@ -447,11 +545,12 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
     def _positive_candidate_steps(self) -> list[int]:
         return [steps for steps in self._candidate_steps if steps > 0]
 
-    def _has_positive_score(self, batch_size: int) -> bool:
+    def _has_positive_score(self, batch_size: int, ctx_len: int) -> bool:
         rows = score_decoupled_verify_candidates(
             self._tracker,
             self._cost_table,
             self._positive_candidate_steps(),
             batch_size,
+            ctx_len,
         )
         return any(row["score"] is not None for row in rows)

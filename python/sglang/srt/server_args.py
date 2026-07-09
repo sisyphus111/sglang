@@ -1565,6 +1565,11 @@ class ServerArgs:
         Optional[str],
         "JSON cost-table cache file for DECOUPLED_VERIFY throughput-aware adaptive verifier profiling.",
     ] = None
+    decoupled_verify_throughput_profile_ctx_lens: A[
+        Optional[str],
+        "Comma-separated positive verifier context lengths for DECOUPLED_VERIFY "
+        "throughput-aware adaptive verifier profiling.",
+    ] = None
     decoupled_spec_rank_base: A[
         int,
         "Base global rank for dynamically configured decoupled-spec entry schedulers. The local DP rank is added to this value.",

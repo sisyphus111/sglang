@@ -52,6 +52,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.decoupled_verify_throughput_controller import (
     BatchSizeCostTable,
     DecoupledVerifyThroughputAwareController,
+    parse_decoupled_verify_throughput_profile_ctx_lens,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -78,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 _THROUGHPUT_PROFILE_WARMUP_ITERS = 5
 _THROUGHPUT_PROFILE_MEASURE_ITERS = 1000
-_THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION = 1
+_THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION = 2
 
 
 def _get_req_tail_token_id(req) -> int:
@@ -414,7 +415,13 @@ class VerifyWorker(BaseSpecWorker):
         encoded = ",".join(str(int(bs)) for bs in sorted(set(capture_bs)))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
 
-    def _throughput_profile_fingerprint(self, capture_bs: List[int]) -> dict:
+    def _throughput_profile_ctx_hash(self, profile_ctx_lens: List[int]) -> str:
+        encoded = ",".join(str(int(ctx_len)) for ctx_len in sorted(set(profile_ctx_lens)))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+    def _throughput_profile_fingerprint(
+        self, capture_bs: List[int], profile_ctx_lens: List[int]
+    ) -> dict:
         target_model_path = str(getattr(self.server_args, "model_path", ""))
         target_dp_size = int(getattr(self.server_args, "dp_size", 1) or 1)
         enable_dp_attention = bool(
@@ -433,17 +440,23 @@ class VerifyWorker(BaseSpecWorker):
             "enable_dp_attention": enable_dp_attention,
             "max_steps": int(self._throughput_max_speculative_steps() or 0),
             "capture_bs": sorted({int(bs) for bs in capture_bs}),
+            "profile_ctx_lens": sorted({int(ctx_len) for ctx_len in profile_ctx_lens}),
         }
 
     def _expected_throughput_profile_cache_basename(
-        self, capture_bs: List[int]
+        self, capture_bs: List[int], profile_ctx_lens: List[int]
     ) -> str:
-        fingerprint = self._throughput_profile_fingerprint(capture_bs)
+        fingerprint = self._throughput_profile_fingerprint(
+            capture_bs, profile_ctx_lens
+        )
         target_slug, target_hash = self._throughput_profile_model_identity(
             fingerprint["target_model_path"]
         )
         capture_hash = self._throughput_profile_capture_hash(
             fingerprint["capture_bs"]
+        )
+        ctx_hash = self._throughput_profile_ctx_hash(
+            fingerprint["profile_ctx_lens"]
         )
         dp_attention = 1 if fingerprint["enable_dp_attention"] else 0
         return (
@@ -453,7 +466,8 @@ class VerifyWorker(BaseSpecWorker):
             f"__targetdp-{fingerprint['target_dp_size']}"
             f"__dpa-{dp_attention}"
             f"__maxsteps-{fingerprint['max_steps']}"
-            f"__cgraph-{capture_hash}.json"
+            f"__cgraph-{capture_hash}"
+            f"__ctx-{ctx_hash}.json"
         )
 
     def _load_throughput_profile_cache(
@@ -463,6 +477,7 @@ class VerifyWorker(BaseSpecWorker):
         profile_path: str,
         expected_basename: str,
         profile_bs_by_step: dict[int, List[int]],
+        profile_ctx_lens: List[int],
     ) -> bool:
         actual_basename = os.path.basename(profile_path)
         if actual_basename != expected_basename:
@@ -499,22 +514,27 @@ class VerifyWorker(BaseSpecWorker):
                 cost_table.set(
                     batch_size=entry["batch_size"],
                     steps=entry["steps"],
+                    ctx_len=entry["ctx_len"],
                     cost_ms=entry["cost_ms"],
                 )
 
             missing = [
-                (int(bs), int(steps))
+                (int(bs), int(steps), int(ctx_len))
                 for steps, batch_sizes in profile_bs_by_step.items()
                 for bs in batch_sizes
-                if not cost_table.has_exact(batch_size=bs, steps=steps)
+                for ctx_len in profile_ctx_lens
+                if not cost_table.has_exact(
+                    batch_size=bs, steps=steps, ctx_len=ctx_len
+                )
             ]
             if missing:
                 raise ValueError(f"missing cost entries: {missing}")
 
-            for batch_size, steps, cost_ms in cost_table.items():
+            for batch_size, steps, ctx_len, cost_ms in cost_table.items():
                 controller.set_profile_cost(
                     batch_size=batch_size,
                     steps=steps,
+                    ctx_len=ctx_len,
                     cost_ms=cost_ms,
                 )
         except Exception as exc:
@@ -537,19 +557,23 @@ class VerifyWorker(BaseSpecWorker):
         *,
         profile_path: str,
         capture_bs: List[int],
+        profile_ctx_lens: List[int],
         controller: DecoupledVerifyThroughputAwareController,
     ) -> None:
         payload = {
             "schema_version": _THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION,
             "summary": controller.cost_table_summary(),
-            "fingerprint": self._throughput_profile_fingerprint(capture_bs),
+            "fingerprint": self._throughput_profile_fingerprint(
+                capture_bs, profile_ctx_lens
+            ),
             "costs": [
                 {
                     "batch_size": batch_size,
                     "steps": steps,
+                    "ctx_len": ctx_len,
                     "cost_ms": cost_ms,
                 }
-                for batch_size, steps, cost_ms in controller.cost_table_items()
+                for batch_size, steps, ctx_len, cost_ms in controller.cost_table_items()
             ],
         }
         output_dir = os.path.dirname(os.path.abspath(profile_path))
@@ -598,11 +622,13 @@ class VerifyWorker(BaseSpecWorker):
                 "Decoupled verifier throughput-aware profiling has no captured "
                 "CUDA Graph batch sizes."
             )
+        profile_ctx_lens = self._throughput_profile_ctx_lens()
 
         log_info_on_rank0(
             logger,
             "Profile decoupled verifier throughput-aware cost table begin: "
             f"profile_bs_by_step={profile_bs_by_step}, "
+            f"profile_ctx_lens={profile_ctx_lens}, "
             f"profile_capture_bs_by_step={profile_capture_bs_by_step}, "
             f"warmup_iters={_THROUGHPUT_PROFILE_WARMUP_ITERS}, "
             f"measure_iters={_THROUGHPUT_PROFILE_MEASURE_ITERS}",
@@ -619,16 +645,18 @@ class VerifyWorker(BaseSpecWorker):
         loaded_from_cache = False
         if profile_path is not None:
             expected_basename = self._expected_throughput_profile_cache_basename(
-                profile_capture_bs
+                profile_capture_bs,
+                profile_ctx_lens,
             )
             loaded_from_cache = self._load_throughput_profile_cache(
                 controller=controller,
                 profile_path=profile_path,
                 expected_basename=expected_basename,
                 profile_bs_by_step=profile_bs_by_step,
+                profile_ctx_lens=profile_ctx_lens,
             )
 
-        profile_rows: list[tuple[int, int, float, float]] = []
+        profile_rows: list[tuple[int, int, int, float, float]] = []
         if not loaded_from_cache:
             for steps in sorted(self._throughput_profile_states_by_step):
                 state = self._throughput_profile_states_by_step[steps]
@@ -637,36 +665,49 @@ class VerifyWorker(BaseSpecWorker):
                     padded_graph_bs = self._throughput_profile_padded_graph_bs(
                         bs, capture_bs
                     )
-                    avg_decode_ms = self._profile_throughput_shape(
-                        batch_size=int(bs),
-                        steps=int(steps),
-                        state=state,
-                        tree_cache=tree_cache,
-                    )
-                    avg_decode_ms = self._max_reduce_profile_ms(avg_decode_ms)
-                    throughput = int(bs) * (int(steps) + 1) * 1000.0 / avg_decode_ms
-                    controller.set_profile_cost(
-                        batch_size=int(bs),
-                        steps=int(steps),
-                        cost_ms=avg_decode_ms,
-                    )
-                    profile_rows.append(
-                        (int(bs), int(steps), avg_decode_ms, throughput)
-                    )
-                    log_info_on_rank0(
-                        logger,
-                        "Decoupled verifier throughput-aware profile point: "
-                        f"bs={int(bs)}, steps={int(steps)}, "
-                        f"padded_graph_bs={padded_graph_bs}, "
-                        f"verify_tokens_per_req={int(steps) + 1}, "
-                        f"avg_decode_ms={avg_decode_ms:.4f}, "
-                        f"throughput={throughput:.2f} tok/s",
-                    )
+                    for ctx_len in profile_ctx_lens:
+                        avg_decode_ms = self._profile_throughput_shape(
+                            batch_size=int(bs),
+                            steps=int(steps),
+                            ctx_len=int(ctx_len),
+                            state=state,
+                            tree_cache=tree_cache,
+                        )
+                        avg_decode_ms = self._max_reduce_profile_ms(avg_decode_ms)
+                        throughput = (
+                            int(bs) * (int(steps) + 1) * 1000.0 / avg_decode_ms
+                        )
+                        controller.set_profile_cost(
+                            batch_size=int(bs),
+                            steps=int(steps),
+                            ctx_len=int(ctx_len),
+                            cost_ms=avg_decode_ms,
+                        )
+                        profile_rows.append(
+                            (
+                                int(bs),
+                                int(steps),
+                                int(ctx_len),
+                                avg_decode_ms,
+                                throughput,
+                            )
+                        )
+                        log_info_on_rank0(
+                            logger,
+                            "Decoupled verifier throughput-aware profile point: "
+                            f"bs={int(bs)}, steps={int(steps)}, "
+                            f"ctx_len={int(ctx_len)}, "
+                            f"padded_graph_bs={padded_graph_bs}, "
+                            f"verify_tokens_per_req={int(steps) + 1}, "
+                            f"avg_decode_ms={avg_decode_ms:.4f}, "
+                            f"throughput={throughput:.2f} tok/s",
+                        )
 
             if profile_path is not None:
                 self._write_throughput_profile_cache(
                     profile_path=profile_path,
                     capture_bs=profile_capture_bs,
+                    profile_ctx_lens=profile_ctx_lens,
                     controller=controller,
                 )
 
@@ -701,6 +742,7 @@ class VerifyWorker(BaseSpecWorker):
         self,
         batch_size: int,
         steps: int,
+        ctx_len: int,
         state: SpecRuntimeState,
         tree_cache,
     ) -> float:
@@ -713,6 +755,7 @@ class VerifyWorker(BaseSpecWorker):
 
         reqs, batch = self._build_throughput_profile_batch(
             batch_size=batch_size,
+            seq_len=ctx_len,
             tree_cache=tree_cache,
         )
 
@@ -754,9 +797,14 @@ class VerifyWorker(BaseSpecWorker):
         self,
         *,
         batch_size: int,
+        seq_len: int,
         tree_cache,
     ) -> tuple[list[Req], ScheduleBatch]:
-        seq_len = self._throughput_profile_prompt_len()
+        seq_len = int(seq_len)
+        self._validate_throughput_profile_prompt_len(
+            seq_len=seq_len,
+            batch_size=batch_size,
+        )
         vocab_size = int(getattr(self.model_config, "vocab_size", 32000) or 32000)
         token_mod = max(1, vocab_size - 1)
         max_new_tokens = self._throughput_profile_decode_headroom(extra_iters=4)
@@ -775,11 +823,17 @@ class VerifyWorker(BaseSpecWorker):
                 [((i + j) % token_mod) + 1 for j in range(seq_len)],
             )
             req = Req(
-                rid=f"decoupled-throughput-profile-{batch_size}-{i}-{time.time_ns()}",
+                rid=(
+                    f"decoupled-throughput-profile-{batch_size}-{seq_len}-"
+                    f"{i}-{time.time_ns()}"
+                ),
                 origin_input_text="",
                 origin_input_ids=token_ids,
                 sampling_params=sampling_params,
-                extra_key=f"decoupled-throughput-profile-{batch_size}-{i}-{time.time_ns()}",
+                extra_key=(
+                    f"decoupled-throughput-profile-{batch_size}-{seq_len}-"
+                    f"{i}-{time.time_ns()}"
+                ),
             )
             req.skip_radix_cache_insert = True
             req.init_next_round_input(tree_cache)
@@ -808,22 +862,37 @@ class VerifyWorker(BaseSpecWorker):
             + int(extra_iters)
         ) * tokens_per_decode
 
-    def _throughput_profile_prompt_len(self) -> int:
+    def _throughput_profile_ctx_lens(self) -> List[int]:
+        raw = getattr(
+            self.server_args,
+            "decoupled_verify_throughput_profile_ctx_lens",
+            None,
+        )
+        parsed = parse_decoupled_verify_throughput_profile_ctx_lens(raw)
+        if parsed is None:
+            return [self._throughput_profile_prompt_len()]
+        return parsed
+
+    def _throughput_profile_prompt_limit_details(
+        self, *, batch_size: int
+    ) -> tuple[int, dict[str, Optional[int]]]:
+        batch_size = max(1, int(batch_size))
         context_len = int(getattr(self.model_config, "context_len", 4096) or 4096)
         decode_headroom = self._throughput_profile_decode_headroom(extra_iters=8)
-        max_profile_bs = max(self._throughput_profile_capture_bs or [1])
-        available_tokens = getattr(
-            self.token_to_kv_pool_allocator, "available_size", lambda: 0
-        )()
-        pool_limited_len = (
-            max(
-                1,
-                int(available_tokens) // max(1, int(max_profile_bs))
-                - decode_headroom,
-            )
-            if available_tokens
-            else 256
+        context_limited_len = context_len - decode_headroom
+
+        available_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "available_size",
+            None,
         )
+        available_tokens = int(available_size()) if callable(available_size) else None
+        pool_limited_len = (
+            int(available_tokens) // batch_size - decode_headroom
+            if available_tokens is not None
+            else None
+        )
+
         prefill_budget_candidates = [
             int(value)
             for value in (
@@ -833,19 +902,58 @@ class VerifyWorker(BaseSpecWorker):
             if value is not None and int(value) > 0
         ]
         prefill_limited_len = (
-            max(1, min(prefill_budget_candidates) // max(1, int(max_profile_bs)))
+            min(prefill_budget_candidates) // batch_size
             if prefill_budget_candidates
-            else 256
+            else None
         )
-        return max(
-            1,
-            min(
-                256,
-                context_len - decode_headroom,
-                pool_limited_len,
-                prefill_limited_len,
-            ),
+        details = {
+            "context_limit": context_limited_len,
+            "kv_pool_limit": pool_limited_len,
+            "prefill_limit": prefill_limited_len,
+        }
+        return min(value for value in details.values() if value is not None), details
+
+    def _validate_throughput_profile_prompt_len(
+        self, *, seq_len: int, batch_size: int
+    ) -> None:
+        seq_len = int(seq_len)
+        if seq_len <= 0:
+            raise RuntimeError(
+                "Decoupled verifier throughput-aware profile ctx_len must be "
+                f"positive, got ctx_len={seq_len}."
+            )
+        max_profile_len, details = self._throughput_profile_prompt_limit_details(
+            batch_size=batch_size
         )
+        if seq_len <= max_profile_len:
+            return
+        limits = ", ".join(
+            f"{name}={value}" for name, value in details.items() if value is not None
+        )
+        raise RuntimeError(
+            "Decoupled verifier throughput-aware profile ctx_len exceeds the "
+            "safe profiling range: "
+            f"ctx_len={seq_len}, batch_size={int(batch_size)}, "
+            f"max_profile_ctx_len={max_profile_len}, {limits}."
+        )
+
+    def _throughput_profile_prompt_len(self) -> int:
+        max_profile_bs = max(self._throughput_profile_capture_bs or [1])
+        max_profile_len, details = self._throughput_profile_prompt_limit_details(
+            batch_size=max_profile_bs
+        )
+        if max_profile_len <= 0:
+            limits = ", ".join(
+                f"{name}={value}"
+                for name, value in details.items()
+                if value is not None
+            )
+            raise RuntimeError(
+                "Decoupled verifier throughput-aware profiling cannot build a "
+                "dummy batch with decode headroom: "
+                f"batch_size={int(max_profile_bs)}, {limits}."
+            )
+        return max(1, min(256, max_profile_len))
 
     def _run_throughput_profile_prefill(
         self, batch: ScheduleBatch
@@ -1003,9 +1111,14 @@ class VerifyWorker(BaseSpecWorker):
                 num_correct_drafts_per_req, batch_size=batch_size
             )
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(self, batch_size: int, ctx_len: int = 1) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+            if isinstance(
+                self.adaptive_controller, DecoupledVerifyThroughputAwareController
+            ):
+                self.adaptive_controller.activate_step_by_batch(batch_size, ctx_len)
+            else:
+                self.adaptive_controller.activate_step_by_batch(batch_size)
 
     def build_adaptive_runtime_state(
         self,

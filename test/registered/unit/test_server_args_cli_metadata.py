@@ -139,6 +139,21 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         self.assertIn(
             "--decoupled-verify-throughput-profile-path", self.actions_by_option
         )
+        self.assertIn(
+            "--decoupled-verify-throughput-profile-ctx-lens", self.actions_by_option
+        )
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--decoupled-verify-throughput-profile-ctx-lens",
+                "256,1024,4096",
+            ]
+        )
+        self.assertEqual(
+            ServerArgs.from_cli_args(args).decoupled_verify_throughput_profile_ctx_lens,
+            "256,1024,4096",
+        )
         removed_options = (
             "--decoupled-spec-target-verify-token-budget",
             "--verifier-roofline-profile-bs-candidates",

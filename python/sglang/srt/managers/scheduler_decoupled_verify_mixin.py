@@ -85,7 +85,7 @@ class SchedulerDecoupledVerifyMixin:
             self._prepare_verify_decode_inputs(batch)
 
     def _activate_decoupled_verify_step_by_batch(
-        self: Scheduler, raw_batch_size: int
+        self: Scheduler, raw_batch_size: int, avg_ctx_len: int
     ) -> None:
         if not dynamic_verify_enabled(self.server_args):
             return
@@ -101,7 +101,17 @@ class SchedulerDecoupledVerifyMixin:
                 "decoupled verifier dynamic verify length requires the verifier "
                 "worker AdaptiveController runtime-state activator."
             )
-        activate_step_by_batch(int(raw_batch_size))
+        activate_step_by_batch(int(raw_batch_size), int(avg_ctx_len))
+
+    def _decoupled_verify_avg_ctx_len(self: Scheduler, batch: ScheduleBatch) -> int:
+        if batch.batch_size() <= 0:
+            return 1
+
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and int(seq_lens_cpu.numel()) > 0:
+            return max(1, int(round(float(seq_lens_cpu.float().mean().item()))))
+
+        return 1
 
     def _active_decoupled_verify_config(self: Scheduler) -> tuple[int, int]:
         return (
@@ -157,7 +167,11 @@ class SchedulerDecoupledVerifyMixin:
         )
 
     def _prepare_verify_decode_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
-        self._activate_decoupled_verify_step_by_batch(batch.batch_size())
+        avg_ctx_len = self._decoupled_verify_avg_ctx_len(batch)
+        self._activate_decoupled_verify_step_by_batch(
+            batch.batch_size(),
+            avg_ctx_len,
+        )
         self._maybe_log_decoupled_verify_state_selection(batch.batch_size())
         num_speculative_steps, _ = self._active_decoupled_verify_config()
 
