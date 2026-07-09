@@ -4,6 +4,7 @@ from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.decoupled_verify_throughput_controller import (
     BatchSizeCostTable,
     DecoupledVerifyThroughputAwareController,
+    DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WINDOW_SIZE,
     PositionAcceptanceTracker,
     pick_best_step,
     pick_best_step_with_hysteresis,
@@ -98,6 +99,17 @@ class TestDecoupledVerifyScoring(unittest.TestCase):
 
 
 class TestDecoupledVerifyThroughputAwareController(unittest.TestCase):
+    def test_default_sliding_window_size_is_fifty_batches(self):
+        worker = _Worker(initial_steps=1)
+        controller = DecoupledVerifyThroughputAwareController(
+            worker,
+            candidate_steps=[0, 1],
+            initial_steps=1,
+        )
+
+        self.assertEqual(DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WINDOW_SIZE, 50)
+        self.assertEqual(controller._tracker.window_size, 50)
+
     def test_initial_step_uses_smallest_positive_candidate(self):
         worker = _Worker(initial_steps=0)
         controller = DecoupledVerifyThroughputAwareController(

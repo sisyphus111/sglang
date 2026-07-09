@@ -136,6 +136,9 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             self.actions_by_option["--speculative-adaptive-strategy"].choices,
             ["ema", "throughput_aware"],
         )
+        self.assertIn(
+            "--decoupled-verify-throughput-profile-path", self.actions_by_option
+        )
         removed_options = (
             "--decoupled-spec-target-verify-token-budget",
             "--verifier-roofline-profile-bs-candidates",

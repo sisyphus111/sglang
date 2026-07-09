@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_decoupled_draft_mixin import (
     DraftReqState,
     SchedulerDecoupledDraftMixin,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey, DraftSync
 from sglang.srt.utils.common import flatten_arrays_to_pinned_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -224,6 +225,51 @@ class TestDecoupledDraftBatchState(unittest.TestCase):
         )
 
         self.assertEqual(replay_batch.outputs, [])
+
+    def test_flush_draft_updates_cpp_env_submits_native_rows(self):
+        key = DraftReqKey(src_verifier_rank=7, request_id="req-1")
+        req = SimpleNamespace(
+            output_ids=array("q", [10, 11, 12, 13]),
+            _decoupled_draft_state=None,
+        )
+        state = DraftReqState(
+            key=key,
+            req=req,
+            verifier_committed_prefix_len=1,
+        )
+        req._decoupled_draft_state = state
+
+        class _TokenSync:
+            def __init__(self):
+                self.rows = []
+
+            def submit_draft_result_rows(self, rows):
+                self.rows.append(list(rows))
+
+            def submit_draft_results(self, _batch):
+                raise AssertionError("C++ env path must use native rows")
+
+        token_sync = _TokenSync()
+        scheduler = SimpleNamespace(
+            is_draft_worker_batch=lambda batch: True,
+            is_draft_entry_rank=lambda: True,
+            get_decoupled_spec_rank=lambda: 3,
+            _get_draft_state_by_req=lambda item: item._decoupled_draft_state,
+            _get_token_sync_thread=lambda: token_sync,
+            draft_req_table={key: state},
+        )
+        batch = SimpleNamespace(reqs=[req])
+
+        with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(True):
+            trace_payload = SchedulerDecoupledDraftMixin.flush_draft_updates(
+                scheduler, batch
+            )
+
+        self.assertEqual(trace_payload["num_stream_outputs"], 1)
+        self.assertEqual(
+            token_sync.rows,
+            [[(3, 7, "req-1", 1, 3, 13)]],
+        )
 
 
 if __name__ == "__main__":

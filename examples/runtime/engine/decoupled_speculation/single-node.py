@@ -229,6 +229,22 @@ def parse_args() -> argparse.Namespace:
             "engine when --speculative-adaptive is enabled."
         ),
     )
+    parser.add_argument(
+        "--decoupled-verify-throughput-profile-path",
+        default=None,
+        help=(
+            "Optional JSON cost-table cache file for decoupled verifier "
+            "throughput-aware startup profiling."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-bs-decode",
+        default=None,
+        help=(
+            "Comma-separated decode CUDA Graph batch sizes for target/verifier "
+            "and baseline target engines, e.g. 32,64,128."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--deterministic",
@@ -714,6 +730,15 @@ def validate_single_node_args(args: argparse.Namespace) -> None:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
+    if args.cuda_graph_bs_decode is not None:
+        args.cuda_graph_bs_decode = [
+            int(item)
+            for item in str(args.cuda_graph_bs_decode).replace(",", " ").split()
+        ]
+        if not args.cuda_graph_bs_decode or any(
+            bs <= 0 for bs in args.cuda_graph_bs_decode
+        ):
+            raise ValueError("cuda-graph-bs-decode must contain positive integers")
     if (
         args.speculative_adaptive
         and args.speculative_adaptive_strategy == "ema"
@@ -1096,6 +1121,8 @@ def create_verifier_engine(
         log_level="info",
         decoupled_spec_rank_base=0,
     )
+    if args.cuda_graph_bs_decode is not None:
+        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.speculative_adaptive:
@@ -1106,6 +1133,10 @@ def create_verifier_engine(
         if args.speculative_adaptive_config is not None:
             engine_kwargs["speculative_adaptive_config"] = (
                 args.speculative_adaptive_config
+            )
+        if args.decoupled_verify_throughput_profile_path is not None:
+            engine_kwargs["decoupled_verify_throughput_profile_path"] = (
+                args.decoupled_verify_throughput_profile_path
             )
     if args.target_enable_dp_attention:
         engine_kwargs["enable_dp_attention"] = True
@@ -1138,6 +1169,8 @@ def create_decode_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.cuda_graph_bs_decode is not None:
+        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.target_enable_dp_attention:
@@ -1177,6 +1210,8 @@ def create_mtp_engine(
         spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
+    if args.cuda_graph_bs_decode is not None:
+        engine_kwargs["cuda_graph_bs_decode"] = args.cuda_graph_bs_decode
     if args.max_running_requests is not None:
         engine_kwargs["max_running_requests"] = args.max_running_requests
     if args.target_enable_dp_attention:

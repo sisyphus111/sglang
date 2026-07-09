@@ -1561,6 +1561,10 @@ class ServerArgs:
             choices=["ema", "throughput_aware"],
         ),
     ] = "ema"
+    decoupled_verify_throughput_profile_path: A[
+        Optional[str],
+        "JSON cost-table cache file for DECOUPLED_VERIFY throughput-aware adaptive verifier profiling.",
+    ] = None
     decoupled_spec_rank_base: A[
         int,
         "Base global rank for dynamically configured decoupled-spec entry schedulers. The local DP rank is added to this value.",

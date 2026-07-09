@@ -598,6 +598,8 @@ class TargetActor:
         speculative_adaptive: bool = False,
         speculative_adaptive_strategy: str = "throughput_aware",
         speculative_adaptive_config: str | None = None,
+        decoupled_verify_throughput_profile_path: str | None = None,
+        cuda_graph_bs_decode: list[int] | None = None,
         rank_base: int = 0,
         deterministic: bool = False,
         spec_trace_dir: str | None = None,
@@ -625,6 +627,8 @@ class TargetActor:
         )
         if log_level is not None:
             engine_kwargs["log_level"] = log_level
+        if cuda_graph_bs_decode is not None:
+            engine_kwargs["cuda_graph_bs_decode"] = cuda_graph_bs_decode
         if max_running_requests is not None:
             engine_kwargs["max_running_requests"] = max_running_requests
         if ep_size is not None:
@@ -651,6 +655,10 @@ class TargetActor:
                 if speculative_adaptive_config is not None:
                     engine_kwargs["speculative_adaptive_config"] = (
                         speculative_adaptive_config
+                    )
+                if decoupled_verify_throughput_profile_path is not None:
+                    engine_kwargs["decoupled_verify_throughput_profile_path"] = (
+                        decoupled_verify_throughput_profile_path
                     )
         elif mode == "decode":
             engine_kwargs["disable_overlap_schedule"] = True

@@ -1,5 +1,6 @@
 import unittest
 import json
+import os
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,7 +83,9 @@ class _Scheduler(SchedulerDecoupledVerifyMixin):
     def _broadcast_verify_snapshots(self, local_snapshots):
         return []
 
-    def _bind_verify_snapshots(self, target_reqs, synced_snapshots):
+    def _bind_verify_snapshots(
+        self, target_reqs, synced_snapshots, *, collect_trace_stats=False
+    ):
         return 0
 
 
@@ -120,6 +123,66 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
+
+    def _make_throughput_profile_worker(self, cache_path=None):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.enable_adaptive_verify = True
+        worker.speculative_num_steps = 1
+        worker.speculative_num_draft_tokens = 2
+        worker.server_args = SimpleNamespace(
+            speculative_adaptive_strategy="throughput_aware",
+            _decoupled_verify_max_speculative_steps=2,
+            decoupled_verify_throughput_profile_path=cache_path,
+            model_path="/models/target-model",
+            tp_size=4,
+            dp_size=1,
+            enable_dp_attention=False,
+        )
+        worker._throughput_profile_done = False
+        worker._throughput_profile_states_by_step = {
+            steps: SpecRuntimeState.for_decoupled_verify(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                target_attn_backend=object(),
+                target_graph_runner=SimpleNamespace(capture_bs=[4, 8]),
+            )
+            for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_capture_bs_by_step = {
+            steps: [4, 8] for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_bs_by_step = {
+            steps: [4, 8] for steps in (0, 1, 2)
+        }
+        worker._throughput_profile_capture_bs = [4, 8]
+
+        def apply_runtime_state(state):
+            worker.speculative_num_steps = state.speculative_num_steps
+            worker.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+
+        worker.apply_runtime_state = apply_runtime_state
+        return worker
+
+    def _throughput_profile_cache_payload(self, worker, *, omit_last=False):
+        costs = [
+            {
+                "batch_size": bs,
+                "steps": steps,
+                "cost_ms": float(bs + steps + 1),
+            }
+            for steps in (0, 1, 2)
+            for bs in (4, 8)
+        ]
+        if omit_last:
+            costs.pop()
+        return {
+            "schema_version": 1,
+            "summary": "cached",
+            "fingerprint": worker._throughput_profile_fingerprint([4, 8]),
+            "costs": costs,
+        }
 
     def test_throughput_aware_validation_accepts_adaptive_full_cuda_graph(self):
         args = self._make_validate_args()
@@ -185,7 +248,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         for req in batch.reqs:
             self.assertEqual(req._decoupled_verify_num_speculative_steps, 3)
             self.assertEqual(req._decoupled_verify_tokens_per_req, 4)
-            self.assertEqual(req.kv_committed_len, 3)
+            self.assertEqual(req.kv_committed_len, 2)
 
     def test_scheduler_zero_step_uses_active_worker_config(self):
         scheduler = _Scheduler(steps=0, draft_tokens=1)
@@ -200,7 +263,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         for req in batch.reqs:
             self.assertEqual(req._decoupled_verify_num_speculative_steps, 0)
             self.assertEqual(req._decoupled_verify_tokens_per_req, 1)
-            self.assertEqual(req.kv_committed_len, 3)
+            self.assertEqual(req.kv_committed_len, 2)
 
     def test_verify_worker_activate_step_by_batch_applies_state(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
@@ -472,7 +535,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertEqual(spec_info.capture_hidden_mode, CaptureHiddenMode.NULL)
         self.assertEqual(spec_info.draft_token.tolist(), [7])
         self.assertEqual(spec_info.retrieve_next_token.tolist(), [[-1]])
-        self.assertEqual(req.decode_batch_idx, 1)
+        self.assertEqual(req.decode_batch_idx, 0)
 
     def test_verify_worker_update_weights_delegates_to_target_only(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
@@ -744,6 +807,108 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             "(bs=8, steps=2): 11.0000ms",
             worker.server_args._decoupled_verify_throughput_cost_table_summary,
         )
+
+    def test_startup_throughput_profile_loads_matching_cache_without_measurement(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = self._make_throughput_profile_worker()
+            basename = VerifyWorker._expected_throughput_profile_cache_basename(
+                worker, [4, 8]
+            )
+            fingerprint = VerifyWorker._throughput_profile_fingerprint(worker, [4, 8])
+            self.assertNotIn("draft", basename)
+            self.assertNotIn("draft_model_path", fingerprint)
+            self.assertNotIn("draft_tp_size", fingerprint)
+            cache_path = os.path.join(tmpdir, basename)
+            worker.server_args.decoupled_verify_throughput_profile_path = cache_path
+            with open(cache_path, "w") as f:
+                json.dump(self._throughput_profile_cache_payload(worker), f)
+
+            with (
+                patch.object(
+                    VerifyWorker,
+                    "_profile_throughput_shape",
+                    side_effect=AssertionError("cache hit should not profile"),
+                ),
+                patch(
+                    "sglang.srt.speculative.decoupled_verify_worker.log_info_on_rank0"
+                ) as log_mock,
+            ):
+                VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
+
+        self.assertEqual(worker.adaptive_controller.candidate_steps, [0, 1, 2])
+        self.assertEqual(
+            worker.adaptive_controller._cost_table.lookup(batch_size=5, steps=2),
+            11.0,
+        )
+        self.assertIn(
+            "(bs=8, steps=2): 11.0000ms",
+            worker.server_args._decoupled_verify_throughput_cost_table_summary,
+        )
+        self.assertTrue(
+            any(
+                "Loaded decoupled verifier throughput-aware profile data" in call.args[1]
+                for call in log_mock.call_args_list
+            )
+        )
+
+    def test_startup_throughput_profile_cache_misses_profile_and_rewrite(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        cases = ("missing", "basename_mismatch", "malformed_json", "incomplete")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                worker = self._make_throughput_profile_worker()
+                basename = VerifyWorker._expected_throughput_profile_cache_basename(
+                    worker, [4, 8]
+                )
+                cache_path = os.path.join(
+                    tmpdir,
+                    "wrong-name.json" if case == "basename_mismatch" else basename,
+                )
+                worker.server_args.decoupled_verify_throughput_profile_path = cache_path
+                if case == "malformed_json":
+                    with open(cache_path, "w") as f:
+                        f.write("{not-json")
+                elif case == "incomplete":
+                    with open(cache_path, "w") as f:
+                        json.dump(
+                            self._throughput_profile_cache_payload(
+                                worker, omit_last=True
+                            ),
+                            f,
+                        )
+
+                profile_calls = []
+
+                def profile_shape(_worker, batch_size, steps, state, tree_cache):
+                    profile_calls.append((batch_size, steps))
+                    return float(batch_size + steps + 1)
+
+                with (
+                    patch.object(
+                        VerifyWorker,
+                        "_profile_throughput_shape",
+                        profile_shape,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.decoupled_verify_worker."
+                        "log_info_on_rank0"
+                    ),
+                ):
+                    VerifyWorker.run_startup_spec_profiling(
+                        worker, tree_cache=object()
+                    )
+
+                self.assertEqual(
+                    profile_calls,
+                    [(4, 0), (8, 0), (4, 1), (8, 1), (4, 2), (8, 2)],
+                )
+                with open(cache_path) as f:
+                    payload = json.load(f)
+                self.assertEqual(payload["schema_version"], 1)
+                self.assertEqual(len(payload["costs"]), 6)
 
     def test_zero_step_runtime_state_builds_decode_graph_runner(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker

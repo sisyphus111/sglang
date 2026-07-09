@@ -5,7 +5,6 @@ import csv
 import glob
 import json
 import os
-import struct
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -33,12 +32,6 @@ from sglang.srt.speculative.tracer import (
 )
 from sglang.srt.utils.network import get_free_port
 
-_MAGIC = b"DSC1"
-_VERSION = 1
-_KIND_CONTROL_BATCH = 1
-_KIND_TAIL_STREAM_BATCH = 2
-_KIND_STRING_LIST = 3
-_KIND_EXTRACT_DECISIONS = 4
 _PROFILE_FLUSH_INTERVAL_NS = 5_000_000_000
 
 
@@ -67,145 +60,6 @@ def _ensure_zmq_lib_path() -> None:
         candidates.extend(glob.glob(str(parent / "pyzmq.libs" / "libzmq*.so*")))
     if candidates:
         os.environ["SGLANG_DECOUPLED_SPEC_ZMQ_LIB"] = candidates[0]
-
-
-class _BinaryWriter:
-    def __init__(self, kind: int) -> None:
-        self.buf = bytearray()
-        self.buf.extend(_MAGIC)
-        self.u8(_VERSION)
-        self.u8(kind)
-
-    def u8(self, value: int) -> None:
-        self.buf.extend(struct.pack("<B", int(value)))
-
-    def u32(self, value: int) -> None:
-        self.buf.extend(struct.pack("<I", int(value)))
-
-    def i32(self, value: int) -> None:
-        self.buf.extend(struct.pack("<i", int(value)))
-
-    def i64(self, value: int) -> None:
-        self.buf.extend(struct.pack("<q", int(value)))
-
-    def string(self, value: str) -> None:
-        data = str(value).encode("utf-8")
-        self.u32(len(data))
-        self.buf.extend(data)
-
-    def int_list(self, values: list[int]) -> None:
-        self.u32(len(values))
-        for value in values:
-            self.i32(value)
-
-    def frame(self) -> bytes:
-        return bytes(self.buf)
-
-
-def _pack_control_batch(batch: DraftControlBatch) -> bytes:
-    writer = _BinaryWriter(_KIND_CONTROL_BATCH)
-    writer.i32(batch.dst_drafter_rank)
-    writer.u32(len(batch.sync_messages))
-    for message in batch.sync_messages:
-        writer.string(message.request_id)
-        writer.i32(message.src_verifier_rank)
-        writer.i32(message.dst_drafter_rank)
-        writer.int_list([int(x) for x in message.prompt_token_ids])
-        writer.int_list([int(x) for x in message.committed_output_ids])
-    writer.u32(len(batch.verify_commit_messages))
-    for message in batch.verify_commit_messages:
-        writer.string(message.request_id)
-        writer.i32(message.src_verifier_rank)
-        writer.i32(message.dst_drafter_rank)
-        writer.i64(message.pre_verify_committed_len)
-        writer.int_list([int(x) for x in message.committed_token_ids])
-    writer.u32(len(batch.close_messages))
-    for message in batch.close_messages:
-        writer.string(message.request_id)
-        writer.i32(message.src_verifier_rank)
-        writer.i32(message.dst_drafter_rank)
-        writer.string(message.reason)
-    return writer.frame()
-
-
-def _pack_tail_stream_batch(batch: DraftTailStreamOutputBatch) -> bytes:
-    writer = _BinaryWriter(_KIND_TAIL_STREAM_BATCH)
-    writer.u32(len(batch.outputs))
-    for output in batch.outputs:
-        writer.i32(output.src_drafter_rank)
-        writer.i32(output.dst_verifier_rank)
-        writer.string(output.request_id)
-        writer.i64(output.base_committed_len)
-        writer.i64(output.new_token_pos)
-        writer.i32(output.new_token_id)
-    return writer.frame()
-
-
-def _pack_string_list(values: list[str]) -> bytes:
-    writer = _BinaryWriter(_KIND_STRING_LIST)
-    writer.u32(len(values))
-    for value in values:
-        writer.string(value)
-    return writer.frame()
-
-
-def _pack_extract_decisions(
-    decisions: list[tuple[VerifierCommitSegment, int]]
-) -> bytes:
-    writer = _BinaryWriter(_KIND_EXTRACT_DECISIONS)
-    writer.u32(len(decisions))
-    for segment, consumable_len in decisions:
-        writer.string(segment.draft_key.request_id)
-        writer.i32(segment.draft_key.src_verifier_rank)
-        writer.i32(segment.dst_drafter_rank)
-        writer.i64(segment.pre_verify_committed_len)
-        writer.i64(consumable_len)
-    return writer.frame()
-
-
-def _json_dict(payload: str | None) -> dict[str, Any] | None:
-    if not payload:
-        return None
-    return json.loads(payload)
-
-
-def _draft_key_from_json(item: dict[str, Any]) -> DraftReqKey:
-    return DraftReqKey(
-        src_verifier_rank=int(item["src_verifier_rank"]),
-        request_id=str(item["request_id"]),
-    )
-
-
-def _sync_from_json(item: dict[str, Any]) -> DraftSync:
-    return DraftSync(
-        request_id=str(item["request_id"]),
-        src_verifier_rank=int(item["src_verifier_rank"]),
-        dst_drafter_rank=int(item["dst_drafter_rank"]),
-        prompt_token_ids=[int(x) for x in item.get("prompt_token_ids", [])],
-        committed_output_ids=[int(x) for x in item.get("committed_output_ids", [])],
-    )
-
-
-def _segment_from_json(item: dict[str, Any]) -> VerifierCommitSegment:
-    return VerifierCommitSegment(
-        draft_key=_draft_key_from_json(item["draft_key"]),
-        dst_drafter_rank=int(item["dst_drafter_rank"]),
-        pre_verify_committed_len=int(item["pre_verify_committed_len"]),
-        committed_token_ids=[int(x) for x in item.get("committed_token_ids", [])],
-    )
-
-
-def _ready_controls_from_json(payload: str | None) -> ReadyDraftControls:
-    data = _json_dict(payload) or {}
-    return ReadyDraftControls(
-        sync_messages=[_sync_from_json(item) for item in data.get("sync_messages", [])],
-        close_keys={
-            _draft_key_from_json(item) for item in data.get("close_keys", [])
-        },
-        ready_commit_segments=[
-            _segment_from_json(item) for item in data.get("ready_commit_segments", [])
-        ],
-    )
 
 
 def _write_cpp_profile(tracer: Any, component: str, payload: str | None) -> None:
@@ -250,6 +104,101 @@ def _write_cpp_profile(tracer: Any, component: str, payload: str | None) -> None
             writer.writerow(out)
 
 
+def _sync_row(message: DraftSync) -> tuple[str, int, int, list[int], list[int]]:
+    return (
+        str(message.request_id),
+        int(message.src_verifier_rank),
+        int(message.dst_drafter_rank),
+        [int(x) for x in message.prompt_token_ids],
+        [int(x) for x in message.committed_output_ids],
+    )
+
+
+def _commit_row(message: VerifyCommit) -> tuple[str, int, int, int, list[int]]:
+    return (
+        str(message.request_id),
+        int(message.src_verifier_rank),
+        int(message.dst_drafter_rank),
+        int(message.pre_verify_committed_len),
+        [int(x) for x in message.committed_token_ids],
+    )
+
+
+def _close_row(message: DraftClose) -> tuple[str, int, int, str]:
+    return (
+        str(message.request_id),
+        int(message.src_verifier_rank),
+        int(message.dst_drafter_rank),
+        str(message.reason),
+    )
+
+
+def _tail_row(
+    output: DraftTailStreamOutput,
+) -> tuple[int, int, str, int, int, int]:
+    return (
+        int(output.src_drafter_rank),
+        int(output.dst_verifier_rank),
+        str(output.request_id),
+        int(output.base_committed_len),
+        int(output.new_token_pos),
+        int(output.new_token_id),
+    )
+
+
+def _draft_key_from_native(row: Any) -> DraftReqKey:
+    request_id, src_verifier_rank = row
+    return DraftReqKey(
+        src_verifier_rank=int(src_verifier_rank),
+        request_id=str(request_id),
+    )
+
+
+def _sync_from_native(row: Any) -> DraftSync:
+    (
+        request_id,
+        src_verifier_rank,
+        dst_drafter_rank,
+        prompt_token_ids,
+        committed_output_ids,
+    ) = row
+    return DraftSync(
+        request_id=str(request_id),
+        src_verifier_rank=int(src_verifier_rank),
+        dst_drafter_rank=int(dst_drafter_rank),
+        prompt_token_ids=[int(x) for x in prompt_token_ids],
+        committed_output_ids=[int(x) for x in committed_output_ids],
+    )
+
+
+def _segment_from_native(row: Any) -> VerifierCommitSegment:
+    (
+        request_id,
+        src_verifier_rank,
+        dst_drafter_rank,
+        pre_verify_committed_len,
+        committed_token_ids,
+    ) = row
+    return VerifierCommitSegment(
+        draft_key=DraftReqKey(
+            src_verifier_rank=int(src_verifier_rank),
+            request_id=str(request_id),
+        ),
+        dst_drafter_rank=int(dst_drafter_rank),
+        pre_verify_committed_len=int(pre_verify_committed_len),
+        committed_token_ids=[int(x) for x in committed_token_ids],
+    )
+
+
+def _ready_controls_from_native(rows: Any) -> ReadyDraftControls:
+    sync_rows, close_rows, segment_rows = rows
+    return ReadyDraftControls(
+        sync_messages=[_sync_from_native(row) for row in sync_rows],
+        close_keys={_draft_key_from_native(row) for row in close_rows},
+        ready_commit_segments=[_segment_from_native(row) for row in segment_rows],
+    )
+
+
 class CppDraftTailBuffer:
     def __init__(self, *, verifier_rank: int, required_tail_len: int) -> None:
         module = _load_decoupled_spec_cpp_module()
@@ -283,10 +232,29 @@ class CppDraftTailBuffer:
     def apply_control_batch(
         self, batch: DraftControlBatch, *, collect_stats: bool = False
     ) -> dict[str, Any] | None:
-        return _json_dict(
-            self._cpp.apply_control_batch(
-                _pack_control_batch(batch), bool(collect_stats)
-            )
+        return self.apply_control_rows(
+            int(batch.dst_drafter_rank),
+            [_sync_row(message) for message in batch.sync_messages],
+            [_commit_row(message) for message in batch.verify_commit_messages],
+            [_close_row(message) for message in batch.close_messages],
+            collect_stats=collect_stats,
+        )
+
+    def apply_control_rows(
+        self,
+        dst_drafter_rank: int,
+        sync_rows: list[tuple],
+        commit_rows: list[tuple],
+        close_rows: list[tuple],
+        *,
+        collect_stats: bool = False,
+    ) -> dict[str, Any] | None:
+        return self._cpp.apply_control_batch_native(
+            int(dst_drafter_rank),
+            list(sync_rows),
+            list(commit_rows),
+            list(close_rows),
+            bool(collect_stats),
         )
 
     def append_draft_stream_batch(
@@ -294,15 +262,23 @@ class CppDraftTailBuffer:
     ) -> dict[str, Any] | None:
         if not batch.outputs:
             return None
-        return _json_dict(
-            self._cpp.append_draft_stream_batch(
-                _pack_tail_stream_batch(batch), bool(collect_stats)
-            )
+        return self.append_draft_rows(
+            [_tail_row(output) for output in batch.outputs],
+            collect_stats=collect_stats,
+        )
+
+    def append_draft_rows(
+        self, rows: list[tuple], *, collect_stats: bool = False
+    ) -> dict[str, Any] | None:
+        if not rows:
+            return None
+        return self._cpp.append_draft_stream_batch_native(
+            list(rows), bool(collect_stats)
         )
 
     def wait_for_draft_tokens(self, rids: list[str], min_draft_tokens: int) -> None:
-        self._cpp.wait_for_draft_tokens(
-            _pack_string_list([str(rid) for rid in rids]), int(min_draft_tokens)
+        self._cpp.wait_for_draft_tokens_native(
+            [str(rid) for rid in rids], int(min_draft_tokens)
         )
 
     def get_draft_snapshots(
@@ -315,20 +291,19 @@ class CppDraftTailBuffer:
     ) -> list[DraftTailSnapshot]:
         rids = [str(req.rid) for req in reqs]
         tail_cap = -1 if max_tail_len is None else max(0, int(max_tail_len))
-        payload = self._cpp.get_draft_snapshots(
-            _pack_string_list(rids),
+        rows = self._cpp.get_draft_snapshots_native(
+            rids,
             bool(allow_partial),
             bool(include_raw_tail_tokens),
             int(tail_cap),
         )
-        rows = json.loads(payload or "[]")
         return [
             DraftTailSnapshot(
-                request_id=str(row["request_id"]),
-                committed_len=int(row["committed_len"]),
-                tail_tokens=[int(x) for x in row.get("tail_tokens", [])],
-                raw_tail_len=int(row.get("raw_tail_len", 0)),
-                raw_tail_tokens=[int(x) for x in row.get("raw_tail_tokens", [])],
+                request_id=str(row[0]),
+                committed_len=int(row[1]),
+                tail_tokens=[int(x) for x in row[2]],
+                raw_tail_len=int(row[3]),
+                raw_tail_tokens=[int(x) for x in row[4]],
             )
             for row in rows
         ]
@@ -353,15 +328,25 @@ class _CppDraftControlInboxProxy:
     ) -> ReadyDraftControls:
         if int(self._cpp.pending_control_count()) <= 0:
             return ReadyDraftControls()
-        pending = json.loads(self._cpp.snapshot_pending_commit_segments() or "[]")
+        pending = self._cpp.snapshot_pending_commit_segments_native()
         decisions: list[tuple[VerifierCommitSegment, int]] = []
-        for item in pending:
-            segment = _segment_from_json(item)
+        for row in pending:
+            segment = _segment_from_native(row)
             consumable_len = int(consumable_commit_len(segment))
             if consumable_len > 0:
                 decisions.append((segment, consumable_len))
-        return _ready_controls_from_json(
-            self._cpp.extract_ready_controls(_pack_extract_decisions(decisions))
+        decision_rows = [
+            (
+                segment.draft_key.request_id,
+                int(segment.draft_key.src_verifier_rank),
+                int(segment.dst_drafter_rank),
+                int(segment.pre_verify_committed_len),
+                int(consumable_len),
+            )
+            for segment, consumable_len in decisions
+        ]
+        return _ready_controls_from_native(
+            self._cpp.extract_ready_controls_native(decision_rows)
         )
 
 
@@ -406,7 +391,7 @@ class CppTokenSyncThread:
 
     def configure_peer_endpoints(self, verifier_result_endpoints: list[str]) -> None:
         endpoints = [str(endpoint) for endpoint in verifier_result_endpoints]
-        self._cpp.configure_peer_endpoints(_pack_string_list(endpoints))
+        self._cpp.configure_peer_endpoints_native(endpoints)
         self.verifier_result_endpoints = endpoints
 
     @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
@@ -422,7 +407,13 @@ class CppTokenSyncThread:
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
             return
-        self._cpp.submit_draft_results(_pack_tail_stream_batch(result_batch))
+        self.submit_draft_result_rows([_tail_row(output) for output in result_batch.outputs])
+        self._maybe_flush_cpp_profile()
+
+    def submit_draft_result_rows(self, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        self._cpp.submit_draft_results_native(list(rows))
         self._maybe_flush_cpp_profile()
 
 
@@ -477,32 +468,32 @@ class CppDraftProxyThread:
 
     def configure_peer_endpoints(self, drafter_control_endpoints: list[str]) -> None:
         endpoints = [str(endpoint) for endpoint in drafter_control_endpoints]
-        self._cpp.configure_peer_endpoints(_pack_string_list(endpoints))
+        self._cpp.configure_peer_endpoints_native(endpoints)
         self.drafter_control_endpoints = endpoints
 
     def submit_control_batch(self, batch: DraftControlBatch) -> None:
         if not self.drafter_control_endpoints:
             raise RuntimeError("Decoupled verify peer endpoints are not configured")
-        self._apply_control_batch(batch)
-        self._enqueue_control_batch(batch)
-
-    @trace_speculative(
-        SpecTraceEvent.DRAFT_PROXY_APPLY_CONTROL_BATCH,
-        inject_trace_enabled="collect_trace_stats",
-    )
-    def _apply_control_batch(
-        self,
-        batch: DraftControlBatch,
-        *,
-        collect_trace_stats: bool = False,
-    ) -> dict[str, Any] | None:
-        result = self.draft_tail_buffer.apply_control_batch(
-            batch, collect_stats=collect_trace_stats
+        self.submit_control_rows(
+            int(batch.dst_drafter_rank),
+            [_sync_row(message) for message in batch.sync_messages],
+            [_commit_row(message) for message in batch.verify_commit_messages],
+            [_close_row(message) for message in batch.close_messages],
         )
-        self._maybe_flush_cpp_profile()
-        return result
 
-    @trace_speculative(SpecTraceEvent.DRAFT_PROXY_SEND_CONTROL_BATCH)
-    def _enqueue_control_batch(self, batch: DraftControlBatch) -> None:
-        self._cpp.submit_control_batch(_pack_control_batch(batch))
+    def submit_control_rows(
+        self,
+        dst_drafter_rank: int,
+        sync_rows: list[tuple],
+        commit_rows: list[tuple],
+        close_rows: list[tuple],
+    ) -> None:
+        if not self.drafter_control_endpoints:
+            raise RuntimeError("Decoupled verify peer endpoints are not configured")
+        self._cpp.submit_control_batch_native(
+            int(dst_drafter_rank),
+            list(sync_rows),
+            list(commit_rows),
+            list(close_rows),
+        )
         self._maybe_flush_cpp_profile()

@@ -270,6 +270,22 @@ def parse_args() -> argparse.Namespace:
             "engine when --speculative-adaptive is enabled."
         ),
     )
+    parser.add_argument(
+        "--decoupled-verify-throughput-profile-path",
+        default=None,
+        help=(
+            "Optional JSON cost-table cache file for decoupled verifier "
+            "throughput-aware startup profiling."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-bs-decode",
+        default=None,
+        help=(
+            "Comma-separated decode CUDA Graph batch sizes for target/verifier "
+            "and baseline target engines, e.g. 32,64,128."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--deterministic",
@@ -736,6 +752,15 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         raise ValueError("draft-tp-size must be positive")
     if args.max_running_requests is not None and args.max_running_requests <= 0:
         raise ValueError("max-running-requests must be positive when set")
+    if args.cuda_graph_bs_decode is not None:
+        args.cuda_graph_bs_decode = [
+            int(item)
+            for item in str(args.cuda_graph_bs_decode).replace(",", " ").split()
+        ]
+        if not args.cuda_graph_bs_decode or any(
+            bs <= 0 for bs in args.cuda_graph_bs_decode
+        ):
+            raise ValueError("cuda-graph-bs-decode must contain positive integers")
     if (
         args.speculative_adaptive
         and args.speculative_adaptive_strategy == "ema"
@@ -1157,6 +1182,10 @@ def launch_target_actors(
             speculative_adaptive=args.speculative_adaptive,
             speculative_adaptive_strategy=args.speculative_adaptive_strategy,
             speculative_adaptive_config=args.speculative_adaptive_config,
+            decoupled_verify_throughput_profile_path=(
+                args.decoupled_verify_throughput_profile_path
+            ),
+            cuda_graph_bs_decode=args.cuda_graph_bs_decode,
             rank_base=rank_base,
             deterministic=args.deterministic,
             spec_trace_dir=args.spec_trace_dir,

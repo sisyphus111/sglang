@@ -1,7 +1,12 @@
 import bisect
 import contextlib
 import dataclasses
+import hashlib
+import json
 import logging
+import os
+import re
+import tempfile
 import time
 from array import array
 from typing import List, Optional, Tuple
@@ -45,6 +50,7 @@ from sglang.srt.speculative.adaptive_spec_params import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.decoupled_verify_throughput_controller import (
+    BatchSizeCostTable,
     DecoupledVerifyThroughputAwareController,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -72,6 +78,7 @@ logger = logging.getLogger(__name__)
 
 _THROUGHPUT_PROFILE_WARMUP_ITERS = 5
 _THROUGHPUT_PROFILE_MEASURE_ITERS = 1000
+_THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION = 1
 
 
 def _get_req_tail_token_id(req) -> int:
@@ -384,6 +391,190 @@ class VerifyWorker(BaseSpecWorker):
             self._throughput_max_speculative_steps()
         )
 
+    def _throughput_profile_cache_path(self) -> Optional[str]:
+        path = getattr(
+            self.server_args,
+            "decoupled_verify_throughput_profile_path",
+            None,
+        )
+        return None if path is None else str(path)
+
+    def _throughput_profile_model_identity(self, path: object) -> tuple[str, str]:
+        raw_path = "none" if path is None else str(path)
+        name = os.path.basename(raw_path.rstrip(os.sep)) or raw_path
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")
+        if not slug:
+            slug = "model"
+        if len(slug) > 48:
+            slug = slug[:48].rstrip("-._")
+        digest = hashlib.sha256(raw_path.encode("utf-8")).hexdigest()[:12]
+        return slug, digest
+
+    def _throughput_profile_capture_hash(self, capture_bs: List[int]) -> str:
+        encoded = ",".join(str(int(bs)) for bs in sorted(set(capture_bs)))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+    def _throughput_profile_fingerprint(self, capture_bs: List[int]) -> dict:
+        target_model_path = str(getattr(self.server_args, "model_path", ""))
+        target_dp_size = int(getattr(self.server_args, "dp_size", 1) or 1)
+        enable_dp_attention = bool(
+            getattr(self.server_args, "enable_dp_attention", False)
+        )
+        engine_tp_size = int(getattr(self.server_args, "tp_size", 1) or 1)
+        target_tp_size = (
+            engine_tp_size // max(1, target_dp_size)
+            if enable_dp_attention
+            else engine_tp_size
+        )
+        return {
+            "target_model_path": target_model_path,
+            "target_tp_size": target_tp_size,
+            "target_dp_size": target_dp_size,
+            "enable_dp_attention": enable_dp_attention,
+            "max_steps": int(self._throughput_max_speculative_steps() or 0),
+            "capture_bs": sorted({int(bs) for bs in capture_bs}),
+        }
+
+    def _expected_throughput_profile_cache_basename(
+        self, capture_bs: List[int]
+    ) -> str:
+        fingerprint = self._throughput_profile_fingerprint(capture_bs)
+        target_slug, target_hash = self._throughput_profile_model_identity(
+            fingerprint["target_model_path"]
+        )
+        capture_hash = self._throughput_profile_capture_hash(
+            fingerprint["capture_bs"]
+        )
+        dp_attention = 1 if fingerprint["enable_dp_attention"] else 0
+        return (
+            "decoupled_verify_throughput"
+            f"__target-{target_slug}-{target_hash}"
+            f"__targettp-{fingerprint['target_tp_size']}"
+            f"__targetdp-{fingerprint['target_dp_size']}"
+            f"__dpa-{dp_attention}"
+            f"__maxsteps-{fingerprint['max_steps']}"
+            f"__cgraph-{capture_hash}.json"
+        )
+
+    def _load_throughput_profile_cache(
+        self,
+        *,
+        controller: DecoupledVerifyThroughputAwareController,
+        profile_path: str,
+        expected_basename: str,
+        profile_bs_by_step: dict[int, List[int]],
+    ) -> bool:
+        actual_basename = os.path.basename(profile_path)
+        if actual_basename != expected_basename:
+            log_info_on_rank0(
+                logger,
+                "Decoupled verifier throughput-aware profile cache miss: "
+                f"basename mismatch, expected={expected_basename}, "
+                f"actual={actual_basename}, path={profile_path}",
+            )
+            return False
+        if not os.path.exists(profile_path):
+            log_info_on_rank0(
+                logger,
+                "Decoupled verifier throughput-aware profile cache miss: "
+                f"path does not exist, path={profile_path}",
+            )
+            return False
+
+        try:
+            with open(profile_path) as f:
+                payload = json.load(f)
+            if payload.get("schema_version") != _THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"unsupported schema_version={payload.get('schema_version')!r}"
+                )
+            costs = payload.get("costs")
+            if not isinstance(costs, list):
+                raise ValueError("costs must be a list")
+
+            cost_table = BatchSizeCostTable()
+            for entry in costs:
+                if not isinstance(entry, dict):
+                    raise ValueError(f"cost entry must be an object, got {entry!r}")
+                cost_table.set(
+                    batch_size=entry["batch_size"],
+                    steps=entry["steps"],
+                    cost_ms=entry["cost_ms"],
+                )
+
+            missing = [
+                (int(bs), int(steps))
+                for steps, batch_sizes in profile_bs_by_step.items()
+                for bs in batch_sizes
+                if not cost_table.has_exact(batch_size=bs, steps=steps)
+            ]
+            if missing:
+                raise ValueError(f"missing cost entries: {missing}")
+
+            for batch_size, steps, cost_ms in cost_table.items():
+                controller.set_profile_cost(
+                    batch_size=batch_size,
+                    steps=steps,
+                    cost_ms=cost_ms,
+                )
+        except Exception as exc:
+            log_info_on_rank0(
+                logger,
+                "Decoupled verifier throughput-aware profile cache miss: "
+                f"failed to load {profile_path}: {exc}",
+            )
+            return False
+
+        log_info_on_rank0(
+            logger,
+            "Loaded decoupled verifier throughput-aware profile data from "
+            f"{profile_path}: cost_table={controller.cost_table_summary()}",
+        )
+        return True
+
+    def _write_throughput_profile_cache(
+        self,
+        *,
+        profile_path: str,
+        capture_bs: List[int],
+        controller: DecoupledVerifyThroughputAwareController,
+    ) -> None:
+        payload = {
+            "schema_version": _THROUGHPUT_PROFILE_CACHE_SCHEMA_VERSION,
+            "summary": controller.cost_table_summary(),
+            "fingerprint": self._throughput_profile_fingerprint(capture_bs),
+            "costs": [
+                {
+                    "batch_size": batch_size,
+                    "steps": steps,
+                    "cost_ms": cost_ms,
+                }
+                for batch_size, steps, cost_ms in controller.cost_table_items()
+            ],
+        }
+        output_dir = os.path.dirname(os.path.abspath(profile_path))
+        os.makedirs(output_dir, exist_ok=True)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                suffix=".tmp",
+                prefix=os.path.basename(profile_path) + ".",
+                dir=output_dir,
+                delete=False,
+            ) as f:
+                tmp_path = f.name
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, profile_path)
+        except Exception:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
+
     def run_startup_spec_profiling(self, tree_cache) -> None:
         if not self._use_throughput_aware_adaptive_verify():
             return
@@ -424,36 +615,59 @@ class VerifyWorker(BaseSpecWorker):
             initial_steps=initial_steps,
         )
 
+        profile_path = self._throughput_profile_cache_path()
+        loaded_from_cache = False
+        if profile_path is not None:
+            expected_basename = self._expected_throughput_profile_cache_basename(
+                profile_capture_bs
+            )
+            loaded_from_cache = self._load_throughput_profile_cache(
+                controller=controller,
+                profile_path=profile_path,
+                expected_basename=expected_basename,
+                profile_bs_by_step=profile_bs_by_step,
+            )
+
         profile_rows: list[tuple[int, int, float, float]] = []
-        for steps in sorted(self._throughput_profile_states_by_step):
-            state = self._throughput_profile_states_by_step[steps]
-            capture_bs = profile_capture_bs_by_step.get(steps, [])
-            for bs in profile_bs_by_step.get(steps, []):
-                padded_graph_bs = self._throughput_profile_padded_graph_bs(
-                    bs, capture_bs
-                )
-                avg_decode_ms = self._profile_throughput_shape(
-                    batch_size=int(bs),
-                    steps=int(steps),
-                    state=state,
-                    tree_cache=tree_cache,
-                )
-                avg_decode_ms = self._max_reduce_profile_ms(avg_decode_ms)
-                throughput = int(bs) * (int(steps) + 1) * 1000.0 / avg_decode_ms
-                controller.set_profile_cost(
-                    batch_size=int(bs),
-                    steps=int(steps),
-                    cost_ms=avg_decode_ms,
-                )
-                profile_rows.append((int(bs), int(steps), avg_decode_ms, throughput))
-                log_info_on_rank0(
-                    logger,
-                    "Decoupled verifier throughput-aware profile point: "
-                    f"bs={int(bs)}, steps={int(steps)}, "
-                    f"padded_graph_bs={padded_graph_bs}, "
-                    f"verify_tokens_per_req={int(steps) + 1}, "
-                    f"avg_decode_ms={avg_decode_ms:.4f}, "
-                    f"throughput={throughput:.2f} tok/s",
+        if not loaded_from_cache:
+            for steps in sorted(self._throughput_profile_states_by_step):
+                state = self._throughput_profile_states_by_step[steps]
+                capture_bs = profile_capture_bs_by_step.get(steps, [])
+                for bs in profile_bs_by_step.get(steps, []):
+                    padded_graph_bs = self._throughput_profile_padded_graph_bs(
+                        bs, capture_bs
+                    )
+                    avg_decode_ms = self._profile_throughput_shape(
+                        batch_size=int(bs),
+                        steps=int(steps),
+                        state=state,
+                        tree_cache=tree_cache,
+                    )
+                    avg_decode_ms = self._max_reduce_profile_ms(avg_decode_ms)
+                    throughput = int(bs) * (int(steps) + 1) * 1000.0 / avg_decode_ms
+                    controller.set_profile_cost(
+                        batch_size=int(bs),
+                        steps=int(steps),
+                        cost_ms=avg_decode_ms,
+                    )
+                    profile_rows.append(
+                        (int(bs), int(steps), avg_decode_ms, throughput)
+                    )
+                    log_info_on_rank0(
+                        logger,
+                        "Decoupled verifier throughput-aware profile point: "
+                        f"bs={int(bs)}, steps={int(steps)}, "
+                        f"padded_graph_bs={padded_graph_bs}, "
+                        f"verify_tokens_per_req={int(steps) + 1}, "
+                        f"avg_decode_ms={avg_decode_ms:.4f}, "
+                        f"throughput={throughput:.2f} tok/s",
+                    )
+
+            if profile_path is not None:
+                self._write_throughput_profile_cache(
+                    profile_path=profile_path,
+                    capture_bs=profile_capture_bs,
+                    controller=controller,
                 )
 
         for steps, state in self._throughput_profile_states_by_step.items():

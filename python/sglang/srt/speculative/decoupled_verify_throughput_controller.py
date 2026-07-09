@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import os
 from collections import deque
 from typing import Optional
 
@@ -16,9 +17,13 @@ from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WINDOW_SIZE = 20
+DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WINDOW_SIZE = 50
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_UPDATE_INTERVAL = 5
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS = 0.1
+
+
+def _ta_debug_enabled() -> bool:
+    return os.environ.get("SGLANG_TA_DEBUG") == "1"
 
 
 class PositionAcceptanceTracker:
@@ -144,6 +149,15 @@ class BatchSizeCostTable:
             index = len(batch_sizes) - 1
         return self._data.get((batch_sizes[index], int(steps)))
 
+    def has_exact(self, batch_size: int, steps: int) -> bool:
+        return (int(batch_size), int(steps)) in self._data
+
+    def items(self) -> list[tuple[int, int, float]]:
+        return [
+            (batch_size, steps, cost_ms)
+            for (batch_size, steps), cost_ms in sorted(self._data.items())
+        ]
+
     def is_empty(self) -> bool:
         return not self._data
 
@@ -169,6 +183,7 @@ def score_decoupled_verify_candidates(
     rows = []
     for raw_steps in candidate_steps:
         steps = int(raw_steps)
+        position_accept_rates = tracker.snapshot_position_rates(steps)
         expected = tracker.get_expected_tokens(steps)
         cost_ms = cost_table.lookup(batch_size, steps)
         score = (
@@ -182,6 +197,19 @@ def score_decoupled_verify_candidates(
                 "expected": expected,
                 "cost_ms": cost_ms,
                 "score": score,
+                "position_accept_rates": position_accept_rates,
+                "position_accept_sources": [
+                    (
+                        "unknown"
+                        if rate is None
+                        else (
+                            "extra"
+                            if tracker.is_position_extrapolated(position)
+                            else "win"
+                        )
+                    )
+                    for position, rate in enumerate(position_accept_rates)
+                ],
             }
         )
     return rows
@@ -226,14 +254,36 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         expected = row["expected"]
         cost_ms = row["cost_ms"]
         score = row["score"]
+        accept_rates = row.get("position_accept_rates") or []
+        accept_sources = row.get("position_accept_sources") or []
+        rate_parts = []
+        for position, rate in enumerate(accept_rates):
+            source = accept_sources[position] if position < len(accept_sources) else "?"
+            if rate is None:
+                rate_parts.append(f"p{position + 1}=?")
+            else:
+                rate_parts.append(f"p{position + 1}={rate:.3f}:{source}")
+        rate_text = f",rates=[{','.join(rate_parts)}]" if rate_parts else ""
         if score is None:
-            parts.append(f"S={row['steps']}:score=?{marker}")
+            parts.append(f"S={row['steps']}:score=?{rate_text}{marker}")
         else:
             parts.append(
                 f"S={row['steps']}:E={expected:.3f}/cost={cost_ms:.4f}ms"
-                f"={score:.6f}{marker}"
+                f"={score:.6f}{rate_text}{marker}"
             )
     return "[" + ", ".join(parts) + "]"
+
+
+def _score_for_step(rows: list[dict], steps: int) -> Optional[float]:
+    for row in rows:
+        if int(row["steps"]) == int(steps):
+            score = row.get("score")
+            return None if score is None else float(score)
+    return None
+
+
+def _format_optional_score(score: Optional[float]) -> str:
+    return "?" if score is None else f"{score:.6f}"
 
 
 class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
@@ -298,6 +348,9 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
     def cost_table_summary(self) -> str:
         return self._cost_table.summary()
 
+    def cost_table_items(self) -> list[tuple[int, int, float]]:
+        return self._cost_table.items()
+
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
@@ -337,18 +390,64 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
                 hysteresis=self._switch_hysteresis,
             )
 
+        if _ta_debug_enabled():
+            current_score = _score_for_step(rows, self._current_steps)
+            best_score = _score_for_step(rows, best_steps)
+            score_ratio = (
+                best_score / current_score
+                if best_score is not None
+                and current_score is not None
+                and current_score > 0
+                else None
+            )
+            log_info_on_rank0(
+                logger,
+                "[TA-VERIFY-SCORE] "
+                f"batch_count={self._batch_count}, bs={int(batch_size)}, "
+                f"active_steps={self._current_steps}, "
+                f"scores={format_score_rows(rows, best_steps)}, "
+                f"best_steps={best_steps}, "
+                f"current_score={_format_optional_score(current_score)}, "
+                f"best_score={_format_optional_score(best_score)}, "
+                f"best_over_current={_format_optional_score(score_ratio)}, "
+                f"switch_hysteresis={self._switch_hysteresis:.4f}",
+            )
+
         if best_steps == self._current_steps:
             return
 
         old_steps = self._current_steps
+        current_score = _score_for_step(rows, old_steps)
+        best_score = _score_for_step(rows, best_steps)
+        score_ratio = (
+            best_score / current_score
+            if best_score is not None and current_score is not None and current_score > 0
+            else None
+        )
         if best_steps < old_steps:
             self._tracker.clear_positions_above(best_steps)
         self._current_steps = best_steps
+        if _ta_debug_enabled():
+            log_info_on_rank0(
+                logger,
+                "[TA-VERIFY-SWITCH] "
+                f"batch_count={self._batch_count}, bs={int(batch_size)}, "
+                f"from_steps={old_steps}, to_steps={best_steps}, "
+                f"current_score={_format_optional_score(current_score)}, "
+                f"best_score={_format_optional_score(best_score)}, "
+                f"best_over_current={_format_optional_score(score_ratio)}, "
+                f"switch_hysteresis={self._switch_hysteresis:.4f}, "
+                f"reason=score_hysteresis",
+            )
         log_info_on_rank0(
             logger,
             "Decoupled verifier throughput-aware step switch: "
             f"steps {old_steps} -> {best_steps}, bs={int(batch_size)}, "
-            f"batch_count={self._batch_count}, scores={format_score_rows(rows, best_steps)}",
+            f"batch_count={self._batch_count}, "
+            f"current_score={_format_optional_score(current_score)}, "
+            f"best_score={_format_optional_score(best_score)}, "
+            f"best_over_current={_format_optional_score(score_ratio)}, "
+            f"scores={format_score_rows(rows, best_steps)}",
         )
 
     def _positive_candidate_steps(self) -> list[int]:
