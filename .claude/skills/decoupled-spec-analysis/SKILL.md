@@ -44,7 +44,6 @@ paths and matrix choices in TOML instead of editing Python constants.
 - Keep `max_running_requests >= batch_size + 1`; reject configs that can queue the
   measured requests.
 - Leave `ignore_eos=false` unless the user explicitly requests changed outputs.
-- Leave `spec_trace_dir` unset unless traces are explicitly requested.
 - Do not require `SGLANG_TA_DEBUG`, `SGLANG_LOG_FORWARD_ITERS`, or
   `SGLANG_RECORD_STEP_TIME`; scheduler INFO is the base data source.
 - Unless overridden by the requested experiment, capture/profile CUDA graph batch

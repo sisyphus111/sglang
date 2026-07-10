@@ -29,7 +29,6 @@ class DraftTailSnapshot:
     committed_len: int
     tail_tokens: list[int]
     raw_tail_len: int = 0
-    raw_tail_tokens: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -124,7 +123,7 @@ class DraftTailBuffer:
                 self._apply_commit_locked(message)
             self._condition.notify_all()
 
-    def _apply_commit_locked(self, message: VerifyCommit) -> dict | None:
+    def _apply_commit_locked(self, message: VerifyCommit) -> None:
         message.validate_committed_token_ids()
         state = self._states.get(message.request_id)
         old_committed_len = int(message.pre_verify_committed_len)
@@ -132,24 +131,8 @@ class DraftTailBuffer:
             int(token_id) for token_id in message.committed_token_ids
         ]
         committed_segment_len = len(committed_token_ids)
-        last_committed_token_id = int(committed_token_ids[-1])
         if state is None:
-            return {
-                "request_id": message.request_id,
-                "pre_committed_len": old_committed_len,
-                "committed_segment_len": committed_segment_len,
-                "last_committed_token_id": last_committed_token_id,
-                "matched_tail_len": 0,
-                "raw_tail_len_before": 0,
-                "mismatch_tail_token_id": -1,
-                "mismatch_committed_token_id": committed_token_ids[0],
-                "preserved_suffix_len": 0,
-                "tail_len_after": 0,
-                "committed_len_after": 0,
-                "pending_expected_len_before": 0,
-                "pending_expected_len_after": 0,
-                "pending_expected_added": 0,
-            }
+            return
 
         pending_expected_len_before = len(state.pending_expected_tokens)
         target_committed_len = int(state.committed_len) + pending_expected_len_before
@@ -178,22 +161,7 @@ class DraftTailBuffer:
             state.pending_expected_tokens.extend(
                 token_id for token_id in committed_token_ids
             )
-            return {
-                "request_id": message.request_id,
-                "pre_committed_len": old_committed_len,
-                "committed_segment_len": committed_segment_len,
-                "last_committed_token_id": last_committed_token_id,
-                "matched_tail_len": 0,
-                "raw_tail_len_before": raw_tail_len_before,
-                "mismatch_tail_token_id": -1,
-                "mismatch_committed_token_id": committed_token_ids[0],
-                "preserved_suffix_len": 0,
-                "tail_len_after": 0,
-                "committed_len_after": int(state.committed_len),
-                "pending_expected_len_before": pending_expected_len_before,
-                "pending_expected_len_after": len(state.pending_expected_tokens),
-                "pending_expected_added": len(committed_token_ids),
-            }
+            return
 
         matched_tail_len = 0
         max_possible_match_len = min(committed_segment_len, raw_tail_len_before)
@@ -208,10 +176,6 @@ class DraftTailBuffer:
             del state.tail_tokens[:matched_tail_len]
             state.committed_len += matched_tail_len
 
-        mismatch_tail_token_id = -1
-        mismatch_committed_token_id = -1
-        pending_expected_added = 0
-        preserved_suffix_len = len(state.tail_tokens)
         if matched_tail_len < committed_segment_len:
             # matched_tail_len < committed_segment_len means the verifier-
             # committed segment is not fully matched by the draft tail.
@@ -230,32 +194,11 @@ class DraftTailBuffer:
             # output with stale base before the mismatch will be rejected, even
             # if it matches the preserved tail suffix.
             if matched_tail_len < raw_tail_len_before:
-                mismatch_tail_token_id = int(state.tail_tokens[0])
                 state.can_accept_prefix_len = int(state.committed_len)
-            mismatch_committed_token_id = committed_token_ids[matched_tail_len]
             state.tail_tokens = []
             state.pending_expected_tokens.extend(
                 committed_token_ids[matched_tail_len:]
             )
-            pending_expected_added = committed_segment_len - matched_tail_len
-            preserved_suffix_len = 0
-
-        return {
-            "request_id": message.request_id,
-            "pre_committed_len": old_committed_len,
-            "committed_segment_len": committed_segment_len,
-            "last_committed_token_id": last_committed_token_id,
-            "matched_tail_len": matched_tail_len,
-            "raw_tail_len_before": raw_tail_len_before,
-            "mismatch_tail_token_id": mismatch_tail_token_id,
-            "mismatch_committed_token_id": mismatch_committed_token_id,
-            "preserved_suffix_len": preserved_suffix_len,
-            "tail_len_after": len(state.tail_tokens),
-            "committed_len_after": int(state.committed_len),
-            "pending_expected_len_before": pending_expected_len_before,
-            "pending_expected_len_after": len(state.pending_expected_tokens),
-            "pending_expected_added": pending_expected_added,
-        }
 
     def close_requests(self, messages: list[DraftClose]) -> None:
         if not messages:
@@ -350,19 +293,14 @@ class DraftTailBuffer:
     def apply_control_batch(
         self,
         batch: DraftControlBatch,
-        *,
-        collect_stats: bool = False,
-    ) -> dict | None:
+    ) -> None:
         start_ns = decoupled_spec_timing_start()
-        commit_stats: list[dict] = []
         try:
             with self._condition:
                 for message in batch.sync_messages:
                     self._open_request_locked(message)
                 for message in batch.verify_commit_messages:
-                    commit_stat = self._apply_commit_locked(message)
-                    if collect_stats and commit_stat is not None:
-                        commit_stats.append(commit_stat)
+                    self._apply_commit_locked(message)
                 for message in batch.close_messages:
                     self._close_request_locked(message)
                 self._condition.notify_all()
@@ -385,67 +323,18 @@ class DraftTailBuffer:
                     + len(batch.close_messages)
                 ),
             )
-        if not collect_stats:
-            return None
-        return {
-            "commit_rids": [item["request_id"] for item in commit_stats],
-            "pre_committed_lens_by_req": [
-                item["pre_committed_len"] for item in commit_stats
-            ],
-            "committed_segment_lens_by_req": [
-                item["committed_segment_len"] for item in commit_stats
-            ],
-            "last_committed_token_ids_by_req": [
-                item["last_committed_token_id"] for item in commit_stats
-            ],
-            "matched_tail_lens_by_req": [
-                item["matched_tail_len"] for item in commit_stats
-            ],
-            "raw_tail_lens_before_by_req": [
-                item["raw_tail_len_before"] for item in commit_stats
-            ],
-            "mismatch_tail_token_ids_by_req": [
-                item["mismatch_tail_token_id"] for item in commit_stats
-            ],
-            "mismatch_committed_token_ids_by_req": [
-                item["mismatch_committed_token_id"] for item in commit_stats
-            ],
-            "preserved_suffix_lens_by_req": [
-                item["preserved_suffix_len"] for item in commit_stats
-            ],
-            "tail_lens_after_by_req": [item["tail_len_after"] for item in commit_stats],
-            "committed_lens_after_by_req": [
-                item["committed_len_after"] for item in commit_stats
-            ],
-            "pending_expected_lens_before_by_req": [
-                item["pending_expected_len_before"] for item in commit_stats
-            ],
-            "pending_expected_lens_after_by_req": [
-                item["pending_expected_len_after"] for item in commit_stats
-            ],
-            "pending_expected_added_by_req": [
-                item["pending_expected_added"] for item in commit_stats
-            ],
-        }
 
     def append_draft_stream_batch(
         self,
         batch: DraftTailStreamOutputBatch,
-        *,
-        collect_stats: bool = False,
-    ) -> dict | None:
+    ) -> None:
         if not batch.outputs:
-            return None
+            return
         start_ns = decoupled_spec_timing_start()
-        append_stats = self._new_append_stats(batch) if collect_stats else None
         try:
             with self._condition:
                 for output in batch.outputs:
-                    result = self._push_one_locked(batch, output)
-                    if append_stats is not None:
-                        self._record_append_result_locked(append_stats, output, result)
-                if append_stats is not None:
-                    self._fill_append_after_lens_locked(append_stats)
+                    self._push_one_locked(batch, output)
                 self._condition.notify_all()
                 self._print_buffer_debug_locked(
                     op="append_draft_stream_batch",
@@ -458,13 +347,12 @@ class DraftTailBuffer:
                 start_ns=start_ns,
                 items=len(batch.outputs),
             )
-        return append_stats
 
     def _push_one_locked(
         self,
         batch: DraftTailStreamOutputBatch,
         output: DraftTailStreamOutput,
-    ) -> str:
+    ) -> None:
         request_id = output.request_id
         base_committed_len = int(output.base_committed_len)
         token_pos = int(output.new_token_pos)
@@ -488,7 +376,7 @@ class DraftTailBuffer:
         state = self._states.get(request_id)
         if state is None:
             # the verifier may have already closed this request, and the drafter still sends stream outputs
-            return "unknown_request"
+            return
 
         state_committed_len = int(state.committed_len)
         can_accept_prefix_len = int(state.can_accept_prefix_len)
@@ -525,13 +413,13 @@ class DraftTailBuffer:
                 f"tail_tokens={list(state.tail_tokens)}"
             )
             if base_committed_len < can_accept_prefix_len:
-                return "stale_base"
+                return
             if token_pos < state_committed_len:
-                return "already_committed"
+                return
             elif base_committed_len > state_committed_len:
-                return "pending_expected_gap"
+                return
             elif token_pos > state_committed_len:
-                return "pending_expected_gap"
+                return
             else:
                 # base_committed_len == state_committed_len and token_pos == state_committed_len,
                 # the token is expected to be the next committed token after the pending expected prefix
@@ -539,12 +427,12 @@ class DraftTailBuffer:
                 if token_id == expected_token_id:
                     state.pending_expected_tokens.popleft()
                     state.committed_len += 1
-                    return "pending_expected_match"
+                    return
                 else:
                     # Drafter and verifier mismatched on the expected next
                     # committed token, so push forward can_accept_prefix_len.
                     state.can_accept_prefix_len = int(state.committed_len)
-                    return "pending_expected_reject"
+                    return
 
         if base_committed_len > state_committed_len:
             raise RuntimeError(
@@ -565,10 +453,10 @@ class DraftTailBuffer:
             )
 
         if base_committed_len < can_accept_prefix_len:
-            return "stale_base"
+            return
 
         if token_pos < state_committed_len:
-            return "already_committed"
+            return
 
         if token_pos < buffer_end_len:
             existing_token_id = int(state.tail_tokens[token_pos - state_committed_len])
@@ -590,7 +478,7 @@ class DraftTailBuffer:
                     f"tail_tokens={list(state.tail_tokens)} "
                     f"{self._format_batch_debug_fields(batch)}"
                 )
-            return "duplicate"
+            return
 
         if token_pos > buffer_end_len:
             if base_committed_len == state_committed_len:
@@ -610,10 +498,9 @@ class DraftTailBuffer:
                     f"tail_tokens={list(state.tail_tokens)} "
                     f"{self._format_batch_debug_fields(batch)}"
                 )
-            return "stale_gap"
+            return
 
         state.tail_tokens.append(token_id)
-        return "appended"
 
     def _format_batch_debug_fields(self, batch: DraftTailStreamOutputBatch) -> str:
         return (
@@ -625,89 +512,6 @@ class DraftTailBuffer:
             f"batch_new_token_id="
             f"{[int(item.new_token_id) for item in batch.outputs]}"
         )
-
-    def _new_append_stats(self, batch: DraftTailStreamOutputBatch) -> dict:
-        request_ids: list[str] = []
-        index_by_request_id: dict[str, int] = {}
-        for output in batch.outputs:
-            if output.request_id in index_by_request_id:
-                continue
-            index_by_request_id[output.request_id] = len(request_ids)
-            request_ids.append(output.request_id)
-        return {
-            "rids": request_ids,
-            "_index_by_request_id": index_by_request_id,
-            "draft_token_lens_by_req": [0] * len(request_ids),
-            "appended_token_lens_by_req": [0] * len(request_ids),
-            "num_appended_outputs": 0,
-            "num_duplicate_outputs": 0,
-            "num_stale_base_outputs": 0,
-            "num_already_committed_outputs": 0,
-            "num_stale_gap_outputs": 0,
-            "num_unknown_request_outputs": 0,
-            "num_pending_expected_match_outputs": 0,
-            "num_pending_expected_reject_outputs": 0,
-            "num_pending_expected_gap_outputs": 0,
-        }
-
-    def _record_append_result_locked(
-        self,
-        append_stats: dict,
-        output: DraftTailStreamOutput,
-        result: str,
-    ) -> None:
-        index = append_stats["_index_by_request_id"][output.request_id]
-        append_stats["draft_token_lens_by_req"][index] += 1
-        if result == "appended":
-            append_stats["num_appended_outputs"] += 1
-            append_stats["appended_token_lens_by_req"][index] += 1
-        elif result == "duplicate":
-            append_stats["num_duplicate_outputs"] += 1
-        elif result == "stale_base":
-            append_stats["num_stale_base_outputs"] += 1
-        elif result == "already_committed":
-            append_stats["num_already_committed_outputs"] += 1
-        elif result == "stale_gap":
-            append_stats["num_stale_gap_outputs"] += 1
-        elif result == "unknown_request":
-            append_stats["num_unknown_request_outputs"] += 1
-        elif result == "pending_expected_match":
-            append_stats["num_pending_expected_match_outputs"] += 1
-        elif result == "pending_expected_reject":
-            append_stats["num_pending_expected_reject_outputs"] += 1
-        elif result == "pending_expected_gap":
-            append_stats["num_pending_expected_gap_outputs"] += 1
-        else:
-            raise RuntimeError(f"Unexpected draft stream append result: {result}")
-
-    def _fill_append_after_lens_locked(self, append_stats: dict) -> None:
-        tail_lens_after_by_req: list[int] = []
-        consumable_tail_lens_after_by_req: list[int] = []
-        committed_lens_after_by_req: list[int] = []
-        pending_expected_lens_after_by_req: list[int] = []
-        for request_id in append_stats["rids"]:
-            state = self._states.get(request_id)
-            if state is None:
-                tail_lens_after_by_req.append(0)
-                consumable_tail_lens_after_by_req.append(0)
-                committed_lens_after_by_req.append(0)
-                pending_expected_lens_after_by_req.append(0)
-                continue
-            tail_lens_after_by_req.append(len(state.tail_tokens))
-            consumable_tail_lens_after_by_req.append(state.consumable_tail_len())
-            committed_lens_after_by_req.append(int(state.committed_len))
-            pending_expected_lens_after_by_req.append(
-                len(state.pending_expected_tokens)
-            )
-        append_stats["tail_lens_after_by_req"] = tail_lens_after_by_req
-        append_stats["consumable_tail_lens_after_by_req"] = (
-            consumable_tail_lens_after_by_req
-        )
-        append_stats["committed_lens_after_by_req"] = committed_lens_after_by_req
-        append_stats["pending_expected_lens_after_by_req"] = (
-            pending_expected_lens_after_by_req
-        )
-        append_stats.pop("_index_by_request_id", None)
 
     def _has_min_draft_tokens_locked(
         self, rids: list[str], min_draft_tokens: int
@@ -751,7 +555,6 @@ class DraftTailBuffer:
         reqs: list,
         *,
         allow_partial: bool = True,
-        include_raw_tail_tokens: bool = False,
         max_tail_len: int | None = None,
     ) -> list[DraftTailSnapshot]:
         start_ns = decoupled_spec_timing_start()
@@ -782,11 +585,6 @@ class DraftTailBuffer:
                                 else state.consumable_tail_tokens()[:tail_cap]
                             ),
                             raw_tail_len=len(state.tail_tokens),
-                            raw_tail_tokens=(
-                                list(state.tail_tokens)
-                                if include_raw_tail_tokens
-                                else []
-                            ),
                         )
                     )
                 self._print_buffer_debug_locked(

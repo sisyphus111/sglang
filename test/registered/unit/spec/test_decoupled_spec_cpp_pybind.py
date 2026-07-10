@@ -27,9 +27,7 @@ class _Req:
 
 
 def _snapshot(buffer, rid: str):
-    return buffer.get_draft_snapshots(
-        [_Req(rid)], allow_partial=True, include_raw_tail_tokens=True
-    )[0]
+    return buffer.get_draft_snapshots([_Req(rid)], allow_partial=True)[0]
 
 
 def _exercise_tail_buffer(buffer):
@@ -88,7 +86,6 @@ def _exercise_tail_buffer(buffer):
             item.committed_len,
             item.tail_tokens,
             item.raw_tail_len,
-            item.raw_tail_tokens,
         )
         for item in [first, second, third, fourth, fifth]
     ]
@@ -115,14 +112,12 @@ class TestDecoupledSpecCppPybind(unittest.TestCase):
                 [("req-native", 0, 0, [1, 2], [3])],
                 [],
                 [],
-                False,
             )
             buffer.append_draft_stream_batch_native(
                 [(0, 0, "req-native", 1, 1, 10)],
-                False,
             )
             snapshots, wait_ns = buffer.get_draft_snapshots_native(
-                ["req-native"], True, True, -1
+                ["req-native"], True, -1
             )
             self.assertEqual(snapshots[0][0], "req-native")
             self.assertEqual(snapshots[0][2], [10])
@@ -254,7 +249,7 @@ class TestDecoupledSpecCppPybind(unittest.TestCase):
                     break
                 time.sleep(0.001)
             self.assertEqual(snapshot.committed_len, 2)
-            self.assertEqual(snapshot.raw_tail_tokens, [])
+            self.assertEqual(snapshot.raw_tail_len, 0)
         finally:
             token_sync.close()
             proxy.close()

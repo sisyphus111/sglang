@@ -465,7 +465,6 @@ def build_result(
             "num_draft_replicas": args.num_draft_replicas,
             "baseline": args.baseline,
             "show_responses": args.show_responses,
-            "spec_trace_dir": args.spec_trace_dir,
             "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL": actor_env_vars[
                 "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"
             ],

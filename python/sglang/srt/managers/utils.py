@@ -73,9 +73,6 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
-    # Decoupled-spec trace start timestamp.
-    decoupled_forward_start_ns: Optional[int] = None
-
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

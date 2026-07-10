@@ -261,11 +261,11 @@ class TestDecoupledDraftBatchState(unittest.TestCase):
         batch = SimpleNamespace(reqs=[req])
 
         with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(True):
-            trace_payload = SchedulerDecoupledDraftMixin.flush_draft_updates(
+            result = SchedulerDecoupledDraftMixin.flush_draft_updates(
                 scheduler, batch
             )
 
-        self.assertEqual(trace_payload["num_stream_outputs"], 1)
+        self.assertIsNone(result)
         self.assertEqual(
             token_sync.rows,
             [[(3, 7, "req-1", 1, 3, 13)]],

@@ -121,11 +121,11 @@ class TestDecoupledSpecCppDataPlane(unittest.TestCase):
         )
 
         with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(True):
-            trace_payload = SchedulerDecoupledVerifyMixin._sync_verify_requests(
+            result = SchedulerDecoupledVerifyMixin._sync_verify_requests(
                 scheduler, batch
             )
 
-        self.assertEqual(trace_payload["rids"], ["req-a"])
+        self.assertIsNone(result)
         self.assertEqual(
             scheduler.draft_proxy_thread.rows,
             [
@@ -154,12 +154,11 @@ class TestDecoupledSpecCppDataPlane(unittest.TestCase):
         )
 
         with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(True):
-            trace_payload = SchedulerDecoupledVerifyMixin.submit_verify_updates(
+            result = SchedulerDecoupledVerifyMixin.submit_verify_updates(
                 scheduler, batch
             )
 
-        self.assertEqual(trace_payload["commit_rids"], ["req-commit"])
-        self.assertEqual(trace_payload["close_rids"], ["req-close"])
+        self.assertIsNone(result)
         self.assertEqual(scheduler.released, ["req-close"])
         self.assertEqual(
             scheduler.draft_proxy_thread.rows,

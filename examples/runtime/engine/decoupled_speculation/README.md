@@ -96,18 +96,6 @@ python examples/runtime/engine/decoupled_speculation/multi-node.py \
   --target-tp-size 4 \
   --draft-tp-size 1 \
   --max-new-tokens 256
-
-# Write decoupled/decode/MTP tracer CSV files under one directory.
-python examples/runtime/engine/decoupled_speculation/multi-node.py \
-  --prompt "Explain speculative decoding." \
-  --baseline mtp \
-  --spec-trace-dir ./spec_traces \
-  --output-dir ./decoupled_spec_outputs \
-  --target-model-path /path/to/target \
-  --draft-model-path /path/to/draft \
-  --target-tp-size 4 \
-  --draft-tp-size 1 \
-  --max-new-tokens 256
 ```
 
 Target token-batch profiling:

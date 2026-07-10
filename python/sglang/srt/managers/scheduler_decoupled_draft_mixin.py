@@ -31,7 +31,6 @@ from sglang.srt.speculative.decoupled_spec_io import (
     parse_draft_scheduler_rid,
 )
 from sglang.srt.speculative.token_sync_thread import TokenSyncThread
-from sglang.srt.speculative.tracer import SpecTraceEvent, trace_speculative
 from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
@@ -117,20 +116,13 @@ class SchedulerDecoupledDraftMixin:
         self.token_sync_thread = token_sync_cls(
             context=self.ipc_channels.context,
             drafter_rank=self.get_decoupled_spec_rank(),
-            tracer=self.tracer,
         )
         self.token_sync_thread.start()
 
-    @trace_speculative(
-        SpecTraceEvent.DRAFTER_EMIT_DRAFT_TOKENS,
-        inject_trace_enabled="trace_enabled",
-    )
     def flush_draft_updates(
         self: Scheduler,
         batch: ScheduleBatch,
         req_indices: Optional[list[int]] = None,
-        *,
-        trace_enabled: bool = False,
     ) -> Optional[DraftTailStreamOutputBatch]:
         if not self.is_draft_worker_batch(batch):
             return None
@@ -171,15 +163,6 @@ class SchedulerDecoupledDraftMixin:
                     )
                 )
 
-            trace_payload = {
-                "num_emit_candidates": len(emit_candidate_indices),
-                "num_stream_outputs": len(stream_output_rows),
-                "committed_lens_by_req": [
-                    int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
-                    for req in batch.reqs
-                ],
-                "output_lens_by_req": [len(req.output_ids) for req in batch.reqs],
-            }
             if stream_output_rows and self.is_draft_entry_rank():
                 submit_rows = getattr(
                     self._get_token_sync_thread(), "submit_draft_result_rows", None
@@ -208,7 +191,7 @@ class SchedulerDecoupledDraftMixin:
                     if value >= int(self.server_args.speculative_num_steps or 0)
                 ),
             )
-            return trace_payload
+            return None
 
         stream_output_batch = DraftTailStreamOutputBatch()
         src_drafter_rank = self.get_decoupled_spec_rank()
@@ -235,24 +218,6 @@ class SchedulerDecoupledDraftMixin:
                 )
             )
 
-        if trace_enabled:
-            setattr(
-                stream_output_batch,
-                "_decoupled_spec_payload",
-                {
-                    "num_emit_candidates": len(emit_candidate_indices),
-                    "num_stream_outputs": len(stream_output_batch.outputs),
-                    "committed_lens_by_req": [
-                        int(
-                            self._get_draft_state_by_req(
-                                req
-                            ).verifier_committed_prefix_len
-                        )
-                        for req in batch.reqs
-                    ],
-                    "output_lens_by_req": [len(req.output_ids) for req in batch.reqs],
-                },
-            )
         if stream_output_batch.outputs and self.is_draft_entry_rank():
             self._get_token_sync_thread().submit_draft_results(stream_output_batch)
         decoupled_spec_print_buffer(
@@ -1170,15 +1135,14 @@ class SchedulerDecoupledDraftMixin:
     def _apply_ready_verifier_commit_segments(
         self: Scheduler,
         ready_commit_segments: list[VerifierCommitSegment],
-    ) -> tuple[list[VerifierCommitSegment], int]:
+    ) -> int:
         kv_truncations: list[DraftKVTruncation] = []
         batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
-        applied_segments: list[VerifierCommitSegment] = []
         use_cpp_pybind = envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
         commit_echo_batch = None if use_cpp_pybind else DraftTailStreamOutputBatch()
         commit_echo_rows: list[tuple] = []
         if not ready_commit_segments:
-            return applied_segments, 0
+            return 0
 
         running_req_to_idx = {}
         if self.running_batch is not None and not self.running_batch.is_empty():
@@ -1209,7 +1173,6 @@ class SchedulerDecoupledDraftMixin:
                 kv_truncations=kv_truncations,
                 batch_metadata_updates=batch_metadata_updates,
             )
-            applied_segments.append(segment)
             if self.is_draft_entry_rank():
                 if not segment.committed_token_ids:
                     raise ValueError(
@@ -1262,16 +1225,16 @@ class SchedulerDecoupledDraftMixin:
                         "C++ decoupled token sync thread does not expose row API"
                     )
                 submit_rows(commit_echo_rows)
-            return applied_segments, len(commit_echo_rows)
+            return len(commit_echo_rows)
         assert commit_echo_batch is not None
         if commit_echo_batch.outputs:
             self._get_token_sync_thread().submit_draft_results(commit_echo_batch)
-        return applied_segments, len(commit_echo_batch.outputs)
+        return len(commit_echo_batch.outputs)
 
     def _handle_draft_sync_message(
         self: Scheduler,
         message: DraftSync,
-    ) -> Optional[Req]:
+    ) -> None:
         req = self._create_draft_request(message)
         running_batch = self.running_batch
         if (
@@ -1280,7 +1243,6 @@ class SchedulerDecoupledDraftMixin:
             and req not in self.draft_sleeping_reqs.values()
         ):
             self._add_request_to_queue(req)
-        return req
 
     def _handle_draft_close_key(self: Scheduler, draft_key: DraftReqKey) -> None:
         entry = self.draft_req_table.get(draft_key)
@@ -1297,13 +1259,7 @@ class SchedulerDecoupledDraftMixin:
             f"draft_key={draft_key} is_sleeping={entry.is_sleeping}"
         )
 
-    @trace_speculative(
-        SpecTraceEvent.DRAFTER_SYNC_CONTROL_MESSAGES,
-        inject_trace_enabled="trace_enabled",
-    )
-    def sync_draft_requests(
-        self: Scheduler, *, trace_enabled: bool = False
-    ) -> dict | None:
+    def sync_draft_requests(self: Scheduler) -> None:
         """
         (called by decoupled drafter)
         Collect ready verifier-to-drafter controls in arrival order.
@@ -1334,29 +1290,17 @@ class SchedulerDecoupledDraftMixin:
                 + len(ready_controls.close_keys)
             )
 
-        num_sync = 0
-        num_commit = len(ready_controls.ready_commit_segments) if trace_enabled else 0
-        num_close = 0
-        num_created_reqs = 0
-        num_applied_commit = 0
-
         closed_keys = ready_controls.close_keys
         for draft_key in closed_keys:
-            if trace_enabled:
-                num_close += 1
             self._handle_draft_close_key(draft_key)
 
         for message in ready_controls.sync_messages:
             draft_key = message.draft_key
             if draft_key in closed_keys:
                 continue
-            if trace_enabled:
-                num_sync += 1
-            req = self._handle_draft_sync_message(message)
-            if trace_enabled and req is not None:
-                num_created_reqs += 1
+            self._handle_draft_sync_message(message)
 
-        applied_segments, num_commit_echo = self._apply_ready_verifier_commit_segments(
+        num_commit_echo = self._apply_ready_verifier_commit_segments(
             ready_controls.ready_commit_segments
         )
         decoupled_spec_print_timing(
@@ -1365,22 +1309,6 @@ class SchedulerDecoupledDraftMixin:
             start_ns=timing_start_ns,
             items=timing_items + num_commit_echo,
         )
-        if trace_enabled:
-            num_applied_commit += len(applied_segments)
-
-        if ready_controls.is_empty() and num_applied_commit == 0:
-            return None
-        if not trace_enabled:
-            return None
-        return {
-            "num_sync": num_sync,
-            "num_commit": num_commit,
-            "num_close": num_close,
-            "num_created_reqs": num_created_reqs,
-            "num_applied_commit": num_applied_commit,
-            "num_commit_echo": num_commit_echo,
-            "num_sleeping_reqs": len(self.draft_sleeping_reqs),
-        }
 
     def _draft_ahead_window(self: Scheduler) -> int:
         draft_tokens = self.server_args.speculative_num_draft_tokens
@@ -1439,26 +1367,17 @@ class SchedulerDecoupledDraftMixin:
         )
         return batch
 
-    @trace_speculative(
-        SpecTraceEvent.DRAFTER_SLEEP_REQUESTS,
-        inject_trace_enabled="trace_enabled",
-    )
     def sleep_overrun_draft_requests(
         self: Scheduler,
         batch: Optional[ScheduleBatch],
-        *,
-        trace_enabled: bool = False,
     ) -> Optional[ScheduleBatch]:
         if batch is None or batch.is_empty():
             return batch
-        if trace_enabled:
-            setattr(batch, "_decoupled_spec_payload", None)
         window = self._draft_ahead_window()
         if window <= 0:
             return batch
 
         keep_indices: list[int] = []
-        slept_rids: list[str] | None = [] if trace_enabled else None
         slept_any = False
         for req_batch_idx, req in enumerate(batch.reqs):
             state = self._get_draft_state_by_req(req)
@@ -1466,8 +1385,6 @@ class SchedulerDecoupledDraftMixin:
             if ahead >= window:
                 state.is_sleeping = True
                 self.draft_sleeping_reqs[state.key] = req
-                if slept_rids is not None:
-                    slept_rids.append(state.key.request_id)
                 slept_any = True
             else:
                 keep_indices.append(req_batch_idx)
@@ -1475,25 +1392,9 @@ class SchedulerDecoupledDraftMixin:
         if slept_any:
             batch.filter_batch(keep_indices=keep_indices)
             batch.batch_is_full = False
-            if trace_enabled:
-                assert slept_rids is not None
-                setattr(
-                    batch,
-                    "_decoupled_spec_payload",
-                    {
-                        "num_slept": len(slept_rids),
-                        "slept_rids": slept_rids,
-                    },
-                )
         return batch
 
-    @trace_speculative(
-        SpecTraceEvent.DRAFTER_WAKE_REQUESTS,
-        inject_trace_enabled="trace_enabled",
-    )
-    def wake_draft_sleeping_requests(
-        self: Scheduler, *, trace_enabled: bool = False
-    ) -> Optional[dict]:
+    def wake_draft_sleeping_requests(self: Scheduler) -> None:
         window = self._draft_ahead_window()
         if window <= 0 or not self.draft_sleeping_reqs:
             return None
@@ -1509,7 +1410,6 @@ class SchedulerDecoupledDraftMixin:
             available_num_reqs = len(self.draft_sleeping_reqs)
 
         wake_reqs: list[Req] = []
-        woken_rids: list[str] | None = [] if trace_enabled else None
         for draft_key, req in list(self.draft_sleeping_reqs.items()):
             state = self.draft_req_table.get(draft_key)
             if state is None or state.req is not req:
@@ -1520,8 +1420,6 @@ class SchedulerDecoupledDraftMixin:
                 state.is_sleeping = False
                 self.draft_sleeping_reqs.pop(draft_key, None)
                 wake_reqs.append(req)
-                if woken_rids is not None:
-                    woken_rids.append(draft_key.request_id)
                 if len(wake_reqs) >= available_num_reqs:
                     break
 
@@ -1535,10 +1433,3 @@ class SchedulerDecoupledDraftMixin:
         else:
             self.running_batch.merge_batch(wake_batch)
         self.running_batch.batch_is_full = False
-        if not trace_enabled:
-            return None
-        assert woken_rids is not None
-        return {
-            "num_woken": len(wake_reqs),
-            "woken_rids": woken_rids,
-        }

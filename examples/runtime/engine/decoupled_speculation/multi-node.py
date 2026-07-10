@@ -409,11 +409,6 @@ def parse_args() -> argparse.Namespace:
             "full prompt and response text is always included in per-mode JSON."
         ),
     )
-    parser.add_argument(
-        "--spec-trace-dir",
-        default=None,
-        help="Directory for speculative decoding CSV trace files.",
-    )
     return parser.parse_args()
 
 
@@ -1188,7 +1183,6 @@ def launch_target_actors(
             cuda_graph_bs_decode=args.cuda_graph_bs_decode,
             rank_base=rank_base,
             deterministic=args.deterministic,
-            spec_trace_dir=args.spec_trace_dir,
             log_level="info",
             available_ports=available_ports,
             max_running_requests=args.max_running_requests,

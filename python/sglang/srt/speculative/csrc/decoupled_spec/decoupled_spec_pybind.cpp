@@ -16,8 +16,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -63,11 +61,6 @@ bool env_flag_enabled(const char* name) {
     return static_cast<char>(std::tolower(c));
   });
   return text != "0" && text != "false" && text != "off" && text != "no";
-}
-
-bool cpp_profile_enabled() {
-  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_CPP_PROFILE");
-  return enabled;
 }
 
 bool debug_timing_enabled() {
@@ -172,127 +165,6 @@ void print_debug_thread(
       payload.c_str());
   std::fflush(stderr);
 }
-
-void json_escape(std::ostringstream& os, const std::string& value) {
-  os << '"';
-  for (unsigned char c : value) {
-    switch (c) {
-      case '"':
-        os << "\\\"";
-        break;
-      case '\\':
-        os << "\\\\";
-        break;
-      case '\b':
-        os << "\\b";
-        break;
-      case '\f':
-        os << "\\f";
-        break;
-      case '\n':
-        os << "\\n";
-        break;
-      case '\r':
-        os << "\\r";
-        break;
-      case '\t':
-        os << "\\t";
-        break;
-      default:
-        if (c < 0x20) {
-          const char* hex = "0123456789abcdef";
-          os << "\\u00" << hex[(c >> 4) & 0xf] << hex[c & 0xf];
-        } else {
-          os << static_cast<char>(c);
-        }
-    }
-  }
-  os << '"';
-}
-
-struct ProfileStat {
-  int64_t count = 0;
-  int64_t total_ns = 0;
-  int64_t max_ns = 0;
-  int64_t total_items = 0;
-  std::vector<int64_t> samples;
-};
-
-class Profiler {
- public:
-  void record(const std::string& op, int64_t duration_ns, int64_t items = 0) {
-    if (!cpp_profile_enabled()) return;
-    std::lock_guard<std::mutex> guard(mu_);
-    auto& stat = stats_[op];
-    stat.count += 1;
-    stat.total_ns += duration_ns;
-    stat.total_items += items;
-    stat.max_ns = std::max(stat.max_ns, duration_ns);
-    if (stat.samples.size() < 200000) {
-      stat.samples.push_back(duration_ns);
-    }
-  }
-
-  std::string to_json() {
-    if (!cpp_profile_enabled()) return "[]";
-    std::lock_guard<std::mutex> guard(mu_);
-    std::ostringstream os;
-    os << '[';
-    bool first = true;
-    for (auto& kv : stats_) {
-      auto samples = kv.second.samples;
-      std::sort(samples.begin(), samples.end());
-      auto percentile = [&](double p) -> int64_t {
-        if (samples.empty()) return 0;
-        size_t index = static_cast<size_t>((samples.size() - 1) * p);
-        return samples[index];
-      };
-      if (!first) os << ',';
-      first = false;
-      os << '{';
-      os << "\"op\":";
-      json_escape(os, kv.first);
-      os << ",\"count\":" << kv.second.count;
-      os << ",\"total_ns\":" << kv.second.total_ns;
-      os << ",\"p50_ns\":" << percentile(0.50);
-      os << ",\"p95_ns\":" << percentile(0.95);
-      os << ",\"max_ns\":" << kv.second.max_ns;
-      os << ",\"items\":" << (kv.second.count ? kv.second.total_items / kv.second.count : 0);
-      os << ",\"total_items\":" << kv.second.total_items;
-      os << '}';
-    }
-    os << ']';
-    return os.str();
-  }
-
- private:
-  std::mutex mu_;
-  std::map<std::string, ProfileStat> stats_;
-};
-
-class ScopedProfile {
- public:
-  ScopedProfile(Profiler& profiler, std::string op, int64_t items = 0)
-      : profiler_(profiler),
-        op_(std::move(op)),
-        items_(items),
-        enabled_(cpp_profile_enabled() || debug_timing_enabled()),
-        start_ns_(enabled_ ? now_ns() : 0) {}
-
-  ~ScopedProfile() {
-    if (!enabled_) return;
-    int64_t duration_ns = now_ns() - start_ns_;
-    profiler_.record(op_, duration_ns, items_);
-    print_debug_timing(op_, duration_ns, items_);
-  }
-
- private:
-  Profiler& profiler_;
-  std::string op_;
-  int64_t items_;
-  bool enabled_;
-  int64_t start_ns_;
-};
 
 class DebugTimingScope {
  public:
@@ -882,121 +754,12 @@ struct DraftTailSnapshotCpp {
   int64_t committed_len = 0;
   std::vector<int32_t> tail_tokens;
   int64_t raw_tail_len = 0;
-  std::vector<int32_t> raw_tail_tokens;
 };
 
 struct DraftTailSnapshotBatchCpp {
   std::vector<DraftTailSnapshotCpp> snapshots;
   int64_t wait_ns = 0;
 };
-
-struct CommitStatCpp {
-  std::string request_id;
-  int64_t pre_committed_len = 0;
-  int64_t committed_segment_len = 0;
-  int64_t last_committed_token_id = -1;
-  int64_t matched_tail_len = 0;
-  int64_t raw_tail_len_before = 0;
-  int64_t mismatch_tail_token_id = -1;
-  int64_t mismatch_committed_token_id = -1;
-  int64_t preserved_suffix_len = 0;
-  int64_t tail_len_after = 0;
-  int64_t committed_len_after = 0;
-  int64_t pending_expected_len_before = 0;
-  int64_t pending_expected_len_after = 0;
-  int64_t pending_expected_added = 0;
-};
-
-struct AppendStatsCpp {
-  std::vector<std::string> rids;
-  std::unordered_map<std::string, size_t> index_by_request_id;
-  std::vector<int64_t> draft_token_lens_by_req;
-  std::vector<int64_t> appended_token_lens_by_req;
-  int64_t num_appended_outputs = 0;
-  int64_t num_duplicate_outputs = 0;
-  int64_t num_stale_base_outputs = 0;
-  int64_t num_already_committed_outputs = 0;
-  int64_t num_stale_gap_outputs = 0;
-  int64_t num_unknown_request_outputs = 0;
-  int64_t num_pending_expected_match_outputs = 0;
-  int64_t num_pending_expected_reject_outputs = 0;
-  int64_t num_pending_expected_gap_outputs = 0;
-  std::vector<int64_t> tail_lens_after_by_req;
-  std::vector<int64_t> consumable_tail_lens_after_by_req;
-  std::vector<int64_t> committed_lens_after_by_req;
-  std::vector<int64_t> pending_expected_lens_after_by_req;
-};
-
-py::dict control_stats_py(const std::vector<CommitStatCpp>& stats) {
-  py::dict out;
-  std::vector<std::string> commit_rids;
-  std::vector<int64_t> pre_committed_lens;
-  std::vector<int64_t> committed_segment_lens;
-  std::vector<int64_t> last_committed_token_ids;
-  std::vector<int64_t> matched_tail_lens;
-  std::vector<int64_t> raw_tail_lens_before;
-  std::vector<int64_t> mismatch_tail_token_ids;
-  std::vector<int64_t> mismatch_committed_token_ids;
-  std::vector<int64_t> preserved_suffix_lens;
-  std::vector<int64_t> tail_lens_after;
-  std::vector<int64_t> committed_lens_after;
-  std::vector<int64_t> pending_expected_lens_before;
-  std::vector<int64_t> pending_expected_lens_after;
-  std::vector<int64_t> pending_expected_added;
-  commit_rids.reserve(stats.size());
-  for (const auto& stat : stats) {
-    commit_rids.push_back(stat.request_id);
-    pre_committed_lens.push_back(stat.pre_committed_len);
-    committed_segment_lens.push_back(stat.committed_segment_len);
-    last_committed_token_ids.push_back(stat.last_committed_token_id);
-    matched_tail_lens.push_back(stat.matched_tail_len);
-    raw_tail_lens_before.push_back(stat.raw_tail_len_before);
-    mismatch_tail_token_ids.push_back(stat.mismatch_tail_token_id);
-    mismatch_committed_token_ids.push_back(stat.mismatch_committed_token_id);
-    preserved_suffix_lens.push_back(stat.preserved_suffix_len);
-    tail_lens_after.push_back(stat.tail_len_after);
-    committed_lens_after.push_back(stat.committed_len_after);
-    pending_expected_lens_before.push_back(stat.pending_expected_len_before);
-    pending_expected_lens_after.push_back(stat.pending_expected_len_after);
-    pending_expected_added.push_back(stat.pending_expected_added);
-  }
-  out["commit_rids"] = py::cast(commit_rids);
-  out["pre_committed_lens_by_req"] = py::cast(pre_committed_lens);
-  out["committed_segment_lens_by_req"] = py::cast(committed_segment_lens);
-  out["last_committed_token_ids_by_req"] = py::cast(last_committed_token_ids);
-  out["matched_tail_lens_by_req"] = py::cast(matched_tail_lens);
-  out["raw_tail_lens_before_by_req"] = py::cast(raw_tail_lens_before);
-  out["mismatch_tail_token_ids_by_req"] = py::cast(mismatch_tail_token_ids);
-  out["mismatch_committed_token_ids_by_req"] = py::cast(mismatch_committed_token_ids);
-  out["preserved_suffix_lens_by_req"] = py::cast(preserved_suffix_lens);
-  out["tail_lens_after_by_req"] = py::cast(tail_lens_after);
-  out["committed_lens_after_by_req"] = py::cast(committed_lens_after);
-  out["pending_expected_lens_before_by_req"] = py::cast(pending_expected_lens_before);
-  out["pending_expected_lens_after_by_req"] = py::cast(pending_expected_lens_after);
-  out["pending_expected_added_by_req"] = py::cast(pending_expected_added);
-  return out;
-}
-
-py::dict append_stats_py(const AppendStatsCpp& stats) {
-  py::dict out;
-  out["rids"] = py::cast(stats.rids);
-  out["draft_token_lens_by_req"] = py::cast(stats.draft_token_lens_by_req);
-  out["appended_token_lens_by_req"] = py::cast(stats.appended_token_lens_by_req);
-  out["num_appended_outputs"] = stats.num_appended_outputs;
-  out["num_duplicate_outputs"] = stats.num_duplicate_outputs;
-  out["num_stale_base_outputs"] = stats.num_stale_base_outputs;
-  out["num_already_committed_outputs"] = stats.num_already_committed_outputs;
-  out["num_stale_gap_outputs"] = stats.num_stale_gap_outputs;
-  out["num_unknown_request_outputs"] = stats.num_unknown_request_outputs;
-  out["num_pending_expected_match_outputs"] = stats.num_pending_expected_match_outputs;
-  out["num_pending_expected_reject_outputs"] = stats.num_pending_expected_reject_outputs;
-  out["num_pending_expected_gap_outputs"] = stats.num_pending_expected_gap_outputs;
-  out["tail_lens_after_by_req"] = py::cast(stats.tail_lens_after_by_req);
-  out["consumable_tail_lens_after_by_req"] = py::cast(stats.consumable_tail_lens_after_by_req);
-  out["committed_lens_after_by_req"] = py::cast(stats.committed_lens_after_by_req);
-  out["pending_expected_lens_after_by_req"] = py::cast(stats.pending_expected_lens_after_by_req);
-  return out;
-}
 
 py::tuple draft_key_row(const DraftReqKeyCpp& key) {
   return py::make_tuple(key.request_id, key.src_verifier_rank);
@@ -1056,20 +819,14 @@ class DraftTailBufferCore {
     return it == states_.end() ? -1 : it->second.committed_len;
   }
 
-  std::vector<CommitStatCpp> apply_control_batch_native(
-      const DraftControlBatchCpp& batch,
-      bool collect_stats) {
-    ScopedProfile timer(profiler_, "tail_buffer.apply_control_batch",
+  void apply_control_batch_native(const DraftControlBatchCpp& batch) {
+    DebugTimingScope timer("tail_buffer.apply_control_batch",
                         static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                              batch.close_messages.size()));
-    std::vector<CommitStatCpp> commit_stats;
     {
       std::lock_guard<std::mutex> guard(mu_);
       for (const auto& msg : batch.sync_messages) open_request_locked(msg);
-      for (const auto& msg : batch.verify_commit_messages) {
-        auto stat = apply_commit_locked(msg);
-        if (collect_stats && stat.has_value()) commit_stats.push_back(*stat);
-      }
+      for (const auto& msg : batch.verify_commit_messages) apply_commit_locked(msg);
       for (const auto& msg : batch.close_messages) close_request_locked(msg);
       cv_.notify_all();
       print_debug_summary_locked(
@@ -1077,11 +834,10 @@ class DraftTailBufferCore {
           static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                batch.close_messages.size()));
     }
-    return commit_stats;
   }
 
   void open_request_rows_native(std::vector<DraftSyncOpenCpp> rows) {
-    ScopedProfile timer(profiler_, "tail_buffer.open_request_rows",
+    DebugTimingScope timer("tail_buffer.open_request_rows",
                         static_cast<int64_t>(rows.size()));
     std::lock_guard<std::mutex> guard(mu_);
     states_.reserve(states_.size() + rows.size());
@@ -1096,32 +852,22 @@ class DraftTailBufferCore {
     print_debug_summary_locked("open_request_rows", static_cast<int64_t>(rows.size()));
   }
 
-  std::optional<AppendStatsCpp> append_draft_stream_batch_native(
-      const DraftTailStreamOutputBatchCpp& batch,
-      bool collect_stats) {
-    if (batch.outputs.empty()) return std::nullopt;
-    ScopedProfile timer(profiler_, "tail_buffer.append_draft_stream_batch",
+  void append_draft_stream_batch_native(const DraftTailStreamOutputBatchCpp& batch) {
+    if (batch.outputs.empty()) return;
+    DebugTimingScope timer("tail_buffer.append_draft_stream_batch",
                         static_cast<int64_t>(batch.outputs.size()));
-    AppendStatsCpp stats;
-    if (collect_stats) init_append_stats(batch, stats);
     {
       std::lock_guard<std::mutex> guard(mu_);
-      for (const auto& output : batch.outputs) {
-        std::string result = push_one_locked(batch, output);
-        if (collect_stats) record_append_result_locked(stats, output, result);
-      }
-      if (collect_stats) fill_append_after_lens_locked(stats);
+      for (const auto& output : batch.outputs) push_one_locked(output);
       cv_.notify_all();
       print_debug_summary_locked(
           "append_draft_stream_batch",
           static_cast<int64_t>(batch.outputs.size()));
     }
-    if (!collect_stats) return std::nullopt;
-    return stats;
   }
 
   void wait_for_draft_tokens(const std::vector<std::string>& rids, int64_t min_draft_tokens) {
-    ScopedProfile timer(profiler_, "tail_buffer.wait_for_draft_tokens",
+    DebugTimingScope timer("tail_buffer.wait_for_draft_tokens",
                         static_cast<int64_t>(rids.size()));
     min_draft_tokens = std::max<int64_t>(0, min_draft_tokens);
     if (min_draft_tokens <= 0) return;
@@ -1135,9 +881,8 @@ class DraftTailBufferCore {
   DraftTailSnapshotBatchCpp get_draft_snapshots_native(
       const std::vector<std::string>& rids,
       bool allow_partial,
-      bool include_raw_tail_tokens,
       int64_t max_tail_len) {
-    ScopedProfile timer(profiler_, "tail_buffer.get_draft_snapshots",
+    DebugTimingScope timer("tail_buffer.get_draft_snapshots",
                         static_cast<int64_t>(rids.size()));
     int64_t tail_cap = std::max<int64_t>(-1, max_tail_len);
     std::unique_lock<std::mutex> lock(mu_);
@@ -1175,7 +920,6 @@ class DraftTailBufferCore {
         snapshot.tail_tokens.resize(static_cast<size_t>(tail_cap));
       }
       snapshot.raw_tail_len = static_cast<int64_t>(state.tail_tokens.size());
-      if (include_raw_tail_tokens) snapshot.raw_tail_tokens = state.tail_tokens;
       snapshots.push_back(std::move(snapshot));
     }
     int64_t snapshot_raw_total = 0;
@@ -1201,8 +945,6 @@ class DraftTailBufferCore {
         allow_partial);
     return {std::move(snapshots), wait_ns};
   }
-
-  std::string profile_json() { return profiler_.to_json(); }
 
  private:
   static double avg_or_zero(int64_t total, int64_t count) {
@@ -1288,19 +1030,11 @@ class DraftTailBufferCore {
     states_[message.request_id] = std::move(state);
   }
 
-  std::optional<CommitStatCpp> apply_commit_locked(const VerifyCommitCpp& message) {
+  void apply_commit_locked(const VerifyCommitCpp& message) {
     message.validate();
-    CommitStatCpp stat;
-    stat.request_id = message.request_id;
-    stat.pre_committed_len = message.pre_verify_committed_len;
-    stat.committed_segment_len = static_cast<int64_t>(message.committed_token_ids.size());
-    stat.last_committed_token_id = message.committed_token_ids.back();
 
     auto it = states_.find(message.request_id);
-    if (it == states_.end()) {
-      stat.mismatch_committed_token_id = message.committed_token_ids.front();
-      return stat;
-    }
+    if (it == states_.end()) return;
     auto& state = it->second;
     int64_t pending_expected_len_before = static_cast<int64_t>(state.pending_expected_tokens.size());
     int64_t target_committed_len = state.committed_len + pending_expected_len_before;
@@ -1310,24 +1044,18 @@ class DraftTailBufferCore {
     }
 
     int64_t raw_tail_len_before = static_cast<int64_t>(state.tail_tokens.size());
-    stat.raw_tail_len_before = raw_tail_len_before;
-    stat.pending_expected_len_before = pending_expected_len_before;
 
     if (pending_expected_len_before) {
       if (!state.tail_tokens.empty()) {
         throw std::runtime_error("Draft tail tokens must be empty while expected prefix tokens are pending");
       }
       for (int32_t token : message.committed_token_ids) state.pending_expected_tokens.push_back(token);
-      stat.mismatch_committed_token_id = message.committed_token_ids.front();
-      stat.committed_len_after = state.committed_len;
-      stat.pending_expected_len_after = static_cast<int64_t>(state.pending_expected_tokens.size());
-      stat.pending_expected_added = static_cast<int64_t>(message.committed_token_ids.size());
-      return stat;
+      return;
     }
 
     int64_t matched_tail_len = 0;
     int64_t max_possible_match_len =
-        std::min<int64_t>(stat.committed_segment_len, raw_tail_len_before);
+        std::min<int64_t>(static_cast<int64_t>(message.committed_token_ids.size()), raw_tail_len_before);
     while (matched_tail_len < max_possible_match_len &&
            state.tail_tokens[matched_tail_len] == message.committed_token_ids[matched_tail_len]) {
       ++matched_tail_len;
@@ -1337,39 +1065,20 @@ class DraftTailBufferCore {
       state.committed_len += matched_tail_len;
     }
 
-    int64_t mismatch_tail_token_id = -1;
-    int64_t mismatch_committed_token_id = -1;
-    int64_t pending_expected_added = 0;
-    int64_t preserved_suffix_len = static_cast<int64_t>(state.tail_tokens.size());
-    if (matched_tail_len < stat.committed_segment_len) {
+    if (matched_tail_len < static_cast<int64_t>(message.committed_token_ids.size())) {
       if (matched_tail_len < raw_tail_len_before) {
-        mismatch_tail_token_id = state.tail_tokens[0];
         state.can_accept_prefix_len = state.committed_len;
       }
-      mismatch_committed_token_id = message.committed_token_ids[matched_tail_len];
       state.tail_tokens.clear();
       for (size_t i = static_cast<size_t>(matched_tail_len); i < message.committed_token_ids.size(); ++i) {
         state.pending_expected_tokens.push_back(message.committed_token_ids[i]);
       }
-      pending_expected_added = stat.committed_segment_len - matched_tail_len;
-      preserved_suffix_len = 0;
     }
-
-    stat.matched_tail_len = matched_tail_len;
-    stat.mismatch_tail_token_id = mismatch_tail_token_id;
-    stat.mismatch_committed_token_id = mismatch_committed_token_id;
-    stat.preserved_suffix_len = preserved_suffix_len;
-    stat.tail_len_after = static_cast<int64_t>(state.tail_tokens.size());
-    stat.committed_len_after = state.committed_len;
-    stat.pending_expected_len_after = static_cast<int64_t>(state.pending_expected_tokens.size());
-    stat.pending_expected_added = pending_expected_added;
-    return stat;
   }
 
   void close_request_locked(const DraftCloseCpp& message) { states_.erase(message.request_id); }
 
-  std::string push_one_locked(
-      const DraftTailStreamOutputBatchCpp& batch, const DraftTailStreamOutputCpp& output) {
+  void push_one_locked(const DraftTailStreamOutputCpp& output) {
     const auto& request_id = output.request_id;
     int64_t base_committed_len = output.base_committed_len;
     int64_t token_pos = output.new_token_pos;
@@ -1381,7 +1090,7 @@ class DraftTailBufferCore {
       throw std::runtime_error("Draft stream output targets the wrong verifier");
     }
     auto it = states_.find(request_id);
-    if (it == states_.end()) return "unknown_request";
+    if (it == states_.end()) return;
 
     auto& state = it->second;
     int64_t state_committed_len = state.committed_len;
@@ -1397,101 +1106,42 @@ class DraftTailBufferCore {
       if (!state.tail_tokens.empty()) {
         throw std::runtime_error("Draft tail tokens must be empty while expected prefix tokens are pending");
       }
-      if (base_committed_len < can_accept_prefix_len) return "stale_base";
-      if (token_pos < state_committed_len) return "already_committed";
-      if (base_committed_len > state_committed_len) return "pending_expected_gap";
-      if (token_pos > state_committed_len) return "pending_expected_gap";
+      if (base_committed_len < can_accept_prefix_len) return;
+      if (token_pos < state_committed_len) return;
+      if (base_committed_len > state_committed_len) return;
+      if (token_pos > state_committed_len) return;
       int32_t expected_token_id = state.pending_expected_tokens.front();
       if (token_id == expected_token_id) {
         state.pending_expected_tokens.pop_front();
         state.committed_len += 1;
-        return "pending_expected_match";
+        return;
       }
       state.can_accept_prefix_len = state.committed_len;
-      return "pending_expected_reject";
+      return;
     }
 
     if (base_committed_len > state_committed_len) {
       throw std::runtime_error("Draft stream base is ahead of verifier state");
     }
-    if (base_committed_len < can_accept_prefix_len) return "stale_base";
-    if (token_pos < state_committed_len) return "already_committed";
+    if (base_committed_len < can_accept_prefix_len) return;
+    if (token_pos < state_committed_len) return;
 
     if (token_pos < buffer_end_len) {
       int32_t existing_token_id = state.tail_tokens[token_pos - state_committed_len];
       if (existing_token_id != token_id) {
         throw std::runtime_error("Draft stream token conflicts with buffered tail");
       }
-      return "duplicate";
+      return;
     }
 
     if (token_pos > buffer_end_len) {
       if (base_committed_len == state_committed_len) {
         throw std::runtime_error("Draft stream token skips buffered tail");
       }
-      return "stale_gap";
+      return;
     }
 
     state.tail_tokens.push_back(token_id);
-    return "appended";
-  }
-
-  void init_append_stats(const DraftTailStreamOutputBatchCpp& batch, AppendStatsCpp& stats) {
-    for (const auto& output : batch.outputs) {
-      if (stats.index_by_request_id.count(output.request_id)) continue;
-      stats.index_by_request_id[output.request_id] = stats.rids.size();
-      stats.rids.push_back(output.request_id);
-    }
-    size_t n = stats.rids.size();
-    stats.draft_token_lens_by_req.assign(n, 0);
-    stats.appended_token_lens_by_req.assign(n, 0);
-  }
-
-  void record_append_result_locked(
-      AppendStatsCpp& stats, const DraftTailStreamOutputCpp& output, const std::string& result) {
-    size_t index = stats.index_by_request_id[output.request_id];
-    stats.draft_token_lens_by_req[index] += 1;
-    if (result == "appended") {
-      stats.num_appended_outputs += 1;
-      stats.appended_token_lens_by_req[index] += 1;
-    } else if (result == "duplicate") {
-      stats.num_duplicate_outputs += 1;
-    } else if (result == "stale_base") {
-      stats.num_stale_base_outputs += 1;
-    } else if (result == "already_committed") {
-      stats.num_already_committed_outputs += 1;
-    } else if (result == "stale_gap") {
-      stats.num_stale_gap_outputs += 1;
-    } else if (result == "unknown_request") {
-      stats.num_unknown_request_outputs += 1;
-    } else if (result == "pending_expected_match") {
-      stats.num_pending_expected_match_outputs += 1;
-    } else if (result == "pending_expected_reject") {
-      stats.num_pending_expected_reject_outputs += 1;
-    } else if (result == "pending_expected_gap") {
-      stats.num_pending_expected_gap_outputs += 1;
-    } else {
-      throw std::runtime_error("Unexpected draft stream append result");
-    }
-  }
-
-  void fill_append_after_lens_locked(AppendStatsCpp& stats) {
-    for (const auto& request_id : stats.rids) {
-      auto it = states_.find(request_id);
-      if (it == states_.end()) {
-        stats.tail_lens_after_by_req.push_back(0);
-        stats.consumable_tail_lens_after_by_req.push_back(0);
-        stats.committed_lens_after_by_req.push_back(0);
-        stats.pending_expected_lens_after_by_req.push_back(0);
-        continue;
-      }
-      const auto& state = it->second;
-      stats.tail_lens_after_by_req.push_back(static_cast<int64_t>(state.tail_tokens.size()));
-      stats.consumable_tail_lens_after_by_req.push_back(state.consumable_tail_len());
-      stats.committed_lens_after_by_req.push_back(state.committed_len);
-      stats.pending_expected_lens_after_by_req.push_back(
-          static_cast<int64_t>(state.pending_expected_tokens.size()));
-    }
   }
 
   bool has_min_draft_tokens_locked(const std::vector<std::string>& rids, int64_t min_draft_tokens) const {
@@ -1512,7 +1162,6 @@ class DraftTailBufferCore {
   std::condition_variable cv_;
   bool closed_ = false;
   std::unordered_map<std::string, RequestDraftTailStateCpp> states_;
-  Profiler profiler_;
 };
 
 class DraftControlInboxCore {
@@ -1528,7 +1177,7 @@ class DraftControlInboxCore {
   }
 
   void add_control_batch(const DraftControlBatchCpp& batch) {
-    ScopedProfile timer(profiler_, "control_inbox.add_control_batch",
+    DebugTimingScope timer("control_inbox.add_control_batch",
                         static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                              batch.close_messages.size()));
     std::lock_guard<std::mutex> guard(mu_);
@@ -1544,7 +1193,7 @@ class DraftControlInboxCore {
   }
 
   std::vector<VerifierCommitSegmentCpp> snapshot_pending_commit_segments_native() {
-    ScopedProfile timer(profiler_, "control_inbox.snapshot_pending_commit_segments");
+    DebugTimingScope timer("control_inbox.snapshot_pending_commit_segments");
     std::lock_guard<std::mutex> guard(mu_);
     std::vector<VerifierCommitSegmentCpp> out;
     out.reserve(verifier_commit_segments_.size());
@@ -1555,7 +1204,7 @@ class DraftControlInboxCore {
   }
 
   ReadyDraftControlsCpp extract_ready_controls_native(const std::vector<ExtractDecisionCpp>& decisions) {
-    ScopedProfile timer(profiler_, "control_inbox.extract_ready_controls",
+    DebugTimingScope timer("control_inbox.extract_ready_controls",
                         static_cast<int64_t>(decisions.size()));
     ReadyDraftControlsCpp ready;
     std::lock_guard<std::mutex> guard(mu_);
@@ -1578,8 +1227,6 @@ class DraftControlInboxCore {
     }
     return ready;
   }
-
-  std::string profile_json() { return profiler_.to_json(); }
 
  private:
   void add_close_key_locked(const DraftReqKeyCpp& key) {
@@ -1612,7 +1259,6 @@ class DraftControlInboxCore {
   std::vector<DraftSyncCpp> sync_messages_;
   std::unordered_map<std::string, VerifierCommitSegmentCpp> verifier_commit_segments_;
   std::unordered_map<std::string, DraftReqKeyCpp> close_keys_;
-  Profiler profiler_;
 };
 
 struct ZmqPollItem {
@@ -1883,47 +1529,38 @@ class DecoupledSpecDraftTailBuffer {
   bool has_request(const std::string& request_id) { return core_->has_request(request_id); }
   int64_t get_committed_len(const std::string& request_id) { return core_->get_committed_len(request_id); }
 
-  py::object apply_control_batch_native(
+  void apply_control_batch_native(
       int64_t dst_drafter_rank,
       const py::sequence& sync_rows,
       const py::sequence& commit_rows,
-      const py::sequence& close_rows,
-      bool collect_stats) {
+      const py::sequence& close_rows) {
     DebugTimingScope debug_timer(
         "pybind.tail_buffer.apply_control_batch_native",
         static_cast<int64_t>(py::len(sync_rows) + py::len(commit_rows) + py::len(close_rows)));
-    if (!collect_stats && py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
+    if (py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
       auto rows = build_sync_open_rows_native(sync_rows);
       {
         py::gil_scoped_release release;
         core_->open_request_rows_native(std::move(rows));
       }
-      return py::none();
+      return;
     }
     auto batch = build_control_batch_native(dst_drafter_rank, sync_rows, commit_rows, close_rows);
-    std::vector<CommitStatCpp> commit_stats;
     {
       py::gil_scoped_release release;
-      commit_stats = core_->apply_control_batch_native(batch, collect_stats);
+      core_->apply_control_batch_native(batch);
     }
-    if (!collect_stats) return py::none();
-    return control_stats_py(commit_stats);
   }
 
-  py::object append_draft_stream_batch_native(
-      const py::sequence& rows,
-      bool collect_stats) {
+  void append_draft_stream_batch_native(const py::sequence& rows) {
     DebugTimingScope debug_timer(
         "pybind.tail_buffer.append_draft_stream_batch_native",
         static_cast<int64_t>(py::len(rows)));
     auto batch = build_tail_stream_batch_native(rows);
-    std::optional<AppendStatsCpp> stats;
     {
       py::gil_scoped_release release;
-      stats = core_->append_draft_stream_batch_native(batch, collect_stats);
+      core_->append_draft_stream_batch_native(batch);
     }
-    if (!stats.has_value()) return py::none();
-    return append_stats_py(*stats);
   }
 
   void wait_for_draft_tokens_native(const py::sequence& rids, int64_t min_draft_tokens) {
@@ -1938,7 +1575,6 @@ class DecoupledSpecDraftTailBuffer {
   py::tuple get_draft_snapshots_native(
       const py::sequence& rids,
       bool allow_partial,
-      bool include_raw_tail_tokens,
       int64_t max_tail_len) {
     DebugTimingScope debug_timer(
         "pybind.tail_buffer.get_draft_snapshots_native",
@@ -1950,7 +1586,6 @@ class DecoupledSpecDraftTailBuffer {
       snapshot_batch = core_->get_draft_snapshots_native(
           rid_vec,
           allow_partial,
-          include_raw_tail_tokens,
           max_tail_len);
     }
     py::list out;
@@ -1959,13 +1594,11 @@ class DecoupledSpecDraftTailBuffer {
           snapshot.request_id,
           snapshot.committed_len,
           snapshot.tail_tokens,
-          snapshot.raw_tail_len,
-          snapshot.raw_tail_tokens));
+          snapshot.raw_tail_len));
     }
     return py::make_tuple(out, snapshot_batch.wait_ns);
   }
 
-  std::string profile_json() { return core_->profile_json(); }
   std::shared_ptr<DraftTailBufferCore> core() { return core_; }
 
  private:
@@ -2093,7 +1726,7 @@ class DecoupledSpecDraftProxyThread {
         close_rows);
     {
       py::gil_scoped_release release;
-      draft_tail_buffer_->apply_control_batch_native(batch, false);
+      draft_tail_buffer_->apply_control_batch_native(batch);
       auto frame = encode_control_batch(batch);
       {
         std::lock_guard<std::mutex> guard(queue_mu_);
@@ -2114,8 +1747,6 @@ class DecoupledSpecDraftProxyThread {
     }
     queue_cv_.notify_one();
   }
-
-  std::string profile_json() { return profiler_.to_json(); }
 
  private:
   void run_guarded() {
@@ -2189,7 +1820,7 @@ class DecoupledSpecDraftProxyThread {
     if (it == control_send_sockets_.end()) {
       throw std::runtime_error("Missing control socket for dst_drafter_rank");
     }
-    ScopedProfile timer(profiler_, "draft_proxy.send_control_batch",
+    DebugTimingScope timer("draft_proxy.send_control_batch",
                         static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
                                              batch.close_messages.size()));
     int64_t send_start_ns = now_ns();
@@ -2214,7 +1845,7 @@ class DecoupledSpecDraftProxyThread {
   }
 
   void recv_tail_stream_batch(const std::string& frame) {
-    ScopedProfile timer(profiler_, "draft_proxy.recv_tail_stream_batch");
+    DebugTimingScope timer("draft_proxy.recv_tail_stream_batch");
     auto batch = parse_tail_stream_batch(frame);
     for (const auto& output : batch.outputs) {
       if (output.dst_verifier_rank != verifier_rank_) {
@@ -2225,7 +1856,7 @@ class DecoupledSpecDraftProxyThread {
     os << "verifier_rank=" << verifier_rank_
        << " items=" << batch.outputs.size();
     print_debug_buffer("draft_proxy", "recv_tail_stream_batch", os.str());
-    draft_tail_buffer_->append_draft_stream_batch_native(batch, false);
+    draft_tail_buffer_->append_draft_stream_batch_native(batch);
   }
 
   int32_t verifier_rank_;
@@ -2244,7 +1875,6 @@ class DecoupledSpecDraftProxyThread {
   std::thread thread_;
   std::mutex error_mu_;
   std::string thread_error_;
-  Profiler profiler_;
 };
 
 class DecoupledSpecTokenSyncThread {
@@ -2372,17 +2002,6 @@ class DecoupledSpecTokenSyncThread {
     return ready_controls_native_rows(ready);
   }
 
-  std::string profile_json() {
-    std::string own = profiler_.to_json();
-    std::string inbox = inbox_.profile_json();
-    if (own == "[]") return inbox;
-    if (inbox == "[]") return own;
-    own.pop_back();
-    own.push_back(',');
-    own.append(inbox.begin() + 1, inbox.end());
-    return own;
-  }
-
  private:
   void run_guarded() {
     try {
@@ -2421,7 +2040,7 @@ class DecoupledSpecTokenSyncThread {
       did_work = drain_outgoing_results() || did_work;
       did_work = drain_control_socket() || did_work;
       if (!did_work) {
-        ScopedProfile timer(profiler_, "token_sync_thread.idle_wait");
+        DebugTimingScope timer("token_sync_thread.idle_wait");
         std::unique_lock<std::mutex> lock(queue_mu_);
         queue_cv_.wait_for(lock, std::chrono::microseconds(500), [&] {
           return closed_.load() || !outgoing_results_.empty();
@@ -2487,7 +2106,7 @@ class DecoupledSpecTokenSyncThread {
       std::string frame;
       bool received = zmq_->api().recv_nonblock(control_recv_socket_, frame);
       if (!received) break;
-      ScopedProfile timer(profiler_, "token_sync_thread.recv_control_batch");
+      DebugTimingScope timer("token_sync_thread.recv_control_batch");
       auto batch = parse_control_batch(frame);
       std::ostringstream os;
       os << "drafter_rank=" << drafter_rank_
@@ -2515,7 +2134,7 @@ class DecoupledSpecTokenSyncThread {
       if (it == result_send_sockets_.end()) {
         throw std::runtime_error("Missing result socket for dst_verifier_rank");
       }
-      ScopedProfile timer(profiler_, "token_sync_thread.send_result_batch",
+      DebugTimingScope timer("token_sync_thread.send_result_batch",
                           static_cast<int64_t>(kv.second.outputs.size()));
       int64_t send_start_ns = now_ns();
       zmq_->api().send(it->second, encode_tail_stream_batch(kv.second));
@@ -2550,7 +2169,6 @@ class DecoupledSpecTokenSyncThread {
   std::thread thread_;
   std::mutex error_mu_;
   std::string thread_error_;
-  Profiler profiler_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2567,13 +2185,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("dst_drafter_rank"),
           py::arg("sync_rows"),
           py::arg("commit_rows"),
-          py::arg("close_rows"),
-          py::arg("collect_stats"))
+          py::arg("close_rows"))
       .def(
           "append_draft_stream_batch_native",
           &DecoupledSpecDraftTailBuffer::append_draft_stream_batch_native,
-          py::arg("rows"),
-          py::arg("collect_stats"))
+          py::arg("rows"))
       .def(
           "wait_for_draft_tokens_native",
           &DecoupledSpecDraftTailBuffer::wait_for_draft_tokens_native,
@@ -2584,9 +2200,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &DecoupledSpecDraftTailBuffer::get_draft_snapshots_native,
           py::arg("rids"),
           py::arg("allow_partial"),
-          py::arg("include_raw_tail_tokens"),
-          py::arg("max_tail_len"))
-      .def("profile_json", &DecoupledSpecDraftTailBuffer::profile_json);
+          py::arg("max_tail_len"));
 
   py::class_<DecoupledSpecDraftProxyThread>(m, "DraftProxyThread")
       .def(
@@ -2607,8 +2221,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("dst_drafter_rank"),
           py::arg("sync_rows"),
           py::arg("commit_rows"),
-          py::arg("close_rows"))
-      .def("profile_json", &DecoupledSpecDraftProxyThread::profile_json);
+          py::arg("close_rows"));
 
   py::class_<DecoupledSpecTokenSyncThread>(m, "TokenSyncThread")
       .def(py::init<int64_t, const std::string&>(), py::arg("drafter_rank"), py::arg("bind_endpoint_or_host"))
@@ -2630,6 +2243,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(
           "extract_ready_controls_native",
           &DecoupledSpecTokenSyncThread::extract_ready_controls_native,
-          py::arg("rows"))
-      .def("profile_json", &DecoupledSpecTokenSyncThread::profile_json);
+          py::arg("rows"));
 }

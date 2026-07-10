@@ -83,10 +83,8 @@ class _Scheduler(SchedulerDecoupledVerifyMixin):
     def _broadcast_verify_snapshots(self, local_snapshots):
         return []
 
-    def _bind_verify_snapshots(
-        self, target_reqs, synced_snapshots, *, collect_trace_stats=False
-    ):
-        return 0
+    def _bind_verify_snapshots(self, target_reqs, synced_snapshots):
+        return None
 
 
 class TestDecoupledVerifyDynamic(unittest.TestCase):
@@ -1219,7 +1217,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertTrue(args.disable_radix_cache)
         self.assertEqual(args.mamba_radix_cache_strategy, "no_buffer")
 
-    def test_draft_tail_buffer_caps_snapshot_tail_without_hiding_raw_tail(self):
+    def test_draft_tail_buffer_caps_snapshot_tail_and_reports_raw_length(self):
         rid = "req-a"
         buffer = DraftTailBuffer(verifier_rank=0, required_tail_len=4)
         try:
@@ -1250,12 +1248,10 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             snapshot = buffer.get_draft_snapshots(
                 [_Req(rid)],
                 allow_partial=True,
-                include_raw_tail_tokens=True,
                 max_tail_len=1,
             )[0]
 
             self.assertEqual(snapshot.tail_tokens, [10])
-            self.assertEqual(snapshot.raw_tail_tokens, [10, 11, 12])
             self.assertEqual(snapshot.raw_tail_len, 3)
         finally:
             buffer.close()

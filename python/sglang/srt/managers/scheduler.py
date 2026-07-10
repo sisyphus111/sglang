@@ -424,7 +424,6 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-        self.tracer = self.create_tracer()
         self.draft_tail_buffer = None
         if self.spec_algorithm.is_decoupled_verify():
             self.draft_tail_buffer = self.create_draft_tail_buffer()
@@ -837,10 +836,6 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
-        self.draft_worker.tracer = self.tracer
-        nested_draft_worker = getattr(self.draft_worker, "draft_worker", None)
-        if nested_draft_worker is not None:
-            nested_draft_worker.tracer = self.tracer
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -3288,7 +3283,6 @@ class Scheduler(
                 items=batch.batch_size(),
             )
 
-        decoupled_forward_start_ns = self.start_forward_timer(batch)
         decoupled_forward_call_start_ns = (
             decoupled_spec_timing_start() if decoupled_timing_role is not None else 0
         )
@@ -3457,9 +3451,6 @@ class Scheduler(
             ret.decoupled_timing_role = decoupled_timing_role
             ret.decoupled_iter_start_ns = decoupled_iter_start_ns
 
-        if decoupled_forward_start_ns is not None:
-            ret.decoupled_forward_start_ns = decoupled_forward_start_ns
-
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3533,11 +3524,6 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-
-        decoupled_forward_start_ns = getattr(result, "decoupled_forward_start_ns", None)
-        if decoupled_forward_start_ns is not None:
-            self.record_forward_latency(batch, decoupled_forward_start_ns, result)
-            result.decoupled_forward_start_ns = None
 
         if decoupled_timing_role is not None:
             decoupled_spec_print_timing(

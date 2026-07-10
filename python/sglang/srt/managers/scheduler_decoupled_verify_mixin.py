@@ -20,7 +20,6 @@ from sglang.srt.speculative.decoupled_spec_io import (
 from sglang.srt.speculative.draft_proxy import DraftProxyThread
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
 from sglang.srt.speculative.spec_info import dynamic_verify_enabled
-from sglang.srt.speculative.tracer import SpecTraceEvent, trace_speculative
 from sglang.srt.utils import broadcast_pyobj, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -64,7 +63,6 @@ class SchedulerDecoupledVerifyMixin:
             context=context,
             verifier_rank=self.get_decoupled_spec_rank(),
             draft_tail_buffer=self.draft_tail_buffer,
-            tracer=self.tracer,
         )
         self.draft_proxy_thread.start()
 
@@ -201,27 +199,17 @@ class SchedulerDecoupledVerifyMixin:
 
         self._snapshot_verify_inputs(batch)
 
-    @trace_speculative(
-        SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH,
-        inject_trace_enabled="trace_enabled",
-    )
     def _prepare_zero_step_verify_inputs(
         self: Scheduler,
         batch: ScheduleBatch,
-        *,
-        trace_enabled: bool = False,
-    ) -> dict | None:
+    ) -> None:
         num_speculative_steps, verify_tokens_per_req = (
             self._active_decoupled_verify_config()
         )
-        live_reqs = []
         for req in batch.reqs:
             if req.is_retracted or req.finished():
                 continue
-            live_reqs.append(req)
             setattr(req, "draft_buffer", None)
-            if trace_enabled:
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
             setattr(
                 req,
                 "_decoupled_verify_pre_committed_len",
@@ -237,30 +225,6 @@ class SchedulerDecoupledVerifyMixin:
                 "_decoupled_verify_tokens_per_req",
                 verify_tokens_per_req,
             )
-        if not live_reqs:
-            return None
-        if not trace_enabled:
-            return None
-
-        raw_verify_tokens = len(live_reqs) * verify_tokens_per_req
-
-        return {
-            "forward_mode": str(batch.forward_mode),
-            "batch_size": len(live_reqs),
-            "dynamic_verify_length": dynamic_verify_enabled(self.server_args),
-            "raw_batch_size": len(live_reqs),
-            "captured_batch_size": "",
-            "num_speculative_steps": num_speculative_steps,
-            "verify_tokens_per_req": verify_tokens_per_req,
-            "raw_verify_tokens": raw_verify_tokens,
-            "padded_verify_tokens": "",
-            "rids": [req.rid for req in live_reqs],
-            "valid_tail_lens_by_req": [0 for _ in live_reqs],
-            "raw_tail_lens_by_req": [0 for _ in live_reqs],
-            "committed_lens_by_req": [len(req.output_ids) for req in live_reqs],
-            "output_lens_by_req": [len(req.output_ids) for req in live_reqs],
-            "num_stale_snapshots": 0,
-        }
 
     def validate_verify_outputs(
         self: Scheduler,
@@ -599,9 +563,7 @@ class SchedulerDecoupledVerifyMixin:
         self,
         target_reqs: list[Req],
         snapshots: list[DraftTailSnapshot],
-        *,
-        collect_trace_stats: bool = False,
-    ) -> int:
+    ) -> None:
         """
         Bind one broadcast draft tail snapshot set to the local verifier batch.
 
@@ -615,8 +577,7 @@ class SchedulerDecoupledVerifyMixin:
             snapshots: Broadcast per-request draft tail snapshots.
 
         Returns:
-            The number of snapshots skipped because their confirmed prefix
-            lags behind the verifier request.
+            None.
         """
         snapshot_by_rid: dict[str, DraftTailSnapshot] = {}
         for snapshot in snapshots:
@@ -631,16 +592,12 @@ class SchedulerDecoupledVerifyMixin:
             snapshot = snapshot_by_rid.get(req.rid)
             if snapshot is None:
                 setattr(req, "draft_buffer", None)
-                if collect_trace_stats:
-                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                 continue
 
             committed_len = int(snapshot.committed_len)
             if committed_len < len(req.output_ids):
                 # the drafter has not caught up with the verifier req's committed output prefix
                 setattr(req, "draft_buffer", None)
-                if collect_trace_stats:
-                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                 continue
             if committed_len > len(req.output_ids):
                 raise RuntimeError(
@@ -650,31 +607,11 @@ class SchedulerDecoupledVerifyMixin:
                     f"request_output_len={len(req.output_ids)}"
                 )
             setattr(req, "draft_buffer", list(snapshot.tail_tokens))
-            if collect_trace_stats:
-                setattr(
-                    req,
-                    "_decoupled_verify_snapshot_raw_tail_tokens",
-                    list(snapshot.raw_tail_tokens),
-                )
-        if not collect_trace_stats:
-            return 0
-        return sum(
-            1
-            for req in target_reqs
-            if snapshot_by_rid.get(req.rid) is not None
-            and int(snapshot_by_rid[req.rid].committed_len) < len(req.output_ids)
-        )
 
-    @trace_speculative(
-        SpecTraceEvent.VERIFIER_BUILD_SYNC_BATCH,
-        inject_trace_enabled="trace_enabled",
-    )
     def _sync_verify_requests(
         self,
         batch: ScheduleBatch,
-        *,
-        trace_enabled: bool = False,
-    ) -> dict | None:
+    ) -> None:
         """
         Send DraftSync messages before verifier prefill/extend processing.
 
@@ -729,17 +666,8 @@ class SchedulerDecoupledVerifyMixin:
                     )
                 )
                 setattr(req, "draft_buffer", None)
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
-            trace_payload = {
-                "forward_mode": str(batch.forward_mode),
-                "batch_size": len(batch.reqs),
-                "rids": [row[0] for row in sync_rows],
-                "committed_lens_by_req": [len(row[4]) for row in sync_rows],
-                "output_lens_by_req": [len(row[4]) for row in sync_rows],
-                "dst_drafter_ranks": [int(row[2]) for row in sync_rows],
-            }
             self._send_verify_control_rows(sync_rows=sync_rows)
-            return trace_payload
+            return
 
         sync_messages: list[DraftSync] = []
         for req in batch.reqs:
@@ -768,36 +696,12 @@ class SchedulerDecoupledVerifyMixin:
                 )
             )
             setattr(req, "draft_buffer", None)
-            if trace_enabled:
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
         self._send_verify_control_batches(sync_messages=sync_messages)
-        if not trace_enabled:
-            return None
-        return {
-            "forward_mode": str(batch.forward_mode),
-            "batch_size": len(batch.reqs),
-            "rids": [message.request_id for message in sync_messages],
-            "committed_lens_by_req": [
-                len(message.committed_output_ids) for message in sync_messages
-            ],
-            "output_lens_by_req": [
-                len(message.committed_output_ids) for message in sync_messages
-            ],
-            "dst_drafter_ranks": [
-                int(message.dst_drafter_rank) for message in sync_messages
-            ],
-        }
 
-    @trace_speculative(
-        SpecTraceEvent.VERIFIER_SNAPSHOT_TAIL_BATCH,
-        inject_trace_enabled="trace_enabled",
-    )
     def _snapshot_verify_inputs(
         self,
         batch: ScheduleBatch,
-        *,
-        trace_enabled: bool = False,
-    ) -> dict | None:
+    ) -> None:
         """
         Collect currently available draft tails, and bind them to a verifier request batch.
 
@@ -819,8 +723,6 @@ class SchedulerDecoupledVerifyMixin:
                 continue
             live_reqs.append(req)
             setattr(req, "draft_buffer", None)
-            if trace_enabled:
-                setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
             setattr(
                 req,
                 "_decoupled_verify_pre_committed_len",
@@ -855,7 +757,6 @@ class SchedulerDecoupledVerifyMixin:
             local_snapshots = draft_tail_buffer.get_draft_snapshots(
                 target_reqs,
                 allow_partial=allow_partial,
-                include_raw_tail_tokens=trace_enabled,
                 max_tail_len=snapshot_tail_cap,
             )
             self._decoupled_verify_draft_wait_ns_since_log = getattr(
@@ -863,62 +764,12 @@ class SchedulerDecoupledVerifyMixin:
             ) + int(draft_tail_buffer.last_draft_wait_ns)
 
         synced_snapshots = self._broadcast_verify_snapshots(local_snapshots)
-        num_stale_snapshots = self._bind_verify_snapshots(
-            target_reqs,
-            synced_snapshots,
-            collect_trace_stats=trace_enabled,
-        )
-        if not trace_enabled:
-            return None
-        snapshot_by_rid = {
-            snapshot.request_id: snapshot for snapshot in synced_snapshots
-        }
-        static_spec_steps = int(self.server_args.speculative_num_steps or 0)
-        static_verify_tokens = int(self.server_args.speculative_num_draft_tokens or 0)
-        active_spec_steps = (
-            snapshot_tail_cap if snapshot_tail_cap is not None else static_spec_steps
-        )
-        active_verify_tokens = (
-            verify_tokens_per_req
-            if verify_tokens_per_req is not None
-            else static_verify_tokens
-        )
-        return {
-            "forward_mode": str(batch.forward_mode),
-            "batch_size": len(target_reqs),
-            "dynamic_verify_length": is_dynamic,
-            "raw_batch_size": len(target_reqs) if is_dynamic else "",
-            "captured_batch_size": "",
-            "num_speculative_steps": active_spec_steps,
-            "verify_tokens_per_req": active_verify_tokens,
-            "raw_verify_tokens": len(target_reqs) * active_verify_tokens,
-            "padded_verify_tokens": "",
-            "rids": [req.rid for req in target_reqs],
-            "valid_tail_lens_by_req": [
-                len(getattr(req, "draft_buffer", None) or []) for req in target_reqs
-            ],
-            "raw_tail_lens_by_req": [
-                int(getattr(snapshot_by_rid.get(req.rid), "raw_tail_len", 0))
-                for req in target_reqs
-            ],
-            "committed_lens_by_req": [
-                int(getattr(snapshot_by_rid.get(req.rid), "committed_len", 0))
-                for req in target_reqs
-            ],
-            "output_lens_by_req": [len(req.output_ids) for req in target_reqs],
-            "num_stale_snapshots": num_stale_snapshots,
-        }
+        self._bind_verify_snapshots(target_reqs, synced_snapshots)
 
-    @trace_speculative(
-        SpecTraceEvent.VERIFIER_BUILD_UPDATE_BATCH,
-        inject_trace_enabled="trace_enabled",
-    )
     def submit_verify_updates(
         self,
         batch: ScheduleBatch,
-        *,
-        trace_enabled: bool = False,
-    ) -> dict | None:
+    ) -> None:
         """
         Send verifier commit or close messages after batch result processing.
 
@@ -949,13 +800,6 @@ class SchedulerDecoupledVerifyMixin:
         if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
             commit_rows: list[tuple] = []
             close_rows: list[tuple] = []
-            commit_pre_committed_lens: list[int] = []
-            commit_draft_buffer_lens: list[int] = []
-            commit_segment_lens: list[int] = []
-            commit_last_token_ids: list[int] = []
-            commit_committed_lens: list[int] = []
-            commit_output_lens: list[int] = []
-            close_output_lens: list[int] = []
             for req in batch.reqs:
                 has_request = draft_tail_buffer.has_request(req.rid)
 
@@ -970,10 +814,8 @@ class SchedulerDecoupledVerifyMixin:
                                 "abort" if req.is_retracted else "finished",
                             )
                         )
-                        close_output_lens.append(len(req.output_ids))
                         self.release_drafter_rank(req.rid)
                     setattr(req, "draft_buffer", None)
-                    setattr(req, "_decoupled_verify_snapshot_raw_tail_tokens", [])
                     continue
 
                 if not has_request:
@@ -1002,11 +844,8 @@ class SchedulerDecoupledVerifyMixin:
                 if pre_verify_committed_len == len(req.output_ids):
                     if hasattr(req, "_decoupled_verify_pre_committed_len"):
                         delattr(req, "_decoupled_verify_pre_committed_len")
-                    if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
-                        delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
                     continue
 
-                draft_buffer = list(getattr(req, "draft_buffer", None) or [])
                 committed_token_ids = [
                     int(token_id)
                     for token_id in req.output_ids[pre_verify_committed_len:]
@@ -1021,51 +860,17 @@ class SchedulerDecoupledVerifyMixin:
                         committed_token_ids,
                     )
                 )
-                commit_pre_committed_lens.append(pre_verify_committed_len)
-                commit_draft_buffer_lens.append(len(draft_buffer))
-                commit_segment_lens.append(len(committed_token_ids))
-                commit_last_token_ids.append(int(committed_token_ids[-1]))
-                commit_committed_lens.append(
-                    pre_verify_committed_len + len(committed_token_ids)
-                )
-                commit_output_lens.append(len(req.output_ids))
                 if hasattr(req, "_decoupled_verify_pre_committed_len"):
                     delattr(req, "_decoupled_verify_pre_committed_len")
-                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
-                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
 
-            trace_payload = {
-                "forward_mode": str(batch.forward_mode),
-                "batch_size": len(batch.reqs),
-                "commit_rids": [row[0] for row in commit_rows],
-                "close_rids": [row[0] for row in close_rows],
-                "num_commit": len(commit_rows),
-                "num_close": len(close_rows),
-                "pre_committed_lens_by_req": commit_pre_committed_lens,
-                "draft_buffer_lens_by_req": commit_draft_buffer_lens,
-                "committed_segment_lens_by_req": commit_segment_lens,
-                "last_committed_token_ids_by_req": commit_last_token_ids,
-                "committed_lens_by_req": commit_committed_lens,
-                "commit_output_lens_by_req": commit_output_lens,
-                "commit_dst_drafter_ranks": [int(row[2]) for row in commit_rows],
-                "close_output_lens_by_req": close_output_lens,
-                "close_dst_drafter_ranks": [int(row[2]) for row in close_rows],
-            }
             self._send_verify_control_rows(
                 commit_rows=commit_rows,
                 close_rows=close_rows,
             )
-            return trace_payload
+            return
 
         verify_commit_messages: list[VerifyCommit] = []
         close_messages: list[DraftClose] = []
-        commit_pre_committed_lens: list[int] = []
-        commit_draft_buffer_lens: list[int] = []
-        commit_segment_lens: list[int] = []
-        commit_last_token_ids: list[int] = []
-        commit_committed_lens: list[int] = []
-        commit_output_lens: list[int] = []
-        close_output_lens: list[int] = []
         for req in batch.reqs:
             has_request = draft_tail_buffer.has_request(req.rid)
 
@@ -1080,12 +885,8 @@ class SchedulerDecoupledVerifyMixin:
                             reason="abort" if req.is_retracted else "finished",
                         )
                     )
-                    if trace_enabled:
-                        close_output_lens.append(len(req.output_ids))
                     self.release_drafter_rank(req.rid)
                 setattr(req, "draft_buffer", None)
-                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
-                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
                 continue
 
             if not has_request:
@@ -1115,11 +916,8 @@ class SchedulerDecoupledVerifyMixin:
                 # no tokens are generated during this forward(e.g. chunked prefill)
                 if hasattr(req, "_decoupled_verify_pre_committed_len"):
                     delattr(req, "_decoupled_verify_pre_committed_len")
-                if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
-                    delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
                 continue
 
-            draft_buffer = list(getattr(req, "draft_buffer", None) or [])
             committed_token_ids = [
                 int(token_id)
                 for token_id in req.output_ids[pre_verify_committed_len:]
@@ -1134,48 +932,12 @@ class SchedulerDecoupledVerifyMixin:
                     committed_token_ids=committed_token_ids,
                 )
             )
-            if trace_enabled:
-                commit_pre_committed_lens.append(pre_verify_committed_len)
-                commit_draft_buffer_lens.append(len(draft_buffer))
-                commit_segment_lens.append(len(committed_token_ids))
-                commit_last_token_ids.append(int(committed_token_ids[-1]))
-                commit_committed_lens.append(
-                    pre_verify_committed_len + len(committed_token_ids)
-                )
-                commit_output_lens.append(len(req.output_ids))
             if hasattr(req, "_decoupled_verify_pre_committed_len"):
                 delattr(req, "_decoupled_verify_pre_committed_len")
-            if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
-                delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
         self._send_verify_control_batches(
             verify_commit_messages=verify_commit_messages,
             close_messages=close_messages,
         )
-        if not trace_enabled:
-            return None
-        return {
-            "forward_mode": str(batch.forward_mode),
-            "batch_size": len(batch.reqs),
-            "commit_rids": [
-                message.request_id for message in verify_commit_messages
-            ],
-            "close_rids": [message.request_id for message in close_messages],
-            "num_commit": len(verify_commit_messages),
-            "num_close": len(close_messages),
-            "pre_committed_lens_by_req": commit_pre_committed_lens,
-            "draft_buffer_lens_by_req": commit_draft_buffer_lens,
-            "committed_segment_lens_by_req": commit_segment_lens,
-            "last_committed_token_ids_by_req": commit_last_token_ids,
-            "committed_lens_by_req": commit_committed_lens,
-            "commit_output_lens_by_req": commit_output_lens,
-            "commit_dst_drafter_ranks": [
-                int(message.dst_drafter_rank) for message in verify_commit_messages
-            ],
-            "close_output_lens_by_req": close_output_lens,
-            "close_dst_drafter_ranks": [
-                int(message.dst_drafter_rank) for message in close_messages
-            ],
-        }
 
     def abort_verify_request(self, request_id: str) -> None:
         """

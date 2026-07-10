@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import atexit
-import csv
 import glob
-import json
 import os
-import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -25,14 +21,7 @@ from sglang.srt.speculative.decoupled_spec_io import (
     VerifyCommit,
 )
 from sglang.srt.speculative.draft_tail_buffer import DraftTailSnapshot
-from sglang.srt.speculative.tracer import (
-    NullSpecTracer,
-    SpecTraceEvent,
-    trace_speculative,
-)
 from sglang.srt.utils.network import get_free_port
-
-_PROFILE_FLUSH_INTERVAL_NS = 5_000_000_000
 
 
 @lru_cache(maxsize=1)
@@ -60,48 +49,6 @@ def _ensure_zmq_lib_path() -> None:
         candidates.extend(glob.glob(str(parent / "pyzmq.libs" / "libzmq*.so*")))
     if candidates:
         os.environ["SGLANG_DECOUPLED_SPEC_ZMQ_LIB"] = candidates[0]
-
-
-def _write_cpp_profile(tracer: Any, component: str, payload: str | None) -> None:
-    if not payload:
-        return
-    output_dir = getattr(tracer, "output_dir", None)
-    if output_dir is None:
-        return
-
-    profile_rows = json.loads(payload)
-    if not profile_rows:
-        return
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    timestamp = time.time_ns()
-    json_path = output_path / f"{component}__cpp_profile.json"
-    csv_path = output_path / f"{component}__cpp_profile.csv"
-
-    with json_path.open("w") as f:
-        json.dump(profile_rows, f, indent=2)
-
-    fieldnames = [
-        "wall_time_ns",
-        "component",
-        "op",
-        "count",
-        "total_ns",
-        "p50_ns",
-        "p95_ns",
-        "max_ns",
-        "items",
-        "total_items",
-    ]
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in profile_rows:
-            out = {key: row.get(key, "") for key in fieldnames}
-            out["wall_time_ns"] = timestamp
-            out["component"] = component
-            writer.writerow(out)
 
 
 def _sync_row(message: DraftSync) -> tuple[str, int, int, list[int], list[int]]:
@@ -230,15 +177,12 @@ class CppDraftTailBuffer:
         dst_rank = int(messages[0].dst_drafter_rank) if messages else 0
         self.apply_control_batch(DraftControlBatch(dst_rank, close_messages=list(messages)))
 
-    def apply_control_batch(
-        self, batch: DraftControlBatch, *, collect_stats: bool = False
-    ) -> dict[str, Any] | None:
-        return self.apply_control_rows(
+    def apply_control_batch(self, batch: DraftControlBatch) -> None:
+        self.apply_control_rows(
             int(batch.dst_drafter_rank),
             [_sync_row(message) for message in batch.sync_messages],
             [_commit_row(message) for message in batch.verify_commit_messages],
             [_close_row(message) for message in batch.close_messages],
-            collect_stats=collect_stats,
         )
 
     def apply_control_rows(
@@ -247,35 +191,25 @@ class CppDraftTailBuffer:
         sync_rows: list[tuple],
         commit_rows: list[tuple],
         close_rows: list[tuple],
-        *,
-        collect_stats: bool = False,
-    ) -> dict[str, Any] | None:
-        return self._cpp.apply_control_batch_native(
+    ) -> None:
+        self._cpp.apply_control_batch_native(
             int(dst_drafter_rank),
             list(sync_rows),
             list(commit_rows),
             list(close_rows),
-            bool(collect_stats),
         )
 
-    def append_draft_stream_batch(
-        self, batch: DraftTailStreamOutputBatch, *, collect_stats: bool = False
-    ) -> dict[str, Any] | None:
+    def append_draft_stream_batch(self, batch: DraftTailStreamOutputBatch) -> None:
         if not batch.outputs:
-            return None
-        return self.append_draft_rows(
+            return
+        self.append_draft_rows(
             [_tail_row(output) for output in batch.outputs],
-            collect_stats=collect_stats,
         )
 
-    def append_draft_rows(
-        self, rows: list[tuple], *, collect_stats: bool = False
-    ) -> dict[str, Any] | None:
+    def append_draft_rows(self, rows: list[tuple]) -> None:
         if not rows:
-            return None
-        return self._cpp.append_draft_stream_batch_native(
-            list(rows), bool(collect_stats)
-        )
+            return
+        self._cpp.append_draft_stream_batch_native(list(rows))
 
     def wait_for_draft_tokens(self, rids: list[str], min_draft_tokens: int) -> None:
         self._cpp.wait_for_draft_tokens_native(
@@ -287,7 +221,6 @@ class CppDraftTailBuffer:
         reqs: list,
         *,
         allow_partial: bool = True,
-        include_raw_tail_tokens: bool = False,
         max_tail_len: int | None = None,
     ) -> list[DraftTailSnapshot]:
         rids = [str(req.rid) for req in reqs]
@@ -295,7 +228,6 @@ class CppDraftTailBuffer:
         rows, wait_ns = self._cpp.get_draft_snapshots_native(
             rids,
             bool(allow_partial),
-            bool(include_raw_tail_tokens),
             int(tail_cap),
         )
         self.last_draft_wait_ns = int(wait_ns)
@@ -305,13 +237,9 @@ class CppDraftTailBuffer:
                 committed_len=int(row[1]),
                 tail_tokens=[int(x) for x in row[2]],
                 raw_tail_len=int(row[3]),
-                raw_tail_tokens=[int(x) for x in row[4]],
             )
             for row in rows
         ]
-
-    def profile_json(self) -> str:
-        return self._cpp.profile_json()
 
 
 class _CppDraftControlInboxProxy:
@@ -357,7 +285,6 @@ class CppTokenSyncThread:
         self,
         context: Any | None = None,
         drafter_rank: int = 0,
-        tracer: Any = None,
     ) -> None:
         _ensure_zmq_lib_path()
         module = _load_decoupled_spec_cpp_module()
@@ -367,56 +294,33 @@ class CppTokenSyncThread:
         self.drafter_rank = int(drafter_rank)
         self.control_bind_endpoint = str(self._cpp.control_bind_endpoint())
         self.verifier_result_endpoints: list[str] = []
-        self.tracer = tracer or NullSpecTracer()
-        self._last_profile_flush_ns = 0
-        atexit.register(self._flush_cpp_profile)
 
     def start(self) -> None:
         self._cpp.start()
 
     def close(self) -> None:
-        try:
-            self._cpp.close()
-        finally:
-            self._flush_cpp_profile()
-
-    def _flush_cpp_profile(self) -> None:
-        if not getattr(self.tracer, "enabled", False):
-            return
-        _write_cpp_profile(self.tracer, "token_sync_thread", self._cpp.profile_json())
-
-    def _maybe_flush_cpp_profile(self) -> None:
-        now = time.time_ns()
-        if now - self._last_profile_flush_ns >= _PROFILE_FLUSH_INTERVAL_NS:
-            self._last_profile_flush_ns = now
-            self._flush_cpp_profile()
+        self._cpp.close()
 
     def configure_peer_endpoints(self, verifier_result_endpoints: list[str]) -> None:
         endpoints = [str(endpoint) for endpoint in verifier_result_endpoints]
         self._cpp.configure_peer_endpoints_native(endpoints)
         self.verifier_result_endpoints = endpoints
 
-    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_DRAIN_CONTROL_BATCH)
     def collect_ready_draft_controls(
         self,
         collector: Callable[[DraftControlInbox], ReadyDraftControls],
     ) -> ReadyDraftControls:
-        result = collector(_CppDraftControlInboxProxy(self._cpp))  # type: ignore[arg-type]
-        self._maybe_flush_cpp_profile()
-        return result
+        return collector(_CppDraftControlInboxProxy(self._cpp))  # type: ignore[arg-type]
 
-    @trace_speculative(SpecTraceEvent.TOKEN_SYNC_ENQUEUE_DRAFT_RESULT_BATCH)
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
             return
         self.submit_draft_result_rows([_tail_row(output) for output in result_batch.outputs])
-        self._maybe_flush_cpp_profile()
 
     def submit_draft_result_rows(self, rows: list[tuple]) -> None:
         if not rows:
             return
         self._cpp.submit_draft_results_native(list(rows))
-        self._maybe_flush_cpp_profile()
 
 
 class CppDraftProxyThread:
@@ -426,7 +330,6 @@ class CppDraftProxyThread:
         context: Any,
         verifier_rank: int,
         draft_tail_buffer: CppDraftTailBuffer,
-        tracer: Any = None,
     ) -> None:
         _ensure_zmq_lib_path()
         module = _load_decoupled_spec_cpp_module()
@@ -437,36 +340,14 @@ class CppDraftProxyThread:
         self.context = context
         self.verifier_rank = int(verifier_rank)
         self.draft_tail_buffer = draft_tail_buffer
-        self.tracer = tracer or NullSpecTracer()
         self.result_bind_endpoint = str(self._cpp.result_bind_endpoint())
         self.drafter_control_endpoints: list[str] = []
-        self._last_profile_flush_ns = 0
-        atexit.register(self._flush_cpp_profile)
 
     def start(self) -> None:
         self._cpp.start()
 
     def close(self) -> None:
-        try:
-            self._cpp.close()
-        finally:
-            self._flush_cpp_profile()
-
-    def _flush_cpp_profile(self) -> None:
-        if not getattr(self.tracer, "enabled", False):
-            return
-        _write_cpp_profile(self.tracer, "draft_proxy", self._cpp.profile_json())
-        _write_cpp_profile(
-            self.tracer,
-            "draft_tail_buffer",
-            self.draft_tail_buffer.profile_json(),
-        )
-
-    def _maybe_flush_cpp_profile(self) -> None:
-        now = time.time_ns()
-        if now - self._last_profile_flush_ns >= _PROFILE_FLUSH_INTERVAL_NS:
-            self._last_profile_flush_ns = now
-            self._flush_cpp_profile()
+        self._cpp.close()
 
     def configure_peer_endpoints(self, drafter_control_endpoints: list[str]) -> None:
         endpoints = [str(endpoint) for endpoint in drafter_control_endpoints]
@@ -498,4 +379,3 @@ class CppDraftProxyThread:
             list(commit_rows),
             list(close_rows),
         )
-        self._maybe_flush_cpp_profile()

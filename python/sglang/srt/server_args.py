@@ -1574,10 +1574,6 @@ class ServerArgs:
         int,
         "Base global rank for dynamically configured decoupled-spec entry schedulers. The local DP rank is added to this value.",
     ] = 0
-    spec_trace_dir: A[
-        Optional[str],
-        "Directory for speculative decoding CSV trace files. Tracing is enabled when this flag is provided.",
-    ] = None
 
     # -------------------------------------------------------------------------
     # Speculative decoding (ngram)
@@ -6733,14 +6729,6 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
-
-        # Check speculative decoding
-        if self.spec_trace_dir:
-            logger.warning(
-                "--spec-trace-dir enables speculative trace file writing, which "
-                "can contend for the Python GIL and may degrade scheduler "
-                "performance, especially for decoupled-spec drafter schedulers."
-            )
 
         if self.speculative_algorithm is not None:
             assert (

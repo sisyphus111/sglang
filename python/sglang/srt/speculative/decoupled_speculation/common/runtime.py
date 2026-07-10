@@ -70,7 +70,6 @@ def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
     for env_name in (
         "CUDA_LAUNCH_BLOCKING",
         "SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND",
-        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
         "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
         env_value = os.environ.get(env_name)
@@ -455,7 +454,6 @@ class DraftActor:
         rank_base: int,
         max_running_requests: int | None = None,
         deterministic: bool = False,
-        spec_trace_dir: str | None = None,
     ):
         """Pin GPUs and create the draft engine."""
         self.assigned_gpu_ids = pin_actor_to_assigned_gpus(tp_size)
@@ -469,7 +467,6 @@ class DraftActor:
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
-            spec_trace_dir=spec_trace_dir,
         )
         if max_running_requests is not None:
             engine_kwargs["max_running_requests"] = max_running_requests
@@ -525,7 +522,6 @@ def launch_draft_actors(
             rank_base=rank,
             max_running_requests=getattr(args, "max_running_requests", None),
             deterministic=args.deterministic,
-            spec_trace_dir=args.spec_trace_dir,
         )
         actors.append(actor)
     ready_infos = ray.get([actor.ready.remote() for actor in actors])
@@ -602,7 +598,6 @@ class TargetActor:
         cuda_graph_bs_decode: list[int] | None = None,
         rank_base: int = 0,
         deterministic: bool = False,
-        spec_trace_dir: str | None = None,
         log_level: str | None = None,
         available_ports: list[int] | None = None,
         max_running_requests: int | None = None,
@@ -623,7 +618,6 @@ class TargetActor:
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
             enable_deterministic_inference=deterministic,
-            spec_trace_dir=spec_trace_dir,
         )
         if log_level is not None:
             engine_kwargs["log_level"] = log_level

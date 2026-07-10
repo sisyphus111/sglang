@@ -396,11 +396,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--spec-trace-dir",
-        default=None,
-        help="Directory for speculative decoding CSV trace files.",
-    )
-    parser.add_argument(
         "--draft-ready-timeout-s",
         type=float,
         default=900.0,
@@ -425,7 +420,6 @@ def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
     for env_name in (
         "CUDA_LAUNCH_BLOCKING",
         "SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND",
-        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
         "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
         env_value = os.environ.get(env_name)
@@ -864,7 +858,6 @@ def run_draft_engine_process(
     max_running_requests: int | None,
     cuda_graph_bs_decode: list[int] | None,
     deterministic: bool,
-    spec_trace_dir: str | None,
     decode_log_interval: int | None,
     mem_fraction_static: float | None,
     chunked_prefill_size: int | None,
@@ -884,7 +877,6 @@ def run_draft_engine_process(
             speculative_num_draft_tokens=speculative_num_steps + 1,
             disable_radix_cache=True,
             enable_deterministic_inference=deterministic,
-            spec_trace_dir=spec_trace_dir,
             decoupled_spec_rank_base=rank,
         )
         if cuda_graph_bs_decode is not None:
@@ -1058,7 +1050,6 @@ def start_draft_engines(
                     max_running_requests=args.max_running_requests,
                     cuda_graph_bs_decode=args.cuda_graph_bs_decode,
                     deterministic=args.deterministic,
-                    spec_trace_dir=args.spec_trace_dir,
                     decode_log_interval=args.decode_log_interval,
                     mem_fraction_static=args.mem_fraction_static,
                     chunked_prefill_size=args.chunked_prefill_size,
@@ -1197,7 +1188,6 @@ def create_verifier_engine(
         speculative_num_draft_tokens=args.num_speculative_steps + 1,
         disable_radix_cache=True,
         enable_deterministic_inference=args.deterministic,
-        spec_trace_dir=args.spec_trace_dir,
         log_level="info",
         decoupled_spec_rank_base=0,
     )
@@ -1247,7 +1237,6 @@ def create_decode_engine(
         dist_init_addr=dist_init_addr,
         enable_deterministic_inference=args.deterministic,
         disable_overlap_schedule=True,
-        spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
     apply_common_engine_overrides(engine_kwargs, args)
@@ -1285,7 +1274,6 @@ def create_mtp_engine(
         disable_radix_cache=True,
         disable_overlap_schedule=True,
         mamba_scheduler_strategy="no_buffer",
-        spec_trace_dir=args.spec_trace_dir,
         log_level="info",
     )
     apply_common_engine_overrides(engine_kwargs, args)
