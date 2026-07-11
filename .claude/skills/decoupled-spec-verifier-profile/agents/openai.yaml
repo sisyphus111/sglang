@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Verifier Profile"
+  short_description: "Profile verifier costs across BS, context, and steps"
+  default_prompt: "Use $decoupled-spec-verifier-profile to generate a validated verifier throughput profile for my target topology and requested grid."

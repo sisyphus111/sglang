@@ -1,6 +1,6 @@
 ---
 name: decoupled-spec-experiment
-description: Run reproducible SGLang decoupled-speculation profile, static, and dynamic experiment matrices through examples/runtime/engine/decoupled_speculation. Use when preparing a baseline matrix, validating a throughput profile cache, launching Qwen decoupled-spec benchmarks, resuming interrupted cases, or collecting raw logs and E2E summaries for later trajectory analysis.
+description: Run reproducible SGLang decoupled-speculation static and dynamic experiment matrices through examples/runtime/engine/decoupled_speculation. Use when preparing a baseline matrix, validating an existing throughput profile cache, launching Qwen decoupled-spec benchmarks, resuming interrupted cases, or collecting raw logs and E2E summaries for later trajectory analysis. Use decoupled-spec-verifier-profile when the profile itself must be generated.
 ---
 
 # Decoupled Spec Experiment
@@ -19,11 +19,13 @@ or compute an oracle here; hand completed artifacts to the downstream skills.
    edit only the copied config before the first invocation. The first invocation
    creates `config.lock.toml`; later config drift is rejected. Keep static and dynamic candidates,
    `allow_partial`, sampling seed, and profile buckets explicit.
-3. Generate or validate the profile before a throughput-aware dynamic run:
+3. Generate the target-only verifier cost cache with
+   `decoupled-spec-verifier-profile`, then set its `profile.json` path in this
+   experiment config. Validate it before a throughput-aware dynamic run:
 
    ```bash
-   python .claude/skills/decoupled-spec-experiment/scripts/run_matrix.py \
-     profile --config <run-dir>/config.toml --run-dir <run-dir>
+   python .claude/skills/decoupled-spec-verifier-profile/scripts/profile_verifier.py \
+     --config <profile-output>/profile-config.toml
    ```
 
 4. Run or resume the matrix:

@@ -1,0 +1,25 @@
+[paths]
+repo = "/opt/tiger/sglang"
+target_model = "/path/to/target-model"
+output_dir = "/path/to/profile-output"
+
+[target]
+gpus = ["0", "1", "2", "3"]
+tp_size = 4
+dp_size = 1
+enable_dp_attention = false
+dtype = "auto"
+trust_remote_code = false
+deterministic = true
+mem_fraction_static = 0.80
+# ep_size = 4
+# moe_a2a_backend = "deepep"
+# attention_backend = "fa3"
+
+[profile]
+batch_sizes = [1, 4, 8, 16, 32, 64]
+ctx_lens = [1024, 4096, 8192, 16384, 32768]
+steps = [0, 1, 2, 3]
+
+[run]
+timeout_s = 7200
