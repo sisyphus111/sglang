@@ -5,6 +5,7 @@ This directory keeps runtime launch scripts separate from profiling utilities:
 - `multi-node.py`: run the Ray-backed multi-node benchmark from either `--prompt` or `--dataset-path`.
 - `single-node.py`: run the local-process single-node benchmark without Ray.
 - `utils/target-profile.py`: profile target-only decode throughput for different batch sizes around the 4k generated-token region. Use its recommended budget as a starting point for decoupled verifier dynamic verify length.
+- [`throughput_aware_acclen.md`](throughput_aware_acclen.md): design and examples for the EMA-based acceptance-length estimator used by the decoupled verifier's throughput-aware adaptive strategy.
 - `configs/`: fixed example configs, such as adaptive speculative step candidates.
 - `common/`: shared helpers split by function: runtime/Ray topology, prompt loading, metrics/output, and shared types.
 

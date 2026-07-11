@@ -456,6 +456,7 @@ def build_result(
                 args, "speculative_adaptive_config", None
             ),
             "temperature": args.temperature,
+            "sampling_seed": getattr(args, "sampling_seed", None),
             "deterministic": args.deterministic,
             "ignore_eos": args.ignore_eos,
             "nnodes": args.nnodes,

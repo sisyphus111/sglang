@@ -55,9 +55,25 @@ def load_config(path: Path) -> dict[str, Any]:
         )
     if bool(workload.get("ignore_eos", False)):
         print("warning: ignore_eos=true changes request outputs", file=sys.stderr)
+    if workload.get("sampling_seed") is not None and not isinstance(
+        workload["sampling_seed"], int
+    ):
+        raise ValueError("workload.sampling_seed must be an integer")
+    if "deterministic" in workload and not isinstance(
+        workload["deterministic"], bool
+    ):
+        raise ValueError("workload.deterministic must be a boolean")
     capture_bs = [int(value) for value in config["profile"]["capture_bs"]]
     if batch_size not in capture_bs:
         raise ValueError(f"profile.capture_bs must contain workload batch_size={batch_size}")
+    adaptive = config.get("adaptive", {})
+    strategy = str(adaptive.get("strategy", "throughput_aware"))
+    if strategy not in {"ema", "throughput_aware"}:
+        raise ValueError(
+            f"adaptive.strategy must be ema or throughput_aware, got {strategy!r}"
+        )
+    if strategy == "ema" and not adaptive.get("config"):
+        raise ValueError("adaptive.config is required when adaptive.strategy=ema")
     return config
 
 
@@ -93,6 +109,13 @@ def stop_process_group(process: subprocess.Popen[Any]) -> None:
 
 def build_env(config: dict[str, Any], allow_partial: bool) -> dict[str, str]:
     env = os.environ.copy()
+    repo_python = str(Path(config["paths"]["repo"]) / "python")
+    ambient_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        os.pathsep.join((repo_python, ambient_pythonpath))
+        if ambient_pythonpath
+        else repo_python
+    )
     env["PYTHONUNBUFFERED"] = "1"
     env["SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"] = "1" if allow_partial else "0"
     configured = config.get("environment", {})
@@ -106,7 +129,12 @@ def build_env(config: dict[str, Any], allow_partial: bool) -> dict[str, str]:
 
 
 def base_command(
-    config: dict[str, Any], output_dir: Path, steps: int, dynamic: bool
+    config: dict[str, Any],
+    output_dir: Path,
+    steps: int,
+    dynamic: bool,
+    *,
+    adaptive_strategy: str | None = None,
 ) -> list[str]:
     paths = config["paths"]
     parallelism = config["parallelism"]
@@ -156,22 +184,38 @@ def base_command(
         "--output-dir",
         str(output_dir),
     ]
+    if workload.get("sampling_seed") is not None:
+        command.extend(["--sampling-seed", str(workload["sampling_seed"])])
     if bool(workload.get("enable_thinking", False)):
         command.append("--enable-thinking")
+    if bool(workload.get("deterministic", False)):
+        command.append("--deterministic")
     if bool(workload.get("ignore_eos", False)):
         command.append("--ignore-eos")
     if dynamic:
-        command.extend(
-            [
-                "--speculative-adaptive",
-                "--speculative-adaptive-strategy",
-                "throughput_aware",
-                "--decoupled-verify-throughput-profile-path",
-                str(paths["profile"]),
-                "--decoupled-verify-throughput-profile-ctx-lens",
-                ",".join(str(value) for value in profile["ctx_lens"]),
-            ]
+        adaptive = config.get("adaptive", {})
+        strategy = adaptive_strategy or str(
+            adaptive.get("strategy", "throughput_aware")
         )
+        command.extend(
+            ["--speculative-adaptive", "--speculative-adaptive-strategy", strategy]
+        )
+        if strategy == "throughput_aware":
+            command.extend(
+                [
+                    "--decoupled-verify-throughput-profile-path",
+                    str(paths["profile"]),
+                    "--decoupled-verify-throughput-profile-ctx-lens",
+                    ",".join(str(value) for value in profile["ctx_lens"]),
+                ]
+            )
+        elif strategy == "ema":
+            adaptive_config = Path(str(adaptive["config"]))
+            if not adaptive_config.is_absolute():
+                adaptive_config = repo / adaptive_config
+            command.extend(["--speculative-adaptive-config", str(adaptive_config)])
+        else:
+            raise ValueError(f"Unsupported adaptive strategy: {strategy!r}")
     for value in config.get("extra_args", {}).get("common", []):
         command.append(str(value))
     return command
@@ -211,6 +255,7 @@ def run_process(
             "# env: "
             + json.dumps(
                 {
+                    "PYTHONPATH": env["PYTHONPATH"],
                     "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL": env[
                         "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"
                     ],
@@ -269,7 +314,13 @@ def generate_profile(
     output_dir = run_dir / "runs" / label
     log_path = run_dir / "logs" / f"{label}.log"
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = base_command(config, output_dir, max_steps, dynamic=True)
+    command = base_command(
+        config,
+        output_dir,
+        max_steps,
+        dynamic=True,
+        adaptive_strategy="throughput_aware",
+    )
     if "mem_fraction_static" in profile:
         command.extend(["--mem-fraction-static", str(profile["mem_fraction_static"])])
     if "prefill_budget" in profile:
@@ -340,9 +391,18 @@ def case_label(allow_partial: bool, dynamic: bool, step: int) -> str:
     return f"ap{int(allow_partial)}_{'dynamic' if dynamic else 'static'}_dl{step}"
 
 
-def run_matrix(config: dict[str, Any], run_dir: Path, force: bool, timeout_s: float) -> None:
+def run_matrix(
+    config: dict[str, Any], run_dir: Path, force: bool, timeout_s: float
+) -> None:
     complete, reason = profile_complete(config)
-    if config["matrix"].get("dynamic_max_steps") and not complete:
+    strategy = str(
+        config.get("adaptive", {}).get("strategy", "throughput_aware")
+    )
+    if (
+        strategy == "throughput_aware"
+        and config["matrix"].get("dynamic_max_steps")
+        and not complete
+    ):
         raise RuntimeError(f"dynamic matrix requires a complete profile: {reason}")
     status_path = run_dir / "status.jsonl"
     cases: list[dict[str, Any]] = []

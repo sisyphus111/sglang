@@ -149,6 +149,39 @@ def summarize(rows: list[dict[str, Any]], switches: list[dict[str, Any]]) -> lis
     return summaries
 
 
+def summarize_step_occupancy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Measure controller residency by iterations, reconstructed time, and output."""
+    output: list[dict[str, Any]] = []
+    for label in sorted({str(row["label"]) for row in rows}):
+        case_rows = [row for row in rows if row["label"] == label]
+        total_points = len(case_rows)
+        total_time_ms = sum(float(row["observed_itl_ms"]) for row in case_rows)
+        total_tokens = sum(float(row["output_tokens"]) for row in case_rows)
+        for step in sorted({int(row["active_step"]) for row in case_rows}):
+            step_rows = [row for row in case_rows if int(row["active_step"]) == step]
+            step_time_ms = sum(float(row["observed_itl_ms"]) for row in step_rows)
+            step_tokens = sum(float(row["output_tokens"]) for row in step_rows)
+            output.append(
+                {
+                    "label": label,
+                    "active_step": step,
+                    "points": len(step_rows),
+                    "point_share": len(step_rows) / total_points,
+                    "reconstructed_time_s": step_time_ms / 1000.0,
+                    "time_share": step_time_ms / total_time_ms,
+                    "output_tokens": step_tokens,
+                    "output_token_share": step_tokens / total_tokens,
+                    "batch_size_mean": mean(
+                        float(row["batch_size"]) for row in step_rows
+                    ),
+                    "ctx_per_req_mean": mean(
+                        float(row["ctx_per_req"]) for row in step_rows
+                    ),
+                }
+            )
+    return output
+
+
 def summarize_e2e(run_dir: Path, cases: list[Case]) -> list[dict[str, Any]]:
     """Extract benchmark-level metrics without mixing them with scheduler-point means."""
     rows: list[dict[str, Any]] = []
@@ -260,6 +293,7 @@ def main() -> None:
     )
     smooth_rows = smooth_points(filtered_rows, args.smooth_window)
     summaries = summarize(filtered_rows, switch_rows)
+    step_occupancy = summarize_step_occupancy(raw_rows)
     e2e_rows = summarize_e2e(args.run_dir, cases)
     speedups = summarize_speedups(e2e_rows)
 
@@ -269,6 +303,7 @@ def main() -> None:
     write_csv(output_dir / "controller_switches.csv", switch_rows)
     write_csv(output_dir / "profile_costs.csv", list(profile.rows()))
     write_csv(output_dir / "case_summary.csv", summaries)
+    write_csv(output_dir / "step_occupancy.csv", step_occupancy)
     write_csv(output_dir / "e2e_summary.csv", e2e_rows)
     write_csv(output_dir / "speedup_summary.csv", speedups)
     (output_dir / "case_summary.json").write_text(
@@ -296,6 +331,7 @@ def main() -> None:
         "raw_points": len(raw_rows),
         "filtered_points": len(filtered_rows),
         "switches": len(switch_rows),
+        "step_occupancy_rows": len(step_occupancy),
         "e2e_summaries": len(e2e_rows),
         "speedup_comparisons": len(speedups),
         "figures": [str(path) for path in figures],

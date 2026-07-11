@@ -25,7 +25,12 @@ SWITCH_RE = re.compile(
     r"bs=(?P<batch_size>\d+), avg_ctx_len=(?P<ctx_len>\d+), "
     r"batch_count=(?P<batch_count>\d+), current_score=(?P<current_score>[0-9.?]+), "
     r"best_score=(?P<best_score>[0-9.?]+), "
-    r"best_over_current=(?P<best_over_current>[0-9.?]+), scores=(?P<scores>.*)$"
+    r"best_over_current=(?P<best_over_current>[0-9.?]+), "
+    r"(?:reason=(?P<reason>\w+), )?scores=(?P<scores>.*)$"
+)
+RUNTIME_SWITCH_RE = re.compile(
+    r"Switch decoupled verifier adaptive state: steps "
+    r"(?P<from_steps>\d+) -> (?P<to_steps>\d+)"
 )
 CANDIDATE_RE = re.compile(
     r"S=(?P<steps>\d+):E=(?P<expected>[0-9.]+)"
@@ -33,7 +38,11 @@ CANDIDATE_RE = re.compile(
     r"profile_cost=(?P<profile_cost_ms>[0-9.]+)ms,"
     r"cpu_overhead=(?P<cpu_overhead_ms>[0-9.]+)ms,"
     r"ctx=(?P<ctx_len>\d+)->(?P<matched_ctx_len>\d+)"
-    r"(?:,rates=\[(?P<rates>[^]]*)\])?(?P<selected>\*)?"
+    r"(?:,rates=\[(?P<rates>[^]]*)\])?"
+    r"(?:,expected_source=(?P<expected_source>\w+),"
+    r"tier_updates=(?P<tier_updates>\d+)"
+    r"(?:,tier_age=(?P<tier_age>\d+))?)?"
+    r"(?P<blocked>:blocked)?(?P<selected>\*)?"
 )
 RATE_RE = re.compile(r"p(?P<position>\d+)=(?P<rate>[0-9.]+):(?P<source>\w+)")
 
@@ -176,6 +185,18 @@ def parse_candidate_scores(raw_scores: str) -> list[dict[str, Any]]:
                 "ctx_len": int(match.group("ctx_len")),
                 "matched_ctx_len": int(match.group("matched_ctx_len")),
                 "position_accept_rates": rates,
+                "expected_source": match.group("expected_source") or "",
+                "tier_updates": (
+                    int(match.group("tier_updates"))
+                    if match.group("tier_updates") is not None
+                    else ""
+                ),
+                "tier_age_batches": (
+                    int(match.group("tier_age"))
+                    if match.group("tier_age") is not None
+                    else ""
+                ),
+                "eligible": not bool(match.group("blocked")),
                 "selected": bool(match.group("selected")),
             }
         )
@@ -184,14 +205,60 @@ def parse_candidate_scores(raw_scores: str) -> list[dict[str, Any]]:
 
 def parse_switches(case: Case) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    pending_detailed_transition: tuple[int, int] | None = None
+    decode_point_ct = 0
+    latest_batch_size: int | str = ""
+    latest_ctx_per_req: int | str = ""
     for line in case.log_path.read_text(errors="ignore").splitlines():
+        if "Decode batch" in line:
+            pending_detailed_transition = None
+            decode_point_ct += 1
+            batch_size = _number(line, r"#running-req:\s*(\d+)", int)
+            full_tokens = _number(line, r"#(?:full )?token:\s*(\d+)", int)
+            if batch_size is not None and full_tokens is not None:
+                latest_batch_size = batch_size
+                latest_ctx_per_req = round(full_tokens / max(batch_size, 1))
         match = SWITCH_RE.search(line)
         if not match:
+            runtime_match = RUNTIME_SWITCH_RE.search(line)
+            if runtime_match:
+                timestamp_match = TIMESTAMP_RE.search(line)
+                timestamp = timestamp_match.group("time") if timestamp_match else ""
+                from_steps = int(runtime_match.group("from_steps"))
+                to_steps = int(runtime_match.group("to_steps"))
+                if pending_detailed_transition == (from_steps, to_steps):
+                    pending_detailed_transition = None
+                    continue
+                pending_detailed_transition = None
+                rows.append(
+                    {
+                        "label": case.label,
+                        "allow_partial": case.allow_partial,
+                        "max_step": case.max_step,
+                        "timestamp": timestamp,
+                        "from_steps": from_steps,
+                        "to_steps": to_steps,
+                        "batch_size": latest_batch_size,
+                        "avg_ctx_len": latest_ctx_per_req,
+                        "batch_count": decode_point_ct,
+                        "current_score": "",
+                        "best_score": "",
+                        "best_over_current": "",
+                        "reason": "runtime_adaptive_state",
+                        "scores": "",
+                        "candidate_scores_json": "[]",
+                    }
+                )
             continue
         row: dict[str, Any] = {
             "label": case.label,
             "allow_partial": case.allow_partial,
             "max_step": case.max_step,
+            "timestamp": (
+                timestamp_match.group("time")
+                if (timestamp_match := TIMESTAMP_RE.search(line))
+                else ""
+            ),
             "from_steps": int(match.group("from_steps")),
             "to_steps": int(match.group("to_steps")),
             "batch_size": int(match.group("batch_size")),
@@ -200,12 +267,14 @@ def parse_switches(case: Case) -> list[dict[str, Any]]:
             "current_score": match.group("current_score"),
             "best_score": match.group("best_score"),
             "best_over_current": match.group("best_over_current"),
+            "reason": match.group("reason") or "score_hysteresis",
             "scores": match.group("scores"),
         }
         row["candidate_scores_json"] = json.dumps(
             parse_candidate_scores(row["scores"]), separators=(",", ":")
         )
         rows.append(row)
+        pending_detailed_transition = (row["from_steps"], row["to_steps"])
     return rows
 
 
@@ -216,7 +285,12 @@ def parse_decode_points(
     rows: list[dict[str, Any]] = []
     reconstructed_elapsed_s = 0.0
     first_timestamp: datetime | None = None
+    runtime_active_step = case.max_step
     for line in case.log_path.read_text(errors="ignore").splitlines():
+        runtime_switch = RUNTIME_SWITCH_RE.search(line)
+        if runtime_switch:
+            runtime_active_step = int(runtime_switch.group("to_steps"))
+            continue
         if "Decode batch" not in line:
             continue
         timestamp_match = TIMESTAMP_RE.search(line)
@@ -240,8 +314,12 @@ def parse_decode_points(
         modeled_throughput = _number(
             line, r"modeled throughput \(token/s\):\s*([0-9.]+)"
         )
+        modeled_step = _number(line, r"modeled step:\s*(\d+)", int)
+        active_step = (
+            int(modeled_step) if modeled_step is not None else runtime_active_step
+        )
         ctx_per_req = float(full_tokens) / max(int(batch_size), 1)
-        profile_match = profile.lookup(batch_size, case.max_step, ctx_per_req)
+        profile_match = profile.lookup(batch_size, active_step, ctx_per_req)
 
         if accept_len is not None:
             output_tokens = float(batch_size) * accept_len
@@ -251,8 +329,6 @@ def parse_decode_points(
         if case.dynamic and modeled_throughput is not None and modeled_throughput > 0:
             modeled_itl_ms = output_tokens * 1000.0 / modeled_throughput
             model_source = "scheduler_modeled_throughput"
-            # The scheduler value reflects the selected runtime step, while lookup below
-            # uses max_step only to expose a reference profile match.
         else:
             modeled_itl_ms = profile_match.cost_ms + runtime_cpu_overhead_ms
             modeled_throughput = output_tokens * 1000.0 / modeled_itl_ms
@@ -264,6 +340,7 @@ def parse_decode_points(
                 "allow_partial": case.allow_partial,
                 "dynamic": case.dynamic,
                 "max_step": case.max_step,
+                "active_step": active_step,
                 "point_index": len(rows) + 1,
                 "timestamp": timestamp.isoformat(sep=" ") if timestamp else "",
                 "wall_elapsed_s": (
@@ -338,4 +415,3 @@ def case_dict(case: Case) -> dict[str, Any]:
     row = asdict(case)
     row["log_path"] = str(case.log_path)
     return row
-

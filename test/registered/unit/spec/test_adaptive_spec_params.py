@@ -223,6 +223,50 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         self.assertEqual(params.current_steps, 0)
         self.assertEqual(params.ema_accept_len, 0.0)
 
+    def test_decoupled_dl0_to_dl3_uses_batch_mean_correct_drafts(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [0, 1, 2, 3],
+                "ema_alpha": 0.2,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "up_hysteresis": 0.0,
+                "down_hysteresis": -0.25,
+            },
+        )
+
+        # The input contains correct drafts only; the verify bonus token is not
+        # part of this average. EMA = 0.8 * 2.0 + 0.2 * mean([0, 2]).
+        self.assertFalse(params.update([0, 2]))
+        self.assertAlmostEqual(params.ema_accept_len, 1.8)
+        self.assertEqual(params.current_steps, 3)
+
+    def test_decoupled_dl0_to_dl3_drop_rise_and_zero_step_probe(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [0, 1, 2, 3],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "up_hysteresis": 0.0,
+                "down_hysteresis": -0.25,
+            },
+        )
+
+        self.assertTrue(params.update([1, 1]))
+        self.assertEqual(params.current_steps, 2)
+        self.assertTrue(params.update([2, 2]))
+        self.assertEqual(params.current_steps, 3)
+        self.assertTrue(params.update([0, 0]))
+        self.assertEqual(params.current_steps, 0)
+
+        # DL0 has no draft acceptance observation, so the next policy
+        # evaluation probes the smallest positive candidate.
+        self.assertTrue(params.update([0, 0]))
+        self.assertEqual(params.current_steps, 1)
+
     def test_ceiling_coeff_caps_steps(self):
         params = self._make_params_from_config(
             7,
@@ -391,6 +435,21 @@ class TestBatchSizeRouting(unittest.TestCase):
             params.on_verify_complete([7, 7, 7], batch_size=1)
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
+
+    def test_decoupled_ema_isolated_across_batch_slots(self):
+        config = {
+            "ema_alpha": 1.0,
+            "warmup_batches": 0,
+            "update_interval": 1,
+            "1": {"candidate_steps": [0, 1, 2, 3]},
+            "64": {"candidate_steps": [0, 1, 2, 3]},
+        }
+        params = AdaptiveSpeculativeParams(initial_steps=3, config=config)
+
+        self.assertEqual(params.on_verify_complete([0, 0], batch_size=64), 0)
+        self.assertEqual(params.get_steps_for_batch(64), 0)
+        self.assertEqual(params.get_steps_for_batch(1), 3)
+
 
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):

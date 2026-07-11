@@ -282,6 +282,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=None,
+        help=(
+            "Per-request sampling seed. Set this together with --deterministic "
+            "for reproducible temperature sampling."
+        ),
+    )
+    parser.add_argument(
         "--deterministic",
         action="store_true",
         help=(
@@ -1336,6 +1345,8 @@ def main() -> None:
         "max_new_tokens": args.context_length,
         "ignore_eos": args.ignore_eos,
     }
+    if args.sampling_seed is not None:
+        sampling_params["sampling_seed"] = args.sampling_seed
 
     num_verifiers = args.num_verifier_replicas
     (
