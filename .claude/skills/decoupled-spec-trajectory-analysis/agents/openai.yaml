@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Spec Trajectory Analysis"
+  short_description: "Plot normalized throughput and acceptance traces"
+  default_prompt: "Use $decoupled-spec-trajectory-analysis to normalize and plot decoupled-spec runtime trajectories."

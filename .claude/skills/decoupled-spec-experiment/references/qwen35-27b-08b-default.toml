@@ -21,6 +21,8 @@ batch_size = 64
 max_running_requests = 65
 max_new_tokens = 32768
 temperature = 1.0
+sampling_seed = 42
+deterministic = true
 enable_thinking = true
 ignore_eos = false
 decode_log_interval = 1
@@ -28,9 +30,9 @@ decode_log_interval = 1
 [profile]
 capture_bs = [1, 4, 8, 16, 24, 32, 40, 48, 56, 64]
 ctx_lens = [1024, 2048, 4096, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
-steps = [0, 1, 2, 3, 4, 5]
-runtime_cpu_overhead_ms = 3.0
+steps = [0, 1, 2, 3]
 mem_fraction_static = 0.74
+expected_gpu_name = "NVIDIA H20"
 
 [matrix]
 static_steps = [0, 1, 2, 3]

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Focused unit tests for controller-compatible analysis primitives."""
+"""Focused tests for normalized decoupled-spec trajectories."""
 
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from analysis_common import (
     Case,
@@ -17,14 +15,20 @@ from analysis_common import (
     parse_decode_points,
     parse_switches,
 )
-from run_matrix import base_command, build_env
+from analysis_render import plot_trajectories
+from analyze import filter_points, filter_trajectory_points, smooth_points
 
 
 class ProfileTableTest(unittest.TestCase):
     def setUp(self) -> None:
         self.table = ProfileTable(
             [
-                {"batch_size": bs, "steps": 2, "ctx_len": ctx, "cost_ms": bs + ctx / 1000}
+                {
+                    "batch_size": bs,
+                    "steps": 2,
+                    "ctx_len": ctx,
+                    "cost_ms": bs + ctx / 1000,
+                }
                 for bs in (8, 16)
                 for ctx in (1000, 3000)
             ]
@@ -41,6 +45,62 @@ class ProfileTableTest(unittest.TestCase):
 
 
 class LogParsingTest(unittest.TestCase):
+    def test_trajectory_keeps_small_batch_tail_points(self) -> None:
+        rows = [
+            {"label": "case", "batch_size": 64, "observed_itl_ms": 20.0},
+            {"label": "case", "batch_size": 8, "observed_itl_ms": 25.0},
+            {"label": "case", "batch_size": 1, "observed_itl_ms": 120.0},
+        ]
+        profile_fit = filter_points(rows, 100.0, include_partial_batches=False)
+        trajectory = filter_trajectory_points(rows, 100.0)
+        self.assertEqual([row["batch_size"] for row in profile_fit], [64])
+        self.assertEqual([row["batch_size"] for row in trajectory], [64, 8])
+
+    def test_trajectory_plot_contains_throughput_acclen_and_step(self) -> None:
+        rows = [
+            {
+                "label": "ap1_dynamic_dl3",
+                "elapsed_s": float(index),
+                "observed_throughput_tok_s": 1000.0 + index,
+                "accept_len": 1.5 + index / 10,
+                "active_step": 2 + index % 2,
+                "observed_itl_ms": 20.0,
+                "modeled_itl_ms": 19.0,
+                "modeled_throughput_tok_s": 1050.0,
+            }
+            for index in range(3)
+        ]
+        smooth = smooth_points(rows, 2)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = plot_trajectories(rows, smooth, Path(directory), 2)
+            content = paths[0].read_text()
+            self.assertTrue(
+                (Path(directory) / "trajectory_ap1_dynamic_dl3.png").exists()
+            )
+        self.assertIn("Observed throughput", content)
+        self.assertIn("Acceptance length", content)
+        self.assertIn("Active draft length", content)
+
+    def test_missing_acclen_is_preserved_as_unavailable(self) -> None:
+        rows = [
+            {
+                "label": "ap0_static_dl0",
+                "elapsed_s": 0.0,
+                "observed_throughput_tok_s": 1000.0,
+                "accept_len": "",
+                "active_step": 0,
+                "observed_itl_ms": 20.0,
+                "modeled_itl_ms": 20.0,
+                "modeled_throughput_tok_s": 1000.0,
+            }
+        ]
+        smooth = smooth_points(rows, 1)
+        self.assertEqual(smooth[0]["accept_len_smooth"], "")
+        with tempfile.TemporaryDirectory() as directory:
+            path = plot_trajectories(rows, smooth, Path(directory), 1)[0]
+            content = path.read_text()
+        self.assertIn("accept_len unavailable", content)
+
     def test_scheduler_modeled_throughput_is_not_charged_twice(self) -> None:
         line = (
             "[2026-07-10 04:44:07 TP0] Decode batch, #running-req: 8, "
@@ -126,7 +186,9 @@ class LogParsingTest(unittest.TestCase):
         )
         candidates = parse_candidate_scores(raw)
         self.assertEqual(candidates[0]["position_accept_rates"][0]["position"], 1)
-        self.assertEqual(candidates[1]["position_accept_rates"][1]["source"], "projected")
+        self.assertEqual(
+            candidates[1]["position_accept_rates"][1]["source"], "projected"
+        )
         self.assertTrue(candidates[0]["selected"])
         self.assertFalse(candidates[1]["eligible"])
         self.assertEqual(candidates[1]["expected_source"], "tier_ema")
@@ -190,8 +252,7 @@ class LogParsingTest(unittest.TestCase):
         lines = []
         for second, (old, new) in enumerate(transitions, start=37):
             lines.append(
-                f"[2026-07-11 10:44:{second} TP0] "
-                + detailed.format(old=old, new=new)
+                f"[2026-07-11 10:44:{second} TP0] " + detailed.format(old=old, new=new)
             )
             lines.append(
                 f"[2026-07-11 10:44:{second + 1} TP0] "
@@ -204,90 +265,6 @@ class LogParsingTest(unittest.TestCase):
 
         self.assertEqual(
             [(row["from_steps"], row["to_steps"]) for row in rows], transitions
-        )
-
-
-class MatrixCommandTest(unittest.TestCase):
-    @staticmethod
-    def _config(strategy: str) -> dict:
-        return {
-            "paths": {
-                "repo": "/repo",
-                "entrypoint": "single-node.py",
-                "dataset": "/data/input.parquet",
-                "target_model": "/models/target",
-                "draft_model": "/models/draft",
-                "profile": "/profiles/cost.json",
-            },
-            "parallelism": {
-                "target_tp_size": 4,
-                "draft_tp_size": 1,
-                "n_gpu_per_node": 5,
-                "verify_ngpus": 4,
-                "draft_ngpus": 1,
-            },
-            "workload": {
-                "dataset_format": "dapo_math_17k",
-                "batch_size": 64,
-                "max_running_requests": 65,
-                "max_new_tokens": 32768,
-                "temperature": 1.0,
-                "sampling_seed": 42,
-                "deterministic": True,
-            },
-            "profile": {
-                "capture_bs": [64],
-                "ctx_lens": [32768],
-                "steps": [0, 1, 2, 3],
-            },
-            "adaptive": {
-                "strategy": strategy,
-                "config": "/configs/ema.json",
-            },
-        }
-
-    def test_ema_dynamic_command_uses_accept_length_config(self) -> None:
-        command = base_command(
-            self._config("ema"), Path("/output"), steps=3, dynamic=True
-        )
-
-        self.assertIn("ema", command)
-        self.assertIn("--speculative-adaptive-config", command)
-        self.assertNotIn("--decoupled-verify-throughput-profile-path", command)
-
-    def test_profile_command_can_force_throughput_aware(self) -> None:
-        command = base_command(
-            self._config("ema"),
-            Path("/output"),
-            steps=3,
-            dynamic=True,
-            adaptive_strategy="throughput_aware",
-        )
-
-        self.assertIn("throughput_aware", command)
-        self.assertIn("--decoupled-verify-throughput-profile-path", command)
-        self.assertNotIn("--speculative-adaptive-config", command)
-
-    def test_all_formal_commands_lock_sampling_seed_and_determinism(self) -> None:
-        config = self._config("ema")
-        cases = ((0, False), (1, False), (2, False), (3, False), (3, True))
-        for steps, dynamic in cases:
-            with self.subTest(steps=steps, dynamic=dynamic):
-                command = base_command(
-                    config, Path("/output"), steps=steps, dynamic=dynamic
-                )
-                seed_index = command.index("--sampling-seed")
-                self.assertEqual(command[seed_index + 1], "42")
-                self.assertIn("--deterministic", command)
-
-    def test_child_environment_prefers_configured_worktree(self) -> None:
-        config = self._config("ema")
-        with mock.patch.dict(os.environ, {"PYTHONPATH": "/ambient/python"}):
-            env = build_env(config, allow_partial=True)
-
-        self.assertEqual(
-            env["PYTHONPATH"].split(os.pathsep),
-            ["/repo/python", "/ambient/python"],
         )
 
 

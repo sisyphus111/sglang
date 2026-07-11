@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Spec Experiment"
+  short_description: "Run reproducible decoupled-spec benchmark matrices"
+  default_prompt: "Use $decoupled-spec-experiment to run a reproducible decoupled-spec benchmark matrix."

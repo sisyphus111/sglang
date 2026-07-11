@@ -11,15 +11,20 @@ The scripts use one result directory per experiment matrix:
   runs/<case>/summary.json
   analysis/
     decode_points.csv
+    decode_points_filtered.csv
     decode_points_smooth.csv
+    decode_points_trajectory.csv
+    decode_points_trajectory_smooth.csv
     controller_switches.csv
     profile_costs.csv
     case_summary.csv
     case_summary.json
+    step_occupancy.csv
     e2e_summary.csv
     e2e_summary.json
     speedup_summary.csv
     report.md
+    trajectory_<case>.{svg,png}
     static_ap{0,1}_latency_profile_gap_{raw,smooth}.png
     dynamic_ap{0,1}_observed_vs_modeled_{raw,smooth}.png
     analysis_metadata.json
@@ -39,6 +44,14 @@ come from the selected runtime state printed by scheduler INFO and already conta
 the runtime CPU overhead. For static logs, `model_source=profile_lookup_plus_overhead`
 means the analyzer performed controller-aligned profile lookup and added the configured
 overhead.
+
+`trajectory_<case>.svg` (with a report-scale PNG companion) is the direct runtime view: raw and centered-smoothed
+throughput, raw and centered-smoothed acceptance length, and active draft length
+on one reconstructed decode-time axis. Its source CSVs remove only latency
+outliers, retaining small-batch tail points; full-batch filtering applies only
+to the separate profile-fit figures. If the scheduler stream has no
+`accept_len`, that panel is explicitly marked unavailable; the analyzer does not
+replace it with zero or with a normal-decoding assumption.
 
 `controller_switches.csv` preserves the complete score string and also extracts each
 candidate into `candidate_scores_json`, including expected accepted tokens, costs,

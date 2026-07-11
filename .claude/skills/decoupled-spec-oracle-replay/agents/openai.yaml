@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Spec Oracle Replay"
+  short_description: "Estimate optimal dynamic schedules from static runs"
+  default_prompt: "Use $decoupled-spec-oracle-replay to estimate an optimal dynamic schedule and E2E time."

@@ -19,7 +19,7 @@ from analysis_common import (
     parse_switches,
     write_csv,
 )
-from analysis_render import plot_dynamic, plot_static, write_report
+from analysis_render import plot_dynamic, plot_static, plot_trajectories, write_report
 
 
 SMOOTH_METRICS = (
@@ -75,6 +75,13 @@ def filter_points(
     ]
 
 
+def filter_trajectory_points(
+    rows: list[dict[str, Any]], cutoff_ms: float
+) -> list[dict[str, Any]]:
+    """Keep the full batch-size trajectory while removing latency outliers."""
+    return [row for row in rows if float(row["observed_itl_ms"]) < cutoff_ms]
+
+
 def smooth_points(rows: list[dict[str, Any]], window: int) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     labels = sorted({str(row["label"]) for row in rows})
@@ -86,10 +93,19 @@ def smooth_points(rows: list[dict[str, Any]], window: int) -> list[dict[str, Any
             )
             for metric in SMOOTH_METRICS
         }
+        accept_values = [row["accept_len"] for row in case_rows]
+        accept_smooth = (
+            moving_average([float(value) for value in accept_values], window)
+            if all(value != "" for value in accept_values)
+            else None
+        )
         for index, row in enumerate(case_rows):
             current = dict(row)
             for metric in SMOOTH_METRICS:
                 current[f"{metric}_smooth"] = smoothed[metric][index]
+            current["accept_len_smooth"] = (
+                accept_smooth[index] if accept_smooth is not None else ""
+            )
             current["observed_minus_modeled_itl_ms_smooth"] = (
                 current["observed_itl_ms_smooth"]
                 - current["modeled_itl_ms_smooth"]
@@ -292,6 +308,8 @@ def main() -> None:
         raw_rows, args.latency_cutoff_ms, args.include_partial_batches
     )
     smooth_rows = smooth_points(filtered_rows, args.smooth_window)
+    trajectory_rows = filter_trajectory_points(raw_rows, args.latency_cutoff_ms)
+    trajectory_smooth_rows = smooth_points(trajectory_rows, args.smooth_window)
     summaries = summarize(filtered_rows, switch_rows)
     step_occupancy = summarize_step_occupancy(raw_rows)
     e2e_rows = summarize_e2e(args.run_dir, cases)
@@ -300,6 +318,10 @@ def main() -> None:
     write_csv(output_dir / "decode_points.csv", raw_rows)
     write_csv(output_dir / "decode_points_filtered.csv", filtered_rows)
     write_csv(output_dir / "decode_points_smooth.csv", smooth_rows)
+    write_csv(output_dir / "decode_points_trajectory.csv", trajectory_rows)
+    write_csv(
+        output_dir / "decode_points_trajectory_smooth.csv", trajectory_smooth_rows
+    )
     write_csv(output_dir / "controller_switches.csv", switch_rows)
     write_csv(output_dir / "profile_costs.csv", list(profile.rows()))
     write_csv(output_dir / "case_summary.csv", summaries)
@@ -314,6 +336,14 @@ def main() -> None:
     )
 
     figures = []
+    figures.extend(
+        plot_trajectories(
+            trajectory_rows,
+            trajectory_smooth_rows,
+            output_dir,
+            args.smooth_window,
+        )
+    )
     figures.extend(plot_static(filtered_rows, output_dir, smooth=False))
     figures.extend(plot_static(smooth_rows, output_dir, smooth=True))
     figures.extend(plot_dynamic(filtered_rows, switch_rows, output_dir, smooth=False))
@@ -330,6 +360,7 @@ def main() -> None:
         "case_count": len(cases),
         "raw_points": len(raw_rows),
         "filtered_points": len(filtered_rows),
+        "trajectory_points": len(trajectory_rows),
         "switches": len(switch_rows),
         "step_occupancy_rows": len(step_occupancy),
         "e2e_summaries": len(e2e_rows),

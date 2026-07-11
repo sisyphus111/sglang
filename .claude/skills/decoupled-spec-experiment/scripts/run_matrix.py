@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -15,7 +16,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from analysis_common import ProfileTable
+from profile_cache import ProfileTable
 
 
 DEBUG_ENV_KEYS = (
@@ -46,6 +47,11 @@ def load_config(path: Path) -> dict[str, Any]:
     missing = sorted(required_sections - set(config))
     if missing:
         raise ValueError(f"config missing sections: {', '.join(missing)}")
+    if Path(config["paths"]["entrypoint"]).name != "single-node.py":
+        raise ValueError(
+            "run_matrix.py supports single-node.py only; invoke multi-node.py "
+            "directly with explicit Ray/topology arguments"
+        )
     workload = config["workload"]
     batch_size = int(workload["batch_size"])
     max_running = int(workload["max_running_requests"])
@@ -55,14 +61,10 @@ def load_config(path: Path) -> dict[str, Any]:
         )
     if bool(workload.get("ignore_eos", False)):
         print("warning: ignore_eos=true changes request outputs", file=sys.stderr)
-    if workload.get("sampling_seed") is not None and not isinstance(
-        workload["sampling_seed"], int
-    ):
+    if type(workload.get("sampling_seed")) is not int:
         raise ValueError("workload.sampling_seed must be an integer")
-    if "deterministic" in workload and not isinstance(
-        workload["deterministic"], bool
-    ):
-        raise ValueError("workload.deterministic must be a boolean")
+    if workload.get("deterministic") is not True:
+        raise ValueError("workload.deterministic must be true")
     capture_bs = [int(value) for value in config["profile"]["capture_bs"]]
     if batch_size not in capture_bs:
         raise ValueError(f"profile.capture_bs must contain workload batch_size={batch_size}")
@@ -216,6 +218,8 @@ def base_command(
             command.extend(["--speculative-adaptive-config", str(adaptive_config)])
         else:
             raise ValueError(f"Unsupported adaptive strategy: {strategy!r}")
+    if "mem_fraction_static" in profile:
+        command.extend(["--mem-fraction-static", str(profile["mem_fraction_static"])])
     for value in config.get("extra_args", {}).get("common", []):
         command.append(str(value))
     return command
@@ -230,6 +234,24 @@ def profile_complete(config: dict[str, Any]) -> tuple[bool, str]:
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         return False, f"invalid profile: {error}"
     profile = config["profile"]
+    expected_fingerprint = {
+        "target_model_path": str(config["paths"]["target_model"]),
+        "target_tp_size": int(config["parallelism"]["target_tp_size"]),
+        "target_dp_size": int(config["parallelism"].get("target_dp_size", 1)),
+        "enable_dp_attention": bool(
+            config["parallelism"].get("enable_dp_attention", False)
+        ),
+        "gpu_name": str(profile.get("expected_gpu_name", "")),
+    }
+    if not expected_fingerprint["gpu_name"]:
+        return False, "profile.expected_gpu_name is required for fingerprint validation"
+    mismatches = {
+        key: {"expected": value, "actual": table.fingerprint.get(key)}
+        for key, value in expected_fingerprint.items()
+        if table.fingerprint.get(key) != value
+    }
+    if mismatches:
+        return False, f"fingerprint mismatch: {mismatches}"
     missing = table.missing_points(
         profile["capture_bs"], profile["steps"], profile["ctx_lens"]
     )
@@ -280,6 +302,9 @@ def run_process(
         except subprocess.TimeoutExpired:
             stop_process_group(process)
             raise
+        except BaseException:
+            stop_process_group(process)
+            raise
 
 
 def generate_profile(
@@ -321,8 +346,6 @@ def generate_profile(
         dynamic=True,
         adaptive_strategy="throughput_aware",
     )
-    if "mem_fraction_static" in profile:
-        command.extend(["--mem-fraction-static", str(profile["mem_fraction_static"])])
     if "prefill_budget" in profile:
         command.extend(
             [
@@ -356,6 +379,8 @@ def generate_profile(
             while time.time() - start < timeout_s:
                 complete, reason = profile_complete(config)
                 if complete:
+                    profile_bytes = Path(config["paths"]["profile"]).read_bytes()
+                    profile_payload = json.loads(profile_bytes)
                     write_jsonl(
                         status_path,
                         {
@@ -363,6 +388,10 @@ def generate_profile(
                             "status": "profile_ok",
                             "elapsed_s": time.time() - start,
                             "reason": reason,
+                            "profile_sha256": hashlib.sha256(
+                                profile_bytes
+                            ).hexdigest(),
+                            "profile_fingerprint": profile_payload["fingerprint"],
                         },
                     )
                     stop_process_group(process)
@@ -426,40 +455,6 @@ def run_matrix(
                     "summary": str(summary_path),
                 }
                 cases.append(case)
-                if summary_path.exists() and not force:
-                    write_jsonl(
-                        status_path, {"ts": now(), "status": "skipped_existing", **case}
-                    )
-                    continue
-                output_dir.mkdir(parents=True, exist_ok=True)
-                command = base_command(config, output_dir, step, dynamic)
-                write_jsonl(
-                    status_path,
-                    {"ts": now(), "status": "started", "command": command, **case},
-                )
-                start = time.time()
-                try:
-                    returncode = run_process(
-                        config=config,
-                        command=command,
-                        log_path=log_path,
-                        allow_partial=bool(allow_partial),
-                        timeout_s=timeout_s,
-                    )
-                    status = "ok" if returncode == 0 else "failed"
-                except subprocess.TimeoutExpired:
-                    returncode = None
-                    status = "timeout"
-                write_jsonl(
-                    status_path,
-                    {
-                        "ts": now(),
-                        "status": status,
-                        "returncode": returncode,
-                        "elapsed_s": time.time() - start,
-                        **case,
-                    },
-                )
     manifest = {
         "config": str((run_dir / "config.toml").resolve()),
         "profile": str(Path(config["paths"]["profile"]).resolve()),
@@ -469,14 +464,130 @@ def run_matrix(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
 
+    for case in cases:
+        output_dir = run_dir / "runs" / case["label"]
+        log_path = Path(case["log"])
+        summary_path = Path(case["summary"])
+        if summary_path.exists() and not force:
+            write_jsonl(
+                status_path, {"ts": now(), "status": "skipped_existing", **case}
+            )
+            continue
+        if force:
+            summary_path.unlink(missing_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = base_command(
+            config,
+            output_dir,
+            int(case["max_step"]),
+            bool(case["dynamic"]),
+        )
+        write_jsonl(
+            status_path,
+            {"ts": now(), "status": "started", "command": command, **case},
+        )
+        start = time.time()
+        try:
+            returncode = run_process(
+                config=config,
+                command=command,
+                log_path=log_path,
+                allow_partial=bool(case["allow_partial"]),
+                timeout_s=timeout_s,
+            )
+            if returncode == 0 and summary_path.exists():
+                status = "ok"
+            elif returncode == 0:
+                status = "missing_summary"
+            else:
+                status = "failed"
+        except subprocess.TimeoutExpired:
+            returncode = None
+            status = "timeout"
+        except KeyboardInterrupt:
+            summary_path.unlink(missing_ok=True)
+            write_jsonl(
+                status_path,
+                {"ts": now(), "status": "interrupted", **case},
+            )
+            raise
+        if status != "ok":
+            summary_path.unlink(missing_ok=True)
+        write_jsonl(
+            status_path,
+            {
+                "ts": now(),
+                "status": status,
+                "returncode": returncode,
+                "elapsed_s": time.time() - start,
+                **case,
+            },
+        )
+
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    config_bytes = args.config.read_bytes()
+    repo = Path(config["paths"]["repo"])
+    repo_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    repo_dirty = bool(
+        subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo, text=True
+        ).strip()
+    )
+    if repo_dirty:
+        raise RuntimeError(
+            f"experiment checkout is dirty: {repo}; commit the exact source first"
+        )
     args.run_dir.mkdir(parents=True, exist_ok=True)
     config_copy = args.run_dir / "config.toml"
+    config_lock = args.run_dir / "config.lock.toml"
+    if config_lock.exists() and config_lock.read_bytes() != config_bytes:
+        raise ValueError(
+            f"run config differs from immutable copy: {config_lock}; use a new run-dir"
+        )
+    if not config_lock.exists():
+        config_lock.write_bytes(config_bytes)
     if args.config.resolve() != config_copy.resolve():
-        config_copy.write_bytes(args.config.read_bytes())
+        if config_copy.exists() and config_copy.read_bytes() != config_bytes:
+            raise ValueError(
+                f"run config differs from copied intent: {config_copy}; use a new run-dir"
+            )
+        if not config_copy.exists():
+            config_copy.write_bytes(config_bytes)
+    profile_path = Path(config["paths"]["profile"])
+    profile_bytes = profile_path.read_bytes() if profile_path.exists() else None
+    profile_fingerprint = None
+    if profile_bytes is not None:
+        try:
+            payload = json.loads(profile_bytes)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            profile_fingerprint = payload.get("fingerprint")
+    write_jsonl(
+        args.run_dir / "status.jsonl",
+        {
+            "ts": now(),
+            "status": "invocation",
+            "action": args.action,
+            "repo": str(repo.resolve()),
+            "repo_commit": repo_commit,
+            "repo_dirty": repo_dirty,
+            "python": sys.executable,
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "profile": str(profile_path.resolve()),
+            "profile_sha256": (
+                hashlib.sha256(profile_bytes).hexdigest()
+                if profile_bytes is not None
+                else None
+            ),
+            "profile_fingerprint": profile_fingerprint,
+        },
+    )
     if args.action == "profile":
         generate_profile(config, args.run_dir, args.force, args.timeout_s, args.poll_s)
     else:

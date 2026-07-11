@@ -11,6 +11,102 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+matplotlib.rcParams["svg.fonttype"] = "none"
+
+
+def plot_trajectories(
+    raw_rows: list[dict[str, Any]],
+    smooth_rows: list[dict[str, Any]],
+    output_dir: Path,
+    smooth_window: int,
+) -> list[Path]:
+    """Plot the observable runtime trajectory that feeds controller diagnosis."""
+    paths: list[Path] = []
+    for label in sorted({str(row["label"]) for row in raw_rows}):
+        case_raw = [row for row in raw_rows if row["label"] == label]
+        case_smooth = [row for row in smooth_rows if row["label"] == label]
+        x = [float(row["elapsed_s"]) for row in case_raw]
+        fig, axes = plt.subplots(
+            3, 1, figsize=(12, 8), sharex=True, constrained_layout=True
+        )
+
+        axes[0].plot(
+            x,
+            [float(row["observed_throughput_tok_s"]) for row in case_raw],
+            color="#6b7280",
+            alpha=0.35,
+            linewidth=0.8,
+            label="raw",
+        )
+        axes[0].plot(
+            x,
+            [float(row["observed_throughput_tok_s_smooth"]) for row in case_smooth],
+            color="#0072B2",
+            linewidth=1.6,
+            label=f"centered MA (window={smooth_window})",
+        )
+        axes[0].set_title("Observed throughput")
+        axes[0].set_ylabel("token/s")
+        axes[0].legend(loc="upper right", frameon=False, fontsize=8)
+
+        accept_raw = [row for row in case_raw if row["accept_len"] != ""]
+        accept_smooth = [
+            row for row in case_smooth if row.get("accept_len_smooth", "") != ""
+        ]
+        if accept_raw:
+            axes[1].plot(
+                [float(row["elapsed_s"]) for row in accept_raw],
+                [float(row["accept_len"]) for row in accept_raw],
+                color="#6b7280",
+                alpha=0.35,
+                linewidth=0.8,
+                label="raw",
+            )
+        if accept_smooth:
+            axes[1].plot(
+                [float(row["elapsed_s"]) for row in accept_smooth],
+                [float(row["accept_len_smooth"]) for row in accept_smooth],
+                color="#D55E00",
+                linewidth=1.6,
+                label=f"centered MA (window={smooth_window})",
+            )
+            axes[1].legend(loc="upper right", frameon=False, fontsize=8)
+        elif not accept_raw:
+            axes[1].text(
+                0.5,
+                0.5,
+                "accept_len unavailable in scheduler log",
+                transform=axes[1].transAxes,
+                ha="center",
+                va="center",
+                color="#6b7280",
+            )
+        else:
+            axes[1].legend(loc="upper right", frameon=False, fontsize=8)
+        axes[1].set_title("Acceptance length")
+        axes[1].set_ylabel("tokens/iteration")
+
+        axes[2].step(
+            x,
+            [int(row["active_step"]) for row in case_raw],
+            where="post",
+            color="#009E73",
+            linewidth=1.4,
+        )
+        axes[2].set_title("Active draft length")
+        axes[2].set_ylabel("step")
+        axes[2].set_xlabel("reconstructed decode time (s)")
+        for axis in axes:
+            axis.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+            axis.spines[["top", "right"]].set_visible(False)
+        fig.suptitle(label, fontsize=11)
+        path = output_dir / f"trajectory_{label}.svg"
+        fig.savefig(path)
+        fig.savefig(output_dir / f"trajectory_{label}.png", dpi=180)
+        plt.close(fig)
+        paths.append(path)
+    return paths
+
 
 def write_report(
     output_dir: Path,
@@ -22,7 +118,8 @@ def write_report(
     lines = [
         "# Decoupled Spec Analysis",
         "",
-        "Structured source files: `decode_points.csv`, `controller_switches.csv`, "
+        "Structured source files: `decode_points.csv`, "
+        "`decode_points_trajectory.csv`, `controller_switches.csv`, "
         "`case_summary.csv`, `e2e_summary.csv`, and `speedup_summary.csv`.",
         "",
         "## Runtime Summary",
@@ -256,4 +353,3 @@ def plot_dynamic(
         plt.close(fig)
         paths.append(path)
     return paths
-
