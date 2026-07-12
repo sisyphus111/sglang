@@ -12,12 +12,17 @@ from sglang.srt.managers.scheduler_decoupled_draft_mixin import (
     SchedulerDecoupledDraftMixin,
 )
 from sglang.srt.environ import envs
-from sglang.srt.speculative.decoupled_spec_io import DraftReqKey, DraftSync
+from sglang.srt.speculative.decoupled_spec_io import (
+    DraftReqKey,
+    DraftSync,
+    VerifierCommitSegment,
+)
 from sglang.srt.speculative.decoupled_draft_mamba import (
     DecoupledDraftMambaStateManager,
 )
 from sglang.srt.utils.common import flatten_arrays_to_pinned_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -40,7 +45,7 @@ class _DraftScheduler(SchedulerDecoupledDraftMixin):
         return None
 
 
-class TestDecoupledDraftBatchState(unittest.TestCase):
+class TestDecoupledDraftBatchState(CustomTestCase):
     def test_mamba_checkpoint_manager_prunes_and_reuses_ring_slots(self):
         allocator = SimpleNamespace(
             alloc=lambda size: torch.arange(10, 10 + size),
@@ -137,6 +142,45 @@ class TestDecoupledDraftBatchState(unittest.TestCase):
             flatten_arrays_to_pinned_cpu([req.get_fill_ids()], False).tolist(),
             [1, 2, 10, 11],
         )
+
+    def test_apply_verifier_commit_segment_rewrites_non_hybrid_draft(self):
+        key = DraftReqKey(src_verifier_rank=0, request_id="req-commit")
+        state = DraftReqState(key=key, verifier_committed_prefix_len=0)
+        req = SimpleNamespace(
+            rid="req-commit",
+            origin_input_ids=array("q", [1, 2]),
+            output_ids=array("q", [10, 11]),
+            kv_committed_freed=False,
+            kv_committed_len=3,
+            kv_allocated_len=3,
+            req_pool_idx=None,
+            grammar=None,
+            return_logprob=False,
+            hidden_states=[],
+        )
+        state.req = req
+        scheduler = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(),
+            decoupled_draft_mamba=SimpleNamespace(prune=lambda item: None),
+            _get_draft_state_by_req=lambda item: state,
+        )
+        segment = VerifierCommitSegment(
+            draft_key=key,
+            dst_drafter_rank=0,
+            pre_verify_committed_len=0,
+            committed_token_ids=[99],
+        )
+
+        SchedulerDecoupledDraftMixin.apply_verifier_commit_segment(
+            scheduler,
+            req,
+            segment,
+            kv_truncations=[],
+            batch_metadata_updates=[],
+        )
+
+        self.assertEqual(list(req.output_ids), [99])
+        self.assertEqual(state.verifier_committed_prefix_len, 1)
 
     def test_kv_truncation_frees_slots_and_clears_req_to_token_mapping(self):
         req_to_token = torch.tensor(
