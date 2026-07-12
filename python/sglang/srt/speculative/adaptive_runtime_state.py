@@ -117,7 +117,7 @@ class _SpecAdaptiveBase:
         """Optional startup profiling hook for throughput-aware controllers."""
 
     def get_modeled_throughput(
-        self, *, batch_size: int, ctx_len: int, accept_length: float
+        self, *, batch_size: int, ctx_len: int
     ) -> dict | None:
         return None
 

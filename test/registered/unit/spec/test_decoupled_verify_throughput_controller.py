@@ -317,21 +317,28 @@ class TestDecoupledVerifyThroughputAwareController(CustomTestCase):
         self.assertEqual(controller._tracker.accept_update_count(1), 0)
         self.assertEqual(controller._tracker.supply_rate(2), 1.0)
 
-    def test_modeled_throughput_exposes_only_required_ema_scalar(self):
+    def test_modeled_throughput_uses_supply_accept_ema(self):
         _, controller = self._controller(
             candidate_steps=[1],
             initial_steps=1,
             costs={1: 10.0},
         )
-        _observe(controller, [1, 0], [1, 1], verified_steps=1)
+        _observe(controller, [1, 0, 0, 0], [1, 1, 0, 0], verified_steps=1)
 
-        modeled = controller.get_modeled_throughput(
-            batch_size=4, ctx_len=256, accept_length=2.0
+        modeled = controller.get_modeled_throughput(batch_size=4, ctx_len=256)
+
+        self.assertAlmostEqual(modeled["modeled_throughput"], 4 * 1.25 * 1000 / 13)
+
+    def test_modeled_throughput_waits_for_ema(self):
+        _, controller = self._controller(
+            candidate_steps=[1],
+            initial_steps=1,
+            costs={1: 10.0},
         )
 
-        self.assertEqual(modeled["ema_expected_tokens"], 1.5)
-        self.assertNotIn("ema_supply_rates", modeled)
-        self.assertNotIn("ema_accept_rates", modeled)
+        self.assertIsNone(
+            controller.get_modeled_throughput(batch_size=4, ctx_len=256)
+        )
 
 
 if __name__ == "__main__":

@@ -26,7 +26,6 @@ SMOOTH_METRICS = (
     "observed_itl_ms",
     "modeled_itl_ms",
     "observed_throughput_tok_s",
-    "modeled_throughput_tok_s",
 )
 
 
@@ -110,10 +109,6 @@ def smooth_points(rows: list[dict[str, Any]], window: int) -> list[dict[str, Any
                 current["observed_itl_ms_smooth"]
                 - current["modeled_itl_ms_smooth"]
             )
-            current["observed_over_modeled_throughput_smooth"] = (
-                current["observed_throughput_tok_s_smooth"]
-                / current["modeled_throughput_tok_s_smooth"]
-            )
             output.append(current)
     return output
 
@@ -123,6 +118,16 @@ def summarize(rows: list[dict[str, Any]], switches: list[dict[str, Any]]) -> lis
     for label in sorted({str(row["label"]) for row in rows}):
         case_rows = [row for row in rows if row["label"] == label]
         first = case_rows[0]
+        modeled_throughputs = [
+            float(row["modeled_throughput_tok_s"])
+            for row in case_rows
+            if row["modeled_throughput_tok_s"] != ""
+        ]
+        throughput_ratios = [
+            float(row["observed_over_modeled_throughput"])
+            for row in case_rows
+            if row["observed_over_modeled_throughput"] != ""
+        ]
         summaries.append(
             {
                 "label": label,
@@ -147,12 +152,11 @@ def summarize(rows: list[dict[str, Any]], switches: list[dict[str, Any]]) -> lis
                 "observed_throughput_mean_tok_s": mean(
                     float(row["observed_throughput_tok_s"]) for row in case_rows
                 ),
-                "modeled_throughput_mean_tok_s": mean(
-                    float(row["modeled_throughput_tok_s"]) for row in case_rows
+                "modeled_throughput_mean_tok_s": (
+                    mean(modeled_throughputs) if modeled_throughputs else ""
                 ),
-                "observed_over_modeled_throughput_mean": mean(
-                    float(row["observed_over_modeled_throughput"])
-                    for row in case_rows
+                "observed_over_modeled_throughput_mean": (
+                    mean(throughput_ratios) if throughput_ratios else ""
                 ),
                 "observed_itl_median_ms": median(
                     float(row["observed_itl_ms"]) for row in case_rows

@@ -117,7 +117,7 @@ class SchedulerDecoupledVerifyMixin:
         )
 
     def _decoupled_verify_modeled_throughput(
-        self: Scheduler, batch: ScheduleBatch, accept_length: float
+        self: Scheduler, batch: ScheduleBatch
     ) -> Optional[dict]:
         if (
             batch is None
@@ -128,7 +128,6 @@ class SchedulerDecoupledVerifyMixin:
         return self.model_worker.get_modeled_throughput(
             batch.batch_size(),
             self._decoupled_verify_avg_ctx_len(batch),
-            accept_length,
         )
 
     def _maybe_log_decoupled_verify_state_selection(

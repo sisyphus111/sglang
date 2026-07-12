@@ -297,14 +297,13 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             self.adaptive_controller.activate_step_by_batch(batch_size, ctx_len)
 
     def get_modeled_throughput(
-        self, batch_size: int, ctx_len: int, accept_length: float
+        self, batch_size: int, ctx_len: int
     ) -> Optional[dict]:
         if self.adaptive_controller is None:
             return None
         return self.adaptive_controller.get_modeled_throughput(
             batch_size=batch_size,
             ctx_len=ctx_len,
-            accept_length=accept_length,
         )
 
     def build_adaptive_runtime_state(

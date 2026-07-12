@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Optional
 
 from sglang.srt.speculative.adaptive_runtime_state import (
@@ -142,23 +141,21 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
         return self._cost_table.items()
 
     def get_modeled_throughput(
-        self, *, batch_size: int, ctx_len: int, accept_length: float
+        self, *, batch_size: int, ctx_len: int
     ) -> Optional[dict]:
         ctx_len = max(1, int(ctx_len))
         profile_cost_ms, matched_batch_size, matched_ctx_len = (
             self._cost_table.lookup_with_match(batch_size, self._current_steps, ctx_len)
         )
         cost_ms = _with_runtime_cpu_overhead_ms(profile_cost_ms)
-        accept_length = float(accept_length)
-        if (
-            cost_ms is None
-            or cost_ms <= 0
-            or not math.isfinite(accept_length)
-            or accept_length < 0
-        ):
+        expected_tokens = self._tracker.get_expected_tokens(self._current_steps)
+        if cost_ms is None or cost_ms <= 0 or expected_tokens is None:
             return None
         return {
-            "modeled_throughput": int(batch_size) * accept_length * 1000.0 / cost_ms,
+            "modeled_throughput": int(batch_size)
+            * expected_tokens
+            * 1000.0
+            / cost_ms,
             "batch_size": int(batch_size),
             "steps": int(self._current_steps),
             "ctx_len": ctx_len,
@@ -167,9 +164,6 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             "cost_ms": cost_ms,
             "profile_cost_ms": profile_cost_ms,
             "runtime_cpu_overhead_ms": DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS,
-            "ema_expected_tokens": self._tracker.get_expected_tokens(
-                self._current_steps
-            ),
         }
 
     def on_verify_complete(

@@ -66,9 +66,7 @@ class LogParsingTest(unittest.TestCase):
                 "active_step": 2 + index % 2,
                 "observed_itl_ms": 20.0,
                 "modeled_itl_ms": 19.0,
-                "modeled_throughput_tok_s": 1050.0,
-                "controller_ema_expected_tokens": 1.8,
-                "controller_ema_modeled_throughput_tok_s": 1100.0 + index,
+                "modeled_throughput_tok_s": 1100.0 + index,
             }
             for index in range(3)
         ]
@@ -80,7 +78,7 @@ class LogParsingTest(unittest.TestCase):
                 (Path(directory) / "trajectory_ap1_dynamic_dl3.png").exists()
             )
         self.assertIn("Observed throughput", content)
-        self.assertIn("controller EMA model", content)
+        self.assertIn("modeled throughput", content)
         self.assertIn("Acceptance length", content)
         self.assertIn("Active draft length", content)
 
@@ -94,7 +92,7 @@ class LogParsingTest(unittest.TestCase):
                 "active_step": 0,
                 "observed_itl_ms": 20.0,
                 "modeled_itl_ms": 20.0,
-                "modeled_throughput_tok_s": 1000.0,
+                "modeled_throughput_tok_s": "",
             }
         ]
         smooth = smooth_points(rows, 1)
@@ -104,15 +102,14 @@ class LogParsingTest(unittest.TestCase):
             content = path.read_text()
         self.assertIn("accept_len unavailable", content)
 
-    def test_scheduler_modeled_throughput_is_not_charged_twice(self) -> None:
+    def test_scheduler_modeled_throughput_uses_controller_ema(self) -> None:
         line = (
             "[2026-07-10 04:44:07 TP0] Decode batch, #running-req: 8, "
             "#full token: 8000, iter latency (ms): 20.0000, accept len: 2.00, "
             "valid draft len: 1.00, accept rate: 1.00, "
-            "modeled throughput (token/s): 1000.00, "
+            "EMA modeled throughput (token/s): 750.00, "
             "modeled step: 1, "
             "modeled cost (ms): 16.0000, "
-            "EMA expected tokens: 1.50, "
             "gen throughput (token/s): 800.00, #queue-req: 0\n"
         )
         table = ProfileTable(
@@ -128,13 +125,11 @@ class LogParsingTest(unittest.TestCase):
                 Case("ap0_dynamic_dl2", path, False, True, 2), table, 3.0
             )
         self.assertEqual(rows[0]["modeled_itl_ms"], 16.0)
-        self.assertEqual(rows[0]["model_source"], "scheduler_modeled_throughput")
+        self.assertEqual(rows[0]["model_source"], "scheduler_modeled_cost")
         self.assertEqual(rows[0]["active_step"], 1)
         self.assertEqual(rows[0]["profile_cost_ms"], 12.0)
-        self.assertEqual(rows[0]["controller_ema_expected_tokens"], 1.5)
-        self.assertEqual(
-            rows[0]["controller_ema_modeled_throughput_tok_s"], 750.0
-        )
+        self.assertEqual(rows[0]["modeled_throughput_tok_s"], 750.0)
+        self.assertNotIn("controller_ema_expected_tokens", rows[0])
 
     def test_static_profile_cost_adds_cpu_overhead_once(self) -> None:
         line = (
@@ -155,6 +150,7 @@ class LogParsingTest(unittest.TestCase):
         self.assertEqual(rows[0]["modeled_itl_ms"], 16.0)
         self.assertEqual(rows[0]["model_source"], "profile_lookup_plus_overhead")
         self.assertEqual(rows[0]["active_step"], 2)
+        self.assertEqual(rows[0]["modeled_throughput_tok_s"], "")
 
     def test_runtime_switch_updates_dynamic_active_step_timeline(self) -> None:
         log = "\n".join(

@@ -335,12 +335,9 @@ def parse_decode_points(
             first_timestamp = first_timestamp or timestamp
         accept_len = _number(line, r"accept len:\s*([0-9.]+)")
         modeled_throughput = _number(
-            line, r"modeled throughput \(token/s\):\s*([0-9.]+)"
+            line, r"EMA modeled throughput \(token/s\):\s*([0-9.]+)"
         )
         modeled_cost_ms = _number(line, r"modeled cost \(ms\):\s*([0-9.]+)")
-        controller_ema_expected_tokens = _number(
-            line, r"EMA expected tokens:\s*([0-9.]+)"
-        )
         modeled_step = _number(line, r"modeled step:\s*(\d+)", int)
         active_step = (
             int(modeled_step) if modeled_step is not None else runtime_active_step
@@ -353,27 +350,12 @@ def parse_decode_points(
         else:
             output_tokens = float(observed_throughput) * float(latency_ms) / 1000.0
 
-        if case.dynamic and modeled_throughput is not None and modeled_throughput > 0:
-            modeled_itl_ms = output_tokens * 1000.0 / modeled_throughput
-            model_source = "scheduler_modeled_throughput"
+        if case.dynamic and modeled_cost_ms is not None and modeled_cost_ms > 0:
+            modeled_itl_ms = modeled_cost_ms
+            model_source = "scheduler_modeled_cost"
         else:
             modeled_itl_ms = profile_match.cost_ms + runtime_cpu_overhead_ms
-            modeled_throughput = output_tokens * 1000.0 / modeled_itl_ms
             model_source = "profile_lookup_plus_overhead"
-
-        controller_ema_modeled_throughput: float | str = ""
-        if controller_ema_expected_tokens is not None:
-            controller_cost_ms = (
-                float(modeled_cost_ms)
-                if modeled_cost_ms is not None
-                else profile_match.cost_ms + runtime_cpu_overhead_ms
-            )
-            controller_ema_modeled_throughput = (
-                float(batch_size)
-                * controller_ema_expected_tokens
-                * 1000.0
-                / controller_cost_ms
-            )
 
         rows.append(
             {
@@ -405,16 +387,12 @@ def parse_decode_points(
                 "output_tokens": output_tokens,
                 "observed_throughput_tok_s": float(observed_throughput),
                 "modeled_itl_ms": modeled_itl_ms,
-                "modeled_throughput_tok_s": float(modeled_throughput),
-                "model_source": model_source,
-                "controller_ema_expected_tokens": (
-                    controller_ema_expected_tokens
-                    if controller_ema_expected_tokens is not None
+                "modeled_throughput_tok_s": (
+                    float(modeled_throughput)
+                    if modeled_throughput is not None
                     else ""
                 ),
-                "controller_ema_modeled_throughput_tok_s": (
-                    controller_ema_modeled_throughput
-                ),
+                "model_source": model_source,
                 "profile_cost_ms": profile_match.cost_ms,
                 "runtime_cpu_overhead_ms": runtime_cpu_overhead_ms,
                 "matched_profile_batch_size": profile_match.batch_size,
@@ -422,7 +400,7 @@ def parse_decode_points(
                 "observed_minus_modeled_itl_ms": float(latency_ms) - modeled_itl_ms,
                 "observed_over_modeled_throughput": (
                     float(observed_throughput) / float(modeled_throughput)
-                    if modeled_throughput > 0
+                    if modeled_throughput is not None and modeled_throughput > 0
                     else ""
                 ),
                 "queue_req": int(queue_req),

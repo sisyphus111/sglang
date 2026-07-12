@@ -45,22 +45,22 @@ def plot_trajectories(
             linewidth=1.6,
             label=f"centered MA (window={smooth_window})",
         )
-        controller_ema_rows = [
+        modeled_rows = [
             row
             for row in case_raw
-            if row.get("controller_ema_modeled_throughput_tok_s", "") != ""
+            if row.get("modeled_throughput_tok_s", "") != ""
         ]
-        if controller_ema_rows:
+        if modeled_rows:
             axes[0].plot(
-                [float(row["elapsed_s"]) for row in controller_ema_rows],
+                [float(row["elapsed_s"]) for row in modeled_rows],
                 [
-                    float(row["controller_ema_modeled_throughput_tok_s"])
-                    for row in controller_ema_rows
+                    float(row["modeled_throughput_tok_s"])
+                    for row in modeled_rows
                 ],
                 color="#CC79A7",
                 linewidth=1.3,
                 linestyle="--",
-                label="controller EMA model",
+                label="modeled throughput",
             )
         axes[0].set_title("Observed throughput")
         axes[0].set_ylabel("token/s")
@@ -145,11 +145,15 @@ def write_report(
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summaries:
+        throughput_ratio = row["observed_over_modeled_throughput_mean"]
+        throughput_ratio_text = (
+            f"{float(throughput_ratio):.3f}" if throughput_ratio != "" else "N/A"
+        )
         lines.append(
             f"| {row['label']} | {row['points']} | {row['queue_req_max']} | "
             f"{float(row['observed_itl_mean_ms']):.2f} | "
             f"{float(row['modeled_itl_mean_ms']):.2f} | "
-            f"{float(row['observed_over_modeled_throughput_mean']):.3f} |"
+            f"{throughput_ratio_text} |"
         )
     lines.extend(
         [
@@ -267,11 +271,7 @@ def plot_dynamic(
             if smooth
             else "observed_throughput_tok_s"
         ),
-        "modeled_thpt": (
-            "modeled_throughput_tok_s_smooth"
-            if smooth
-            else "modeled_throughput_tok_s"
-        ),
+        "modeled_thpt": "modeled_throughput_tok_s",
     }
     for allow_partial in (False, True):
         selected = [
@@ -288,15 +288,11 @@ def plot_dynamic(
             for name in ("observed_itl", "modeled_itl")
         ) * 1.08
         thpt_max = max(
-            [
-                float(row[keys[name]])
-                for row in selected
-                for name in ("observed_thpt", "modeled_thpt")
-            ]
+            [float(row[keys["observed_thpt"]]) for row in selected]
             + [
-                float(row["controller_ema_modeled_throughput_tok_s"])
+                float(row[keys["modeled_thpt"]])
                 for row in selected
-                if row.get("controller_ema_modeled_throughput_tok_s", "") != ""
+                if row.get(keys["modeled_thpt"], "") != ""
             ]
         ) * 1.08
         fig, axes = plt.subplots(
@@ -334,29 +330,22 @@ def plot_dynamic(
                 linewidth=1.0,
                 label="observed throughput",
             )
-            axes[row_index][1].plot(
-                x,
-                [float(row[keys["modeled_thpt"]]) for row in case_rows],
-                linewidth=1.0,
-                linestyle="--",
-                label="profile + observed accept",
-            )
-            controller_ema_rows = [
+            modeled_rows = [
                 row
                 for row in case_rows
-                if row.get("controller_ema_modeled_throughput_tok_s", "") != ""
+                if row.get(keys["modeled_thpt"], "") != ""
             ]
-            if controller_ema_rows:
+            if modeled_rows:
                 axes[row_index][1].plot(
-                    [float(row["elapsed_s"]) for row in controller_ema_rows],
+                    [float(row["elapsed_s"]) for row in modeled_rows],
                     [
-                        float(row["controller_ema_modeled_throughput_tok_s"])
-                        for row in controller_ema_rows
+                        float(row[keys["modeled_thpt"]])
+                        for row in modeled_rows
                     ],
                     color="#CC79A7",
                     linewidth=1.2,
-                    linestyle=":",
-                    label="controller EMA throughput",
+                    linestyle="--",
+                    label="modeled throughput",
                 )
             for axis, y_max, ylabel in (
                 (axes[row_index][0], itl_max, "ITL (ms)"),
