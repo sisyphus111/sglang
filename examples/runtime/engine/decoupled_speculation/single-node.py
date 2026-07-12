@@ -22,7 +22,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import common
+from sglang.srt.speculative.decoupled_speculation import common
 
 LOCAL_HOST = "127.0.0.1"
 DPA_ENV_FIXED_PORT_COUNT = 6

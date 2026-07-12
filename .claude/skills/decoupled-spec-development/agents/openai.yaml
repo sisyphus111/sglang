@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decoupled Spec Development"
+  short_description: "Preserve SGLang decoupled-spec runtime boundaries"
+  default_prompt: "Modify decoupled-speculation code while preserving package and runtime ownership boundaries."

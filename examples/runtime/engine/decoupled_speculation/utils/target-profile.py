@@ -18,7 +18,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -26,8 +25,7 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import common  # noqa: E402
+from sglang.srt.speculative.decoupled_speculation import common
 
 try:
     import sglang as sgl

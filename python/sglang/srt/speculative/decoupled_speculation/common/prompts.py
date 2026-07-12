@@ -571,4 +571,3 @@ def load_prompt_samples(
         f"skipped_invalid={skipped_invalid}, offset={args.offset}, "
         f"total_rows={total_rows}, prompt_column={prompt_column!r}"
     )
-

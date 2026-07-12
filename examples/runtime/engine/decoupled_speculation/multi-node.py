@@ -20,7 +20,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-import common
+from sglang.srt.speculative.decoupled_speculation import common
 
 DEFAULT_RAY_NAMESPACE = "dspec"
 DEFAULT_PROMPT_COLUMN_CANDIDATES = common.DEFAULT_PROMPT_COLUMN_CANDIDATES
