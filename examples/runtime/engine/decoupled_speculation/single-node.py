@@ -284,18 +284,7 @@ def parse_args() -> argparse.Namespace:
         "--sampling-seed",
         type=int,
         default=None,
-        help=(
-            "Per-request sampling seed. Set this together with --deterministic "
-            "for reproducible temperature sampling."
-        ),
-    )
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help=(
-            "Enable deterministic inference for both decoupled drafter and "
-            "verifier engines."
-        ),
+        help="Per-request sampling seed.",
     )
     parser.add_argument(
         "--ignore-eos",
@@ -826,7 +815,6 @@ def run_draft_engine_process(
     speculative_num_steps: int,
     max_running_requests: int | None,
     cuda_graph_bs_decode: list[int] | None,
-    deterministic: bool,
     decode_log_interval: int | None,
     mem_fraction_static: float | None,
     chunked_prefill_size: int | None,
@@ -845,7 +833,6 @@ def run_draft_engine_process(
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
             disable_radix_cache=True,
-            enable_deterministic_inference=deterministic,
             decoupled_spec_rank_base=rank,
         )
         if cuda_graph_bs_decode is not None:
@@ -1018,7 +1005,6 @@ def start_draft_engines(
                     speculative_num_steps=args.num_speculative_steps,
                     max_running_requests=args.max_running_requests,
                     cuda_graph_bs_decode=args.cuda_graph_bs_decode,
-                    deterministic=args.deterministic,
                     decode_log_interval=args.decode_log_interval,
                     mem_fraction_static=args.mem_fraction_static,
                     chunked_prefill_size=args.chunked_prefill_size,
@@ -1156,7 +1142,6 @@ def create_verifier_engine(
         speculative_num_steps=args.num_speculative_steps,
         speculative_num_draft_tokens=args.num_speculative_steps + 1,
         disable_radix_cache=True,
-        enable_deterministic_inference=args.deterministic,
         log_level="info",
         decoupled_spec_rank_base=0,
     )
@@ -1204,7 +1189,6 @@ def create_decode_engine(
         tp_size=get_target_engine_tp_size(args),
         dp_size=args.target_dp_size,
         dist_init_addr=dist_init_addr,
-        enable_deterministic_inference=args.deterministic,
         disable_overlap_schedule=True,
         log_level="info",
     )
@@ -1239,7 +1223,6 @@ def create_mtp_engine(
         speculative_num_steps=args.num_speculative_steps,
         speculative_eagle_topk=1,
         speculative_num_draft_tokens=args.num_speculative_steps + 1,
-        enable_deterministic_inference=args.deterministic,
         disable_radix_cache=True,
         disable_overlap_schedule=True,
         mamba_scheduler_strategy="no_buffer",

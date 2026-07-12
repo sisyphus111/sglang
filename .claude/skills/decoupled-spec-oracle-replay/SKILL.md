@@ -13,8 +13,9 @@ fluid replay estimate, not a request-level exact counterfactual.
 Require one static reference trajectory plus static measurements for every DL
 candidate. A single log cannot reveal counterfactual rates for unobserved DLs
 unless an independent cost/rate model is supplied. Prefer identical sampled
-requests, deterministic inference, equal generated-token totals, no queueing,
-and complete routed BS/context coverage.
+requests, equal generated-token totals, no queueing, and complete routed
+BS/context coverage. Keep deterministic inference disabled unless the user
+explicitly requests it.
 
 ## Workflow
 

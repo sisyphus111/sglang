@@ -34,7 +34,6 @@ dp_size = 1
 enable_dp_attention = false
 dtype = "auto"
 trust_remote_code = false
-deterministic = true
 mem_fraction_static = 0.8
 
 [profile]
@@ -96,6 +95,7 @@ class ProfileVerifierTest(unittest.TestCase):
             kwargs["decoupled_verify_throughput_profile_ctx_lens"], "1024,4096"
         )
         self.assertEqual(kwargs["tp_size"], 4)
+        self.assertNotIn("enable_deterministic_inference", kwargs)
 
     def test_check_cli_requires_no_gpu_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -123,6 +123,17 @@ class ProfileVerifierTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "contiguous"):
                 self.make_spec(Path(directory), ("steps = [0, 1]", "steps = [0, 2]"))
+
+    def test_rejects_deterministic_target_option(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "no longer supported"):
+                self.make_spec(
+                    Path(directory),
+                    (
+                        "trust_remote_code = false",
+                        "trust_remote_code = false\ndeterministic = true",
+                    ),
+                )
 
     def test_rejects_duplicate_grid_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

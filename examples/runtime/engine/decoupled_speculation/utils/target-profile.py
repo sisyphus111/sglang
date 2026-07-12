@@ -457,7 +457,6 @@ def build_engine_kwargs(
         trust_remote_code=args.trust_remote_code,
         disable_overlap_schedule=args.disable_overlap_schedule,
         disable_radix_cache=args.disable_radix_cache,
-        enable_deterministic_inference=args.enable_deterministic,
         max_running_requests=token_batch_size,
         cuda_graph_backend_decode="full",
         cuda_graph_backend_prefill="disabled",
@@ -638,8 +637,6 @@ def parse_args() -> argparse.Namespace:
             "profile point captures exactly the probed batch size."
         ),
     )
-    parser.add_argument("--enable-deterministic", action="store_true")
-
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--dataset-path", default=None)
     parser.add_argument("--prompt-column", default=None)

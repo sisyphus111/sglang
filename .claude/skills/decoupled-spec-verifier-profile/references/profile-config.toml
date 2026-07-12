@@ -10,7 +10,6 @@ dp_size = 1
 enable_dp_attention = false
 dtype = "auto"
 trust_remote_code = false
-deterministic = true
 mem_fraction_static = 0.80
 # ep_size = 4
 # moe_a2a_backend = "deepep"

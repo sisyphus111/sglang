@@ -519,7 +519,6 @@ class DraftActor:
         speculative_num_steps: int,
         rank_base: int,
         max_running_requests: int | None = None,
-        deterministic: bool = False,
     ):
         """Pin GPUs and create the draft engine."""
         self.assigned_gpu_ids = pin_actor_to_assigned_gpus(tp_size)
@@ -532,7 +531,6 @@ class DraftActor:
             decoupled_spec_rank_base=rank_base,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            enable_deterministic_inference=deterministic,
         )
         if max_running_requests is not None:
             engine_kwargs["max_running_requests"] = max_running_requests
@@ -587,7 +585,6 @@ def launch_draft_actors(
             speculative_num_steps=args.num_speculative_steps,
             rank_base=rank,
             max_running_requests=getattr(args, "max_running_requests", None),
-            deterministic=args.deterministic,
         )
         actors.append(actor)
     ready_infos = ray.get([actor.ready.remote() for actor in actors])
@@ -663,7 +660,6 @@ class TargetActor:
         decoupled_verify_throughput_profile_path: str | None = None,
         cuda_graph_bs_decode: list[int] | None = None,
         rank_base: int = 0,
-        deterministic: bool = False,
         log_level: str | None = None,
         available_ports: list[int] | None = None,
         max_running_requests: int | None = None,
@@ -683,7 +679,6 @@ class TargetActor:
             nnodes=nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
-            enable_deterministic_inference=deterministic,
         )
         if log_level is not None:
             engine_kwargs["log_level"] = log_level

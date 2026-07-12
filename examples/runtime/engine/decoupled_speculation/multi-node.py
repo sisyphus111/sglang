@@ -287,14 +287,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help=(
-            "Enable deterministic inference for both decoupled drafter and "
-            "verifier engines."
-        ),
-    )
-    parser.add_argument(
         "--ignore-eos",
         action="store_true",
         help=(
@@ -1143,7 +1135,6 @@ def launch_target_actors(
             ),
             cuda_graph_bs_decode=args.cuda_graph_bs_decode,
             rank_base=rank_base,
-            deterministic=args.deterministic,
             log_level="info",
             available_ports=available_ports,
             max_running_requests=args.max_running_requests,

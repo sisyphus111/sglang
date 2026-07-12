@@ -24,7 +24,6 @@ class ProfileSpec:
     enable_dp_attention: bool
     dtype: str
     trust_remote_code: bool
-    deterministic: bool
     mem_fraction_static: float | None
     ep_size: int | None
     moe_a2a_backend: str | None
@@ -134,11 +133,12 @@ def load_spec(path: Path) -> ProfileSpec:
     if mem_fraction is not None and not 0 < float(mem_fraction) < 1:
         raise ValueError("target.mem_fraction_static must be in (0, 1)")
 
-    for key in ("trust_remote_code", "deterministic"):
-        if type(target.get(key, key == "deterministic")) is not bool:
-            raise ValueError(f"target.{key} must be a boolean")
-    if target.get("deterministic", True) is not True:
-        raise ValueError("target.deterministic must be true")
+    if type(target.get("trust_remote_code", False)) is not bool:
+        raise ValueError("target.trust_remote_code must be a boolean")
+    if "deterministic" in target:
+        raise ValueError(
+            "target.deterministic is no longer supported by this profiler"
+        )
 
     return ProfileSpec(
         config_path=path,
@@ -151,7 +151,6 @@ def load_spec(path: Path) -> ProfileSpec:
         enable_dp_attention=enable_dp_attention,
         dtype=str(target.get("dtype", "auto")),
         trust_remote_code=bool(target.get("trust_remote_code", False)),
-        deterministic=bool(target.get("deterministic", True)),
         mem_fraction_static=(float(mem_fraction) if mem_fraction is not None else None),
         ep_size=(int(target["ep_size"]) if "ep_size" in target else None),
         moe_a2a_backend=(
@@ -185,7 +184,6 @@ def build_engine_kwargs(spec: ProfileSpec, dist_init_addr: str) -> dict[str, Any
         "cuda_graph_bs_decode": list(spec.batch_sizes),
         "max_running_requests": max(spec.batch_sizes),
         "disable_radix_cache": True,
-        "enable_deterministic_inference": spec.deterministic,
         "decoupled_spec_rank_base": 0,
         "dtype": spec.dtype,
         "trust_remote_code": spec.trust_remote_code,

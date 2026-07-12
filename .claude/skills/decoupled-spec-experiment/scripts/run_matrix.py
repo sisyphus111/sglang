@@ -63,8 +63,10 @@ def load_config(path: Path) -> dict[str, Any]:
         print("warning: ignore_eos=true changes request outputs", file=sys.stderr)
     if type(workload.get("sampling_seed")) is not int:
         raise ValueError("workload.sampling_seed must be an integer")
-    if workload.get("deterministic") is not True:
-        raise ValueError("workload.deterministic must be true")
+    if "deterministic" in workload:
+        raise ValueError(
+            "workload.deterministic is no longer supported by this runner"
+        )
     capture_bs = [int(value) for value in config["profile"]["capture_bs"]]
     if batch_size not in capture_bs:
         raise ValueError(f"profile.capture_bs must contain workload batch_size={batch_size}")
@@ -190,8 +192,6 @@ def base_command(
         command.extend(["--sampling-seed", str(workload["sampling_seed"])])
     if bool(workload.get("enable_thinking", False)):
         command.append("--enable-thinking")
-    if bool(workload.get("deterministic", False)):
-        command.append("--deterministic")
     if bool(workload.get("ignore_eos", False)):
         command.append("--ignore-eos")
     if dynamic:

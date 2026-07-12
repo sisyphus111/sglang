@@ -457,7 +457,6 @@ def build_result(
             ),
             "temperature": args.temperature,
             "sampling_seed": getattr(args, "sampling_seed", None),
-            "deterministic": args.deterministic,
             "ignore_eos": args.ignore_eos,
             "nnodes": args.nnodes,
             "n_gpu_per_node": args.n_gpu_per_node,

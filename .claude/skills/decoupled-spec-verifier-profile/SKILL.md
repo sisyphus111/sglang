@@ -58,6 +58,8 @@ when the target engine spans nodes.
   require a draft model, prompts, or a dataset.
 - Profiling uses the runtime's startup CUDA Graph capture and timing path; the
   skill does not implement a second cost model.
+- Keep deterministic inference disabled unless the user explicitly requests it;
+  this profiler does not expose a deterministic option.
 - BS and ctx values are positive and unique. Steps are exactly `0..max_step`.
 - Without DP attention, `dp_size` must be 1. With DP attention, visible GPU count
   must cover `tp_size * dp_size`.

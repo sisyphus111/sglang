@@ -24,6 +24,23 @@ from run_matrix import (
 
 
 class ProfileCoverageTest(unittest.TestCase):
+    def test_deterministic_workload_option_is_rejected(self) -> None:
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "references"
+            / "qwen35-27b-08b-default.toml"
+        ).read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                template.replace(
+                    "sampling_seed = 42",
+                    "sampling_seed = 42\ndeterministic = true",
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "no longer supported"):
+                load_config(path)
+
     def test_boolean_sampling_seed_is_rejected(self) -> None:
         template = (
             Path(__file__).resolve().parents[1]
@@ -257,7 +274,6 @@ class MatrixCommandTest(unittest.TestCase):
                 "max_new_tokens": 32768,
                 "temperature": 1.0,
                 "sampling_seed": 42,
-                "deterministic": True,
             },
             "profile": {
                 "capture_bs": [64],
@@ -344,7 +360,7 @@ class MatrixCommandTest(unittest.TestCase):
                 )
         stop.assert_called_once_with(process)
 
-    def test_formal_commands_lock_sampling_seed_and_determinism(self) -> None:
+    def test_formal_commands_lock_sampling_seed_without_determinism(self) -> None:
         for steps, dynamic in ((0, False), (3, False), (3, True)):
             with self.subTest(steps=steps, dynamic=dynamic):
                 command = base_command(
@@ -352,7 +368,7 @@ class MatrixCommandTest(unittest.TestCase):
                 )
                 seed_index = command.index("--sampling-seed")
                 self.assertEqual(command[seed_index + 1], "42")
-                self.assertIn("--deterministic", command)
+                self.assertNotIn("--deterministic", command)
 
     def test_child_environment_prefers_configured_worktree(self) -> None:
         with mock.patch.dict(os.environ, {"PYTHONPATH": "/ambient/python"}):

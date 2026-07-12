@@ -43,7 +43,9 @@ or compute an oracle here; hand completed artifacts to the downstream skills.
 
 - Keep `max_running_requests >= batch_size + 1`; queueing changes the state path.
 - Leave `ignore_eos=false` unless changed outputs are explicitly requested.
-- Lock sampling seed and deterministic mode when comparing policies.
+- Lock the sampling seed when comparing policies. Keep deterministic inference
+  disabled unless the user explicitly requests it; the matrix runner does not
+  expose a deterministic option.
 - Profile every candidate step and every routed BS/context bucket needed by the
   workload. Require an exact target model/TP/DP/DP-attention/GPU fingerprint; a
   dynamic run must not silently accept an incompatible cache.
