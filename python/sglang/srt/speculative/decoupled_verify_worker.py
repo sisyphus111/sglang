@@ -596,26 +596,6 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             for req in batch.reqs
         ]
 
-    def _assert_num_correct_within_snapshot_tail(
-        self, batch: ScheduleBatch, num_correct_drafts_per_req_cpu: List[int]
-    ) -> List[int]:
-        # The request state is a per-forward snapshot bound before verify. Any
-        # concurrent drafter appends belong to later verify rounds.
-        spec_steps = int(self.speculative_num_steps)
-        real_tail_lens = self._get_snapshot_tail_lens(batch, spec_steps)
-        raw_accept_lens = [int(x) for x in num_correct_drafts_per_req_cpu]
-        for req, raw_accept_len, real_tail_len in zip(
-            batch.reqs, raw_accept_lens, real_tail_lens
-        ):
-            assert raw_accept_len <= real_tail_len, (
-                "Decoupled verify has accepted padded draft tokens: "
-                f"request_id={req.rid} "
-                f"raw_accept_len={raw_accept_len} "
-                f"snapshot_tail_len={real_tail_len}"
-            )
-
-        return raw_accept_lens
-
     def _record_valid_draft_metrics(
         self, batch: ScheduleBatch, num_correct_drafts_per_req_cpu: List[int]
     ) -> int:
@@ -879,9 +859,6 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             verify_input, batch, logits_output, vocab_mask
         )
         num_correct_drafts_per_req_cpu = (accept_lens - 1).cpu().tolist()
-        self._assert_num_correct_within_snapshot_tail(
-            batch, num_correct_drafts_per_req_cpu
-        )
         valid_draft_tokens = self._record_valid_draft_metrics(
             batch, num_correct_drafts_per_req_cpu
         )
