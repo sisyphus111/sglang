@@ -67,6 +67,8 @@ class LogParsingTest(unittest.TestCase):
                 "observed_itl_ms": 20.0,
                 "modeled_itl_ms": 19.0,
                 "modeled_throughput_tok_s": 1050.0,
+                "controller_ema_expected_tokens": 1.8,
+                "controller_ema_modeled_throughput_tok_s": 1100.0 + index,
             }
             for index in range(3)
         ]
@@ -78,6 +80,7 @@ class LogParsingTest(unittest.TestCase):
                 (Path(directory) / "trajectory_ap1_dynamic_dl3.png").exists()
             )
         self.assertIn("Observed throughput", content)
+        self.assertIn("controller EMA model", content)
         self.assertIn("Acceptance length", content)
         self.assertIn("Active draft length", content)
 
@@ -108,6 +111,8 @@ class LogParsingTest(unittest.TestCase):
             "valid draft len: 1.00, accept rate: 1.00, "
             "modeled throughput (token/s): 1000.00, "
             "modeled step: 1, "
+            "modeled cost (ms): 16.0000, "
+            "EMA expected tokens: 1.50, "
             "gen throughput (token/s): 800.00, #queue-req: 0\n"
         )
         table = ProfileTable(
@@ -126,6 +131,10 @@ class LogParsingTest(unittest.TestCase):
         self.assertEqual(rows[0]["model_source"], "scheduler_modeled_throughput")
         self.assertEqual(rows[0]["active_step"], 1)
         self.assertEqual(rows[0]["profile_cost_ms"], 12.0)
+        self.assertEqual(rows[0]["controller_ema_expected_tokens"], 1.5)
+        self.assertEqual(
+            rows[0]["controller_ema_modeled_throughput_tok_s"], 750.0
+        )
 
     def test_static_profile_cost_adds_cpu_overhead_once(self) -> None:
         line = (
@@ -194,6 +203,37 @@ class LogParsingTest(unittest.TestCase):
         self.assertEqual(candidates[1]["expected_source"], "tier_ema")
         self.assertEqual(candidates[1]["tier_updates"], 15)
         self.assertTrue(candidates[2]["selected"])
+
+    def test_switch_candidates_parse_global_supply_accept_rates(self) -> None:
+        raw = (
+            "[S=2:E=2.100/cost=25.0000ms=0.084000,"
+            "profile_cost=22.0000ms,cpu_overhead=3.0000ms,ctx=200->1024,"
+            "rates=[p1=supply:0.900/accept:0.800:ema,"
+            "p2=supply:0.500/accept:?:unobserved],"
+            "expected_source=global_position_ema*]"
+        )
+
+        candidate = parse_candidate_scores(raw)[0]
+
+        self.assertEqual(candidate["expected_source"], "global_position_ema")
+        self.assertTrue(candidate["selected"])
+        self.assertEqual(
+            candidate["position_supply_accept_rates"],
+            [
+                {
+                    "position": 1,
+                    "supply_rate": 0.9,
+                    "accept_rate": 0.8,
+                    "source": "ema",
+                },
+                {
+                    "position": 2,
+                    "supply_rate": 0.5,
+                    "accept_rate": "",
+                    "source": "unobserved",
+                },
+            ],
+        )
 
     def test_switch_parser_accepts_decision_reason(self) -> None:
         line = (

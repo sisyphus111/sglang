@@ -39,12 +39,16 @@ CANDIDATE_RE = re.compile(
     r"cpu_overhead=(?P<cpu_overhead_ms>[0-9.]+)ms,"
     r"ctx=(?P<ctx_len>\d+)->(?P<matched_ctx_len>\d+)"
     r"(?:,rates=\[(?P<rates>[^]]*)\])?"
-    r"(?:,expected_source=(?P<expected_source>\w+),"
-    r"tier_updates=(?P<tier_updates>\d+)"
-    r"(?:,tier_age=(?P<tier_age>\d+))?)?"
+    r"(?:,expected_source=(?P<expected_source>\w+)"
+    r"(?:,tier_updates=(?P<tier_updates>\d+)"
+    r"(?:,tier_age=(?P<tier_age>\d+))?)?)?"
     r"(?P<blocked>:blocked)?(?P<selected>\*)?"
 )
 RATE_RE = re.compile(r"p(?P<position>\d+)=(?P<rate>[0-9.]+):(?P<source>\w+)")
+SUPPLY_ACCEPT_RATE_RE = re.compile(
+    r"p(?P<position>\d+)=supply:(?P<supply>[0-9.]+|\?)"
+    r"/accept:(?P<accept>[0-9.]+|\?):(?P<source>\w+)"
+)
 
 
 @dataclass(frozen=True)
@@ -166,13 +170,31 @@ class ProfileTable:
 def parse_candidate_scores(raw_scores: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for match in CANDIDATE_RE.finditer(raw_scores):
-        rates = [
+        raw_rates = match.group("rates") or ""
+        supply_accept_rates = [
+            {
+                "position": int(rate.group("position")),
+                "supply_rate": (
+                    float(rate.group("supply"))
+                    if rate.group("supply") != "?"
+                    else ""
+                ),
+                "accept_rate": (
+                    float(rate.group("accept"))
+                    if rate.group("accept") != "?"
+                    else ""
+                ),
+                "source": rate.group("source"),
+            }
+            for rate in SUPPLY_ACCEPT_RATE_RE.finditer(raw_rates)
+        ]
+        legacy_accept_rates = [
             {
                 "position": int(rate.group("position")),
                 "rate": float(rate.group("rate")),
                 "source": rate.group("source"),
             }
-            for rate in RATE_RE.finditer(match.group("rates") or "")
+            for rate in RATE_RE.finditer(raw_rates)
         ]
         candidates.append(
             {
@@ -184,7 +206,8 @@ def parse_candidate_scores(raw_scores: str) -> list[dict[str, Any]]:
                 "cpu_overhead_ms": float(match.group("cpu_overhead_ms")),
                 "ctx_len": int(match.group("ctx_len")),
                 "matched_ctx_len": int(match.group("matched_ctx_len")),
-                "position_accept_rates": rates,
+                "position_supply_accept_rates": supply_accept_rates,
+                "position_accept_rates": legacy_accept_rates,
                 "expected_source": match.group("expected_source") or "",
                 "tier_updates": (
                     int(match.group("tier_updates"))
@@ -314,6 +337,10 @@ def parse_decode_points(
         modeled_throughput = _number(
             line, r"modeled throughput \(token/s\):\s*([0-9.]+)"
         )
+        modeled_cost_ms = _number(line, r"modeled cost \(ms\):\s*([0-9.]+)")
+        controller_ema_expected_tokens = _number(
+            line, r"EMA expected tokens:\s*([0-9.]+)"
+        )
         modeled_step = _number(line, r"modeled step:\s*(\d+)", int)
         active_step = (
             int(modeled_step) if modeled_step is not None else runtime_active_step
@@ -333,6 +360,20 @@ def parse_decode_points(
             modeled_itl_ms = profile_match.cost_ms + runtime_cpu_overhead_ms
             modeled_throughput = output_tokens * 1000.0 / modeled_itl_ms
             model_source = "profile_lookup_plus_overhead"
+
+        controller_ema_modeled_throughput: float | str = ""
+        if controller_ema_expected_tokens is not None:
+            controller_cost_ms = (
+                float(modeled_cost_ms)
+                if modeled_cost_ms is not None
+                else profile_match.cost_ms + runtime_cpu_overhead_ms
+            )
+            controller_ema_modeled_throughput = (
+                float(batch_size)
+                * controller_ema_expected_tokens
+                * 1000.0
+                / controller_cost_ms
+            )
 
         rows.append(
             {
@@ -366,6 +407,14 @@ def parse_decode_points(
                 "modeled_itl_ms": modeled_itl_ms,
                 "modeled_throughput_tok_s": float(modeled_throughput),
                 "model_source": model_source,
+                "controller_ema_expected_tokens": (
+                    controller_ema_expected_tokens
+                    if controller_ema_expected_tokens is not None
+                    else ""
+                ),
+                "controller_ema_modeled_throughput_tok_s": (
+                    controller_ema_modeled_throughput
+                ),
                 "profile_cost_ms": profile_match.cost_ms,
                 "runtime_cpu_overhead_ms": runtime_cpu_overhead_ms,
                 "matched_profile_batch_size": profile_match.batch_size,

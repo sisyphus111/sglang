@@ -36,6 +36,8 @@ The scripts use one result directory per experiment matrix:
 - runtime state: `point_index`, `elapsed_s`, `batch_size`, `ctx_per_req`
 - observation: `observed_itl_ms`, `observed_throughput_tok_s`, `accept_len`
 - model: `modeled_itl_ms`, `modeled_throughput_tok_s`, `model_source`
+- controller model: `controller_ema_expected_tokens`,
+  `controller_ema_modeled_throughput_tok_s`
 - profile match: `profile_cost_ms`, `runtime_cpu_overhead_ms`,
   `matched_profile_batch_size`, `matched_profile_ctx_len`
 
@@ -45,17 +47,27 @@ the runtime CPU overhead. For static logs, `model_source=profile_lookup_plus_ove
 means the analyzer performed controller-aligned profile lookup and added the configured
 overhead.
 
+`controller_ema_expected_tokens` is the one controller state value that cannot be
+recovered from BS/step/ctx/profile fields. The analyzer derives
+`controller_ema_modeled_throughput_tok_s` as
+`batch_size * controller_ema_expected_tokens * 1000 / modeled_cost_ms`. Older logs
+without this scalar retain empty controller-model columns. The controller EMA does
+not define a separate iteration latency: it uses the same selected-tier modeled cost
+already represented by `modeled_itl_ms`.
+
 `trajectory_<case>.svg` (with a report-scale PNG companion) is the direct runtime view: raw and centered-smoothed
-throughput, raw and centered-smoothed acceptance length, and active draft length
-on one reconstructed decode-time axis. Its source CSVs remove only latency
+throughput, the controller EMA throughput model when available, raw and
+centered-smoothed acceptance length, and active draft length on one reconstructed
+decode-time axis. Its source CSVs remove only latency
 outliers, retaining small-batch tail points; full-batch filtering applies only
 to the separate profile-fit figures. If the scheduler stream has no
 `accept_len`, that panel is explicitly marked unavailable; the analyzer does not
 replace it with zero or with a normal-decoding assumption.
 
 `controller_switches.csv` preserves the complete score string and also extracts each
-candidate into `candidate_scores_json`, including expected accepted tokens, costs,
-profile costs, per-position acceptance rates, and the selected candidate.
+candidate into `candidate_scores_json`, including expected tokens, costs, profile
+costs, legacy acceptance rates or current supply/conditional-accept rates, and the
+selected candidate.
 
 `e2e_summary.csv` reads each completed `runs/<case>/summary.json` and records output
 throughput, generation time, generated tokens, and aggregate acceptance metrics. It is

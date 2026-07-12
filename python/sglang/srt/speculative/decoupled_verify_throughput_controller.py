@@ -167,6 +167,9 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             "cost_ms": cost_ms,
             "profile_cost_ms": profile_cost_ms,
             "runtime_cpu_overhead_ms": DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS,
+            "ema_expected_tokens": self._tracker.get_expected_tokens(
+                self._current_steps
+            ),
         }
 
     def on_verify_complete(

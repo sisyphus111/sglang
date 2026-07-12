@@ -771,6 +771,12 @@ class SchedulerMetricsReporter:
         if get_modeled_throughput is not None:
             modeled = get_modeled_throughput(batch, spec_accept_length)
             if modeled is not None:
+                ema_expected_tokens = modeled.get("ema_expected_tokens")
+                ema_expected_tokens_msg = (
+                    f"EMA expected tokens: {ema_expected_tokens:.4f}, "
+                    if ema_expected_tokens is not None
+                    else ""
+                )
                 modeled_throughput_msg = (
                     "modeled throughput (token/s): "
                     f"{modeled['modeled_throughput']:.2f}, "
@@ -780,6 +786,7 @@ class SchedulerMetricsReporter:
                     f"modeled ctx: {modeled['ctx_len']}->{modeled['matched_ctx_len']}, "
                     f"modeled bs: {modeled['batch_size']}->"
                     f"{modeled['matched_batch_size']}, "
+                    f"{ema_expected_tokens_msg}"
                 )
 
         draft_wait_msg = ""
