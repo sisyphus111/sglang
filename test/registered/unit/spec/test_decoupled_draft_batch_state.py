@@ -13,6 +13,9 @@ from sglang.srt.managers.scheduler_decoupled_draft_mixin import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey, DraftSync
+from sglang.srt.speculative.decoupled_draft_mamba import (
+    DecoupledDraftMambaStateManager,
+)
 from sglang.srt.utils.common import flatten_arrays_to_pinned_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,6 +41,34 @@ class _DraftScheduler(SchedulerDecoupledDraftMixin):
 
 
 class TestDecoupledDraftBatchState(unittest.TestCase):
+    def test_mamba_checkpoint_manager_prunes_and_reuses_ring_slots(self):
+        allocator = SimpleNamespace(
+            alloc=lambda size: torch.arange(10, 10 + size),
+            available_size=lambda: 8,
+            free=lambda slots: None,
+        )
+        scheduler = SimpleNamespace(
+            _draft_ahead_window=lambda: 3,
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(size=16),
+                mamba_allocator=allocator,
+            ),
+        )
+        manager = DecoupledDraftMambaStateManager(scheduler)
+        state = DraftReqState(
+            key=DraftReqKey(src_verifier_rank=0, request_id="req-mamba"),
+            req=SimpleNamespace(output_ids=[1, 2, 3, 4]),
+            verifier_committed_prefix_len=3,
+            mamba_checkpoint_positions={0, 2, 3},
+        )
+
+        manager.prune(state)
+
+        self.assertEqual(state.mamba_checkpoint_positions, {3})
+        self.assertEqual(
+            manager.checkpoint_slot(state, 4, for_write=True).tolist(), [11]
+        )
+
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "decoupled draft metadata flush is implemented by a CUDA Triton kernel",

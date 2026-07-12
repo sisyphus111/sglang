@@ -5,6 +5,10 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_decoupled_verify_mixin import (
     SchedulerDecoupledVerifyMixin,
 )
+from sglang.srt.speculative.decoupled_spec_transport import (
+    get_decoupled_spec_transport,
+)
+from sglang.srt.speculative.decoupled_verify_state import DecoupledVerifySnapshot
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -44,6 +48,7 @@ class _Req:
         self.origin_input_ids = list(origin_input_ids or [])
         self._finished = finished
         self.is_retracted = is_retracted
+        self.decoupled_verify_snapshot = None
 
     def finished(self):
         return self._finished
@@ -111,6 +116,19 @@ class _VerifyScheduler(SchedulerDecoupledVerifyMixin):
 
 
 class TestDecoupledSpecCppDataPlane(unittest.TestCase):
+    def test_transport_selection_reuses_backend_descriptors(self):
+        with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(False):
+            python_transport = get_decoupled_spec_transport()
+            self.assertIs(python_transport, get_decoupled_spec_transport())
+            self.assertFalse(python_transport.supports_native_rows)
+
+        with envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(True):
+            cpp_transport = get_decoupled_spec_transport()
+            self.assertIs(cpp_transport, get_decoupled_spec_transport())
+            self.assertTrue(cpp_transport.supports_native_rows)
+
+        self.assertIsNot(python_transport, cpp_transport)
+
     def test_sync_verify_requests_cpp_env_submits_native_rows(self):
         scheduler = _VerifyScheduler(_DraftTailBuffer())
         batch = _Batch(
@@ -146,7 +164,11 @@ class TestDecoupledSpecCppDataPlane(unittest.TestCase):
             )
         )
         req_commit = _Req("req-commit", output_ids=[10, 11, 12])
-        req_commit._decoupled_verify_pre_committed_len = 2
+        verify_snapshot = DecoupledVerifySnapshot(
+            pre_committed_len=2, draft_tokens=[99]
+        )
+        draft_tokens = verify_snapshot.draft_tokens
+        req_commit.decoupled_verify_snapshot = verify_snapshot
         req_close = _Req("req-close", output_ids=[20], finished=True)
         batch = _Batch(
             [req_commit, req_close],
@@ -160,6 +182,11 @@ class TestDecoupledSpecCppDataPlane(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(scheduler.released, ["req-close"])
+        self.assertIs(req_commit.decoupled_verify_snapshot, verify_snapshot)
+        self.assertIs(verify_snapshot.draft_tokens, draft_tokens)
+        self.assertEqual(verify_snapshot.pre_committed_len, 3)
+        self.assertEqual(verify_snapshot.draft_tokens, [])
+        self.assertIsNone(req_close.decoupled_verify_snapshot)
         self.assertEqual(
             scheduler.draft_proxy_thread.rows,
             [

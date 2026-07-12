@@ -486,57 +486,17 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
-        resolve_candidate_steps_from_config,
+        resolve_adaptive_spec_config,
     )
 
-    strategy = getattr(server_args, "speculative_adaptive_strategy", "ema")
-    is_decoupled_verify = server_args.speculative_algorithm == "DECOUPLED_VERIFY"
-    is_decoupled_throughput_aware = (
-        is_decoupled_verify and strategy == "throughput_aware"
-    )
-    if is_decoupled_throughput_aware:
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_decoupled_verify_throughput_aware_candidate_steps,
-        )
-
-        if not hasattr(server_args, "_decoupled_verify_max_speculative_steps"):
-            server_args._decoupled_verify_max_speculative_steps = (
-                server_args.speculative_num_steps
-            )
-        candidate_steps = resolve_decoupled_verify_throughput_aware_candidate_steps(
-            server_args._decoupled_verify_max_speculative_steps
-        )
-    elif strategy == "throughput_aware":
-        raise ValueError(
-            "--speculative-adaptive-strategy=throughput_aware is currently "
-            "supported for DECOUPLED_VERIFY only in this branch."
-        )
-    else:
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=server_args.speculative_adaptive_config,
-        )
+    adaptive_config = resolve_adaptive_spec_config(server_args)
+    server_args._adaptive_spec_config = adaptive_config
 
     if server_args.speculative_eagle_topk is None:
         server_args.speculative_eagle_topk = 1
 
-    if is_decoupled_throughput_aware:
-        server_args.speculative_num_steps = min(
-            step for step in candidate_steps if step > 0
-        )
-    elif server_args.speculative_num_steps is None:
-        server_args.speculative_num_steps = candidate_steps[len(candidate_steps) // 2]
-
-    if (
-        not is_decoupled_throughput_aware
-        and server_args.speculative_num_steps not in candidate_steps
-    ):
-        raise ValueError(
-            f"--speculative-num-steps={server_args.speculative_num_steps} "
-            f"is not in the adaptive config candidate_steps {candidate_steps}. "
-            "Pass one of those values."
-        )
-
-    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+    server_args.speculative_num_steps = adaptive_config.initial_steps
+    server_args.speculative_num_draft_tokens = adaptive_config.initial_steps + 1
 
 
 def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) -> tuple:

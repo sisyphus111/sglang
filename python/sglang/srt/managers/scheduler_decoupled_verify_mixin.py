@@ -3,27 +3,26 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.speculative.cpp_decoupled_spec import (
-    CppDraftProxyThread,
-    CppDraftTailBuffer,
-)
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
     DraftSync,
     VerifyCommit,
 )
-from sglang.srt.speculative.draft_proxy import DraftProxyThread
+from sglang.srt.speculative.decoupled_spec_transport import (
+    get_decoupled_spec_transport,
+)
+from sglang.srt.speculative.decoupled_verify_state import (
+    prepare_decoupled_verify_snapshot,
+)
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
 from sglang.srt.speculative.spec_info import dynamic_verify_enabled
 from sglang.srt.utils import broadcast_pyobj, log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +33,8 @@ class SchedulerDecoupledVerifyMixin:
     def create_draft_tail_buffer(self: Scheduler) -> Optional[DraftTailBuffer]:
         if not self.is_verify_entry_rank():
             return None
-        tail_buffer_cls = (
-            CppDraftTailBuffer
-            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
-            else DraftTailBuffer
-        )
-        return tail_buffer_cls(
+        transport = get_decoupled_spec_transport()
+        return transport.draft_tail_buffer_cls(
             verifier_rank=self.get_decoupled_spec_rank(),
             required_tail_len=max(
                 0, int(self.server_args.speculative_num_draft_tokens) - 1
@@ -54,12 +49,8 @@ class SchedulerDecoupledVerifyMixin:
             raise RuntimeError(
                 "DraftTailBuffer is required on decoupled_verify entry rank"
             )
-        proxy_cls = (
-            CppDraftProxyThread
-            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
-            else DraftProxyThread
-        )
-        self.draft_proxy_thread = proxy_cls(
+        transport = get_decoupled_spec_transport()
+        self.draft_proxy_thread = transport.draft_proxy_thread_cls(
             context=context,
             verifier_rank=self.get_decoupled_spec_rank(),
             draft_tail_buffer=self.draft_tail_buffer,
@@ -91,15 +82,9 @@ class SchedulerDecoupledVerifyMixin:
             raise RuntimeError(
                 "decoupled verifier dynamic verify length requires full CUDA Graph."
             )
-        activate_step_by_batch = getattr(
-            self.model_worker, "activate_step_by_batch", None
+        self.model_worker.activate_step_by_batch(
+            int(raw_batch_size), int(avg_ctx_len)
         )
-        if activate_step_by_batch is None:
-            raise RuntimeError(
-                "decoupled verifier dynamic verify length requires the verifier "
-                "worker AdaptiveController runtime-state activator."
-            )
-        activate_step_by_batch(int(raw_batch_size), int(avg_ctx_len))
 
     def _decoupled_verify_avg_ctx_len(self: Scheduler, batch: ScheduleBatch) -> int:
         if batch.batch_size() <= 0:
@@ -140,12 +125,7 @@ class SchedulerDecoupledVerifyMixin:
             or not self.spec_algorithm.is_decoupled_verify()
         ):
             return None
-        get_modeled_throughput = getattr(
-            self.model_worker, "get_modeled_throughput", None
-        )
-        if get_modeled_throughput is None:
-            return None
-        return get_modeled_throughput(
+        return self.model_worker.get_modeled_throughput(
             batch.batch_size(),
             self._decoupled_verify_avg_ctx_len(batch),
             accept_length,
@@ -203,152 +183,10 @@ class SchedulerDecoupledVerifyMixin:
         self: Scheduler,
         batch: ScheduleBatch,
     ) -> None:
-        num_speculative_steps, verify_tokens_per_req = (
-            self._active_decoupled_verify_config()
-        )
         for req in batch.reqs:
             if req.is_retracted or req.finished():
                 continue
-            setattr(req, "draft_buffer", None)
-            setattr(
-                req,
-                "_decoupled_verify_pre_committed_len",
-                len(req.output_ids),
-            )
-            setattr(
-                req,
-                "_decoupled_verify_num_speculative_steps",
-                num_speculative_steps,
-            )
-            setattr(
-                req,
-                "_decoupled_verify_tokens_per_req",
-                verify_tokens_per_req,
-            )
-
-    def validate_verify_outputs(
-        self: Scheduler,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-    ) -> None:
-        accept_lens = result.num_correct_drafts_per_req_cpu
-        # Compatibility with older decoupled verifier results during rolling
-        # migrations from v0.5.10-dev.
-        if accept_lens is None:
-            accept_lens = getattr(result, "num_accepted_drafts_per_req_cpu", None)
-        if accept_lens is None:
-            accept_lens = getattr(result, "accept_length_per_req_cpu", None)
-        if accept_lens is None:
-            raise RuntimeError("Decoupled verify result is missing accept lengths.")
-        if len(accept_lens) != len(batch.reqs):
-            raise RuntimeError(
-                "Decoupled verify accept length count does not match batch size: "
-                f"accept_lens={len(accept_lens)} batch_size={len(batch.reqs)}"
-            )
-        if result.next_token_ids is None:
-            raise RuntimeError("Decoupled verify result is missing verified token ids.")
-
-        verified_ids_obj = result.next_token_ids
-        if isinstance(verified_ids_obj, torch.Tensor):
-            verified_ids = verified_ids_obj.tolist()
-        else:
-            verified_ids = []
-            for item in verified_ids_obj:
-                if isinstance(item, torch.Tensor):
-                    item = item.tolist()
-                if isinstance(item, list):
-                    verified_ids.extend(int(token_id) for token_id in item)
-                else:
-                    verified_ids.append(int(item))
-
-        offset = 0
-        valid_draft_metric_updates: list[tuple[Req, int, int]] = []
-        for req, accept_len in zip(batch.reqs, accept_lens):
-            accept_len = int(accept_len)
-            segment_len = accept_len + 1
-            segment = verified_ids[offset : offset + segment_len]
-            if len(segment) != segment_len:
-                raise RuntimeError(
-                    "Decoupled verify returned too few verified ids: "
-                    f"request_id={req.rid} accept_len={accept_len} "
-                    f"remaining_verified_ids={len(verified_ids) - offset}"
-                )
-            offset += segment_len
-
-            pre_committed_len = getattr(
-                req, "_decoupled_verify_pre_committed_len", None
-            )
-            if pre_committed_len is None:
-                pre_committed_len = len(req.output_ids) - segment_len
-            pre_committed_len = int(pre_committed_len)
-            if pre_committed_len < 0:
-                raise RuntimeError(
-                    "Decoupled verify output is shorter than the verified segment: "
-                    f"request_id={req.rid} output_len={len(req.output_ids)} "
-                    f"segment_len={segment_len}"
-                )
-
-            output_segment = req.output_ids[
-                pre_committed_len : pre_committed_len + segment_len
-            ]
-            if output_segment != segment:
-                raise RuntimeError(
-                    "Decoupled verify result does not match committed output ids: "
-                    f"request_id={req.rid} pre_committed_len={pre_committed_len} "
-                    f"accept_len={accept_len} verified_segment={segment} "
-                    f"output_segment={output_segment}"
-                )
-
-            draft_buffer = list(getattr(req, "draft_buffer", []) or [])
-            accepted_draft_tokens = segment[:accept_len]
-            expected_draft_tokens = draft_buffer[:accept_len]
-            if accepted_draft_tokens != expected_draft_tokens:
-                raise RuntimeError(
-                    "Decoupled verify accepted tokens outside the draft snapshot: "
-                    f"request_id={req.rid} accept_len={accept_len} "
-                    f"accepted_draft_tokens={accepted_draft_tokens} "
-                    f"draft_snapshot_prefix={expected_draft_tokens}"
-                )
-            valid_draft_metric_updates.append((req, len(draft_buffer), accept_len))
-
-        if offset != len(verified_ids):
-            raise RuntimeError(
-                "Decoupled verify returned extra verified ids: "
-                f"consumed={offset} total={len(verified_ids)}"
-            )
-
-        for (
-            req,
-            valid_draft_tokens,
-            valid_accepted_tokens,
-        ) in valid_draft_metric_updates:
-            spec_steps = getattr(req, "_decoupled_verify_num_speculative_steps", None)
-            if spec_steps is None:
-                spec_steps = int(self.server_args.speculative_num_steps or 0)
-                if spec_steps <= 0:
-                    spec_steps = max(
-                        0, int(self.server_args.speculative_num_draft_tokens or 1) - 1
-                    )
-            spec_steps = int(spec_steps)
-            valid_draft_tokens = min(valid_draft_tokens, spec_steps)
-            valid_accepted_tokens = min(valid_accepted_tokens, valid_draft_tokens)
-            req.spec_valid_draft_tokens += valid_draft_tokens
-            req.spec_valid_accepted_tokens += valid_accepted_tokens
-            metric_len = max(
-                spec_steps,
-                len(req.spec_valid_draft_tokens_by_position),
-                len(req.spec_valid_accepted_tokens_by_position),
-            )
-            req.spec_valid_draft_tokens_by_position = (
-                req.spec_valid_draft_tokens_by_position + [0] * metric_len
-            )[:metric_len]
-            req.spec_valid_accepted_tokens_by_position = (
-                req.spec_valid_accepted_tokens_by_position + [0] * metric_len
-            )[:metric_len]
-            for pos in range(valid_draft_tokens):
-                req.spec_valid_draft_tokens_by_position[pos] += 1
-            for pos in range(valid_accepted_tokens):
-                req.spec_valid_accepted_tokens_by_position[pos] += 1
+            prepare_decoupled_verify_snapshot(req, len(req.output_ids))
 
     def assign_drafter_rank(self, request_id: str) -> int:
         """Assign a verifier request to the currently least-loaded drafter rank."""
@@ -569,7 +407,7 @@ class SchedulerDecoupledVerifyMixin:
 
         Called after the entry-rank snapshot
         has been broadcast. All ranks, including the entry rank, use this same
-        snapshot set for req.draft_buffer so concurrent proxy updates cannot
+        snapshot set for the request state so concurrent proxy updates cannot
         affect the current verifier forward pass.
 
         Args:
@@ -591,13 +429,11 @@ class SchedulerDecoupledVerifyMixin:
         for req in target_reqs:
             snapshot = snapshot_by_rid.get(req.rid)
             if snapshot is None:
-                setattr(req, "draft_buffer", None)
                 continue
 
             committed_len = int(snapshot.committed_len)
             if committed_len < len(req.output_ids):
                 # the drafter has not caught up with the verifier req's committed output prefix
-                setattr(req, "draft_buffer", None)
                 continue
             if committed_len > len(req.output_ids):
                 raise RuntimeError(
@@ -606,7 +442,12 @@ class SchedulerDecoupledVerifyMixin:
                     f"request_id={req.rid} snapshot_committed_len={committed_len} "
                     f"request_output_len={len(req.output_ids)}"
                 )
-            setattr(req, "draft_buffer", list(snapshot.tail_tokens))
+            verify_snapshot = req.decoupled_verify_snapshot
+            if verify_snapshot is None:
+                raise RuntimeError(
+                    f"Missing decoupled verify state for request {req.rid}"
+                )
+            verify_snapshot.draft_tokens.extend(snapshot.tail_tokens)
 
     def _sync_verify_requests(
         self,
@@ -637,15 +478,11 @@ class SchedulerDecoupledVerifyMixin:
         draft_tail_buffer = self.draft_tail_buffer
         assert draft_tail_buffer is not None
 
-        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+        if get_decoupled_spec_transport().supports_native_rows:
             sync_rows: list[tuple] = []
             for req in batch.reqs:
                 if not req.is_retracted and not req.finished():
-                    setattr(
-                        req,
-                        "_decoupled_verify_pre_committed_len",
-                        len(req.output_ids),
-                    )
+                    prepare_decoupled_verify_snapshot(req, len(req.output_ids))
                 if (
                     getattr(req, "inflight_middle_chunks", getattr(req, "is_chunked", 0))
                     > 0
@@ -665,18 +502,13 @@ class SchedulerDecoupledVerifyMixin:
                         [int(token_id) for token_id in req.output_ids],
                     )
                 )
-                setattr(req, "draft_buffer", None)
             self._send_verify_control_rows(sync_rows=sync_rows)
             return
 
         sync_messages: list[DraftSync] = []
         for req in batch.reqs:
             if not req.is_retracted and not req.finished():
-                setattr(
-                    req,
-                    "_decoupled_verify_pre_committed_len",
-                    len(req.output_ids),
-                )
+                prepare_decoupled_verify_snapshot(req, len(req.output_ids))
             if (
                 getattr(req, "inflight_middle_chunks", getattr(req, "is_chunked", 0))
                 > 0
@@ -695,7 +527,6 @@ class SchedulerDecoupledVerifyMixin:
                     committed_output_ids=list(req.output_ids),
                 )
             )
-            setattr(req, "draft_buffer", None)
         self._send_verify_control_batches(sync_messages=sync_messages)
 
     def _snapshot_verify_inputs(
@@ -709,7 +540,7 @@ class SchedulerDecoupledVerifyMixin:
         The default path is non-blocking: the verifier entry rank snapshots the
         draft tail tokens already received by DraftProxyThread, broadcasts that
         stable per-forward snapshot to peer TP ranks, and all ranks bind
-        req.draft_buffer from the broadcast snapshot.
+        the request's stable state from the broadcast snapshot.
 
         Args:
             batch: The ScheduleBatch that will run verifier extend/decode.
@@ -722,33 +553,14 @@ class SchedulerDecoupledVerifyMixin:
             if req.is_retracted or req.finished():
                 continue
             live_reqs.append(req)
-            setattr(req, "draft_buffer", None)
-            setattr(
-                req,
-                "_decoupled_verify_pre_committed_len",
-                len(req.output_ids),
-            )
+            prepare_decoupled_verify_snapshot(req, len(req.output_ids))
         target_reqs = live_reqs
         if not target_reqs:
             return None
 
         is_dynamic = dynamic_verify_enabled(self.server_args)
-        active_spec_steps, active_verify_tokens = (
-            self._active_decoupled_verify_config()
-        )
+        active_spec_steps, _ = self._active_decoupled_verify_config()
         snapshot_tail_cap = active_spec_steps if is_dynamic else None
-        verify_tokens_per_req = active_verify_tokens if is_dynamic else None
-        for req in target_reqs:
-            setattr(
-                req,
-                "_decoupled_verify_num_speculative_steps",
-                snapshot_tail_cap,
-            )
-            setattr(
-                req,
-                "_decoupled_verify_tokens_per_req",
-                verify_tokens_per_req,
-            )
         local_snapshots: list[DraftTailSnapshot] = []
         if self.is_verify_entry_rank():
             draft_tail_buffer = self.draft_tail_buffer
@@ -797,7 +609,7 @@ class SchedulerDecoupledVerifyMixin:
         draft_tail_buffer = self.draft_tail_buffer
         assert draft_tail_buffer is not None
 
-        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+        if get_decoupled_spec_transport().supports_native_rows:
             commit_rows: list[tuple] = []
             close_rows: list[tuple] = []
             for req in batch.reqs:
@@ -815,7 +627,7 @@ class SchedulerDecoupledVerifyMixin:
                             )
                         )
                         self.release_drafter_rank(req.rid)
-                    setattr(req, "draft_buffer", None)
+                    req.decoupled_verify_snapshot = None
                     continue
 
                 if not has_request:
@@ -823,10 +635,11 @@ class SchedulerDecoupledVerifyMixin:
                 if not req.output_ids:
                     continue
 
-                pre_verify_committed_len = getattr(
-                    req,
-                    "_decoupled_verify_pre_committed_len",
-                    None,
+                verify_snapshot = req.decoupled_verify_snapshot
+                pre_verify_committed_len = (
+                    verify_snapshot.pre_committed_len
+                    if verify_snapshot is not None
+                    else None
                 )
                 if pre_verify_committed_len is None:
                     pre_verify_committed_len = draft_tail_buffer.get_committed_len(req.rid)
@@ -842,8 +655,8 @@ class SchedulerDecoupledVerifyMixin:
                         f"output_len={len(req.output_ids)}"
                     )
                 if pre_verify_committed_len == len(req.output_ids):
-                    if hasattr(req, "_decoupled_verify_pre_committed_len"):
-                        delattr(req, "_decoupled_verify_pre_committed_len")
+                    if verify_snapshot is not None:
+                        verify_snapshot.reset(len(req.output_ids))
                     continue
 
                 committed_token_ids = [
@@ -860,8 +673,8 @@ class SchedulerDecoupledVerifyMixin:
                         committed_token_ids,
                     )
                 )
-                if hasattr(req, "_decoupled_verify_pre_committed_len"):
-                    delattr(req, "_decoupled_verify_pre_committed_len")
+                if verify_snapshot is not None:
+                    verify_snapshot.reset(len(req.output_ids))
 
             self._send_verify_control_rows(
                 commit_rows=commit_rows,
@@ -886,7 +699,7 @@ class SchedulerDecoupledVerifyMixin:
                         )
                     )
                     self.release_drafter_rank(req.rid)
-                setattr(req, "draft_buffer", None)
+                req.decoupled_verify_snapshot = None
                 continue
 
             if not has_request:
@@ -894,10 +707,11 @@ class SchedulerDecoupledVerifyMixin:
             if not req.output_ids:
                 continue
 
-            pre_verify_committed_len = getattr(
-                req,
-                "_decoupled_verify_pre_committed_len",
-                None,
+            verify_snapshot = req.decoupled_verify_snapshot
+            pre_verify_committed_len = (
+                verify_snapshot.pre_committed_len
+                if verify_snapshot is not None
+                else None
             )
             if pre_verify_committed_len is None:
                 pre_verify_committed_len = draft_tail_buffer.get_committed_len(req.rid)
@@ -914,8 +728,8 @@ class SchedulerDecoupledVerifyMixin:
                 )
             if pre_verify_committed_len == len(req.output_ids):
                 # no tokens are generated during this forward(e.g. chunked prefill)
-                if hasattr(req, "_decoupled_verify_pre_committed_len"):
-                    delattr(req, "_decoupled_verify_pre_committed_len")
+                if verify_snapshot is not None:
+                    verify_snapshot.reset(len(req.output_ids))
                 continue
 
             committed_token_ids = [
@@ -932,8 +746,8 @@ class SchedulerDecoupledVerifyMixin:
                     committed_token_ids=committed_token_ids,
                 )
             )
-            if hasattr(req, "_decoupled_verify_pre_committed_len"):
-                delattr(req, "_decoupled_verify_pre_committed_len")
+            if verify_snapshot is not None:
+                verify_snapshot.reset(len(req.output_ids))
         self._send_verify_control_batches(
             verify_commit_messages=verify_commit_messages,
             close_messages=close_messages,
@@ -961,7 +775,7 @@ class SchedulerDecoupledVerifyMixin:
         assert draft_tail_buffer is not None
         if draft_tail_buffer.has_request(request_id):
             dst_drafter_rank = self.get_drafter_rank(request_id)
-            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+            if get_decoupled_spec_transport().supports_native_rows:
                 self._send_verify_control_rows(
                     close_rows=[
                         (

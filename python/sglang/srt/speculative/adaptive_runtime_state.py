@@ -116,6 +116,11 @@ class _SpecAdaptiveBase:
     def run_profiling(self, tree_cache) -> None:
         """Optional startup profiling hook for throughput-aware controllers."""
 
+    def get_modeled_throughput(
+        self, *, batch_size: int, ctx_len: int, accept_length: float
+    ) -> dict | None:
+        return None
+
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
         if state is None:
@@ -174,7 +179,7 @@ class AdaptiveController(_SpecAdaptiveBase):
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(self, batch_size: int, ctx_len: int = 1) -> None:
         target = self.params.get_steps_for_batch(batch_size)
         if target != self.worker.speculative_num_steps:
             self._activate(target)

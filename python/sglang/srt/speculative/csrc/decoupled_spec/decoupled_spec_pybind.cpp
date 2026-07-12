@@ -5,8 +5,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cctype>
-#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -52,139 +50,6 @@ int64_t now_ns() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
-
-bool env_flag_enabled(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') return false;
-  std::string text(value);
-  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return text != "0" && text != "false" && text != "off" && text != "no";
-}
-
-bool debug_timing_enabled() {
-  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_TIMING");
-  return enabled;
-}
-
-bool debug_buffer_enabled() {
-  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_BUFFER");
-  return enabled;
-}
-
-bool debug_thread_enabled() {
-  static const bool enabled = env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_THREAD");
-  return enabled;
-}
-
-int64_t debug_buffer_interval_ns() {
-  static const int64_t interval_ns = [] {
-    const char* value = std::getenv("SGLANG_DECOUPLED_SPEC_DEBUG_BUFFER_INTERVAL_MS");
-    if (value == nullptr || value[0] == '\0') return int64_t{1000000000};
-    char* end = nullptr;
-    long long interval_ms = std::strtoll(value, &end, 10);
-    if (end == value || interval_ms < 0) interval_ms = 1000;
-    return static_cast<int64_t>(interval_ms) * 1000000;
-  }();
-  return interval_ns;
-}
-
-int64_t debug_thread_interval_ns() {
-  static const int64_t interval_ns = [] {
-    const char* value = std::getenv("SGLANG_DECOUPLED_SPEC_DEBUG_THREAD_INTERVAL_MS");
-    if (value == nullptr || value[0] == '\0') return int64_t{0};
-    char* end = nullptr;
-    long long interval_ms = std::strtoll(value, &end, 10);
-    if (end == value || interval_ms < 0) interval_ms = 0;
-    return static_cast<int64_t>(interval_ms) * 1000000;
-  }();
-  return interval_ns;
-}
-
-void print_debug_timing(const std::string& op, int64_t duration_ns, int64_t items) {
-  if (!debug_timing_enabled()) return;
-  if (op == "token_sync_thread.idle_wait") return;
-  std::fprintf(
-      stderr,
-      "[decoupled-spec-timing] impl=cpp component=cpp op=%s ns=%lld items=%lld\n",
-      op.c_str(),
-      static_cast<long long>(duration_ns),
-      static_cast<long long>(items));
-  std::fflush(stderr);
-}
-
-void print_debug_buffer(
-    const std::string& component,
-    const std::string& op,
-    const std::string& payload,
-    bool force = false) {
-  if (!debug_buffer_enabled()) return;
-  static std::mutex mu;
-  static std::unordered_map<std::string, int64_t> last_print_ns;
-  int64_t now = now_ns();
-  int64_t interval = debug_buffer_interval_ns();
-  std::string key = component + ":" + op;
-  if (!force && interval > 0) {
-    std::lock_guard<std::mutex> guard(mu);
-    auto it = last_print_ns.find(key);
-    if (it != last_print_ns.end() && now - it->second < interval) return;
-    last_print_ns[key] = now;
-  }
-  std::fprintf(
-      stderr,
-      "[decoupled-spec-buffer] impl=cpp component=%s op=%s %s\n",
-      component.c_str(),
-      op.c_str(),
-      payload.c_str());
-  std::fflush(stderr);
-}
-
-void print_debug_thread(
-    const std::string& component,
-    const std::string& op,
-    const std::string& payload,
-    bool force = false) {
-  if (!debug_thread_enabled()) return;
-  static std::mutex mu;
-  static std::unordered_map<std::string, int64_t> last_print_ns;
-  int64_t now = now_ns();
-  int64_t interval = debug_thread_interval_ns();
-  std::string key = component + ":" + op;
-  if (!force && interval > 0) {
-    std::lock_guard<std::mutex> guard(mu);
-    auto it = last_print_ns.find(key);
-    if (it != last_print_ns.end() && now - it->second < interval) return;
-    last_print_ns[key] = now;
-  }
-  std::fprintf(
-      stderr,
-      "[decoupled-spec-thread] impl=cpp component=%s op=%s %s\n",
-      component.c_str(),
-      op.c_str(),
-      payload.c_str());
-  std::fflush(stderr);
-}
-
-class DebugTimingScope {
- public:
-  DebugTimingScope(std::string op, int64_t items = 0)
-      : op_(std::move(op)),
-        items_(items),
-        enabled_(debug_timing_enabled()),
-        start_ns_(enabled_ ? now_ns() : 0) {}
-
-  ~DebugTimingScope() {
-    if (!enabled_) return;
-    print_debug_timing(op_, now_ns() - start_ns_, items_);
-  }
-
- private:
-  std::string op_;
-  int64_t items_;
-  bool enabled_;
-  int64_t start_ns_;
-};
 
 class BinaryReader {
  public:
@@ -820,25 +685,16 @@ class DraftTailBufferCore {
   }
 
   void apply_control_batch_native(const DraftControlBatchCpp& batch) {
-    DebugTimingScope timer("tail_buffer.apply_control_batch",
-                        static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                                             batch.close_messages.size()));
     {
       std::lock_guard<std::mutex> guard(mu_);
       for (const auto& msg : batch.sync_messages) open_request_locked(msg);
       for (const auto& msg : batch.verify_commit_messages) apply_commit_locked(msg);
       for (const auto& msg : batch.close_messages) close_request_locked(msg);
       cv_.notify_all();
-      print_debug_summary_locked(
-          "apply_control_batch",
-          static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                               batch.close_messages.size()));
     }
   }
 
   void open_request_rows_native(std::vector<DraftSyncOpenCpp> rows) {
-    DebugTimingScope timer("tail_buffer.open_request_rows",
-                        static_cast<int64_t>(rows.size()));
     std::lock_guard<std::mutex> guard(mu_);
     states_.reserve(states_.size() + rows.size());
     for (auto& row : rows) {
@@ -849,26 +705,18 @@ class DraftTailBufferCore {
       states_.insert_or_assign(std::move(row.request_id), std::move(state));
     }
     cv_.notify_all();
-    print_debug_summary_locked("open_request_rows", static_cast<int64_t>(rows.size()));
   }
 
   void append_draft_stream_batch_native(const DraftTailStreamOutputBatchCpp& batch) {
     if (batch.outputs.empty()) return;
-    DebugTimingScope timer("tail_buffer.append_draft_stream_batch",
-                        static_cast<int64_t>(batch.outputs.size()));
     {
       std::lock_guard<std::mutex> guard(mu_);
       for (const auto& output : batch.outputs) push_one_locked(output);
       cv_.notify_all();
-      print_debug_summary_locked(
-          "append_draft_stream_batch",
-          static_cast<int64_t>(batch.outputs.size()));
     }
   }
 
   void wait_for_draft_tokens(const std::vector<std::string>& rids, int64_t min_draft_tokens) {
-    DebugTimingScope timer("tail_buffer.wait_for_draft_tokens",
-                        static_cast<int64_t>(rids.size()));
     min_draft_tokens = std::max<int64_t>(0, min_draft_tokens);
     if (min_draft_tokens <= 0) return;
     std::unique_lock<std::mutex> lock(mu_);
@@ -882,8 +730,6 @@ class DraftTailBufferCore {
       const std::vector<std::string>& rids,
       bool allow_partial,
       int64_t max_tail_len) {
-    DebugTimingScope timer("tail_buffer.get_draft_snapshots",
-                        static_cast<int64_t>(rids.size()));
     int64_t tail_cap = std::max<int64_t>(-1, max_tail_len);
     std::unique_lock<std::mutex> lock(mu_);
     int64_t wait_ns = 0;
@@ -922,106 +768,10 @@ class DraftTailBufferCore {
       snapshot.raw_tail_len = static_cast<int64_t>(state.tail_tokens.size());
       snapshots.push_back(std::move(snapshot));
     }
-    int64_t snapshot_raw_total = 0;
-    int64_t snapshot_raw_max = 0;
-    int64_t snapshot_returned_total = 0;
-    int64_t snapshot_returned_max = 0;
-    for (const auto& snapshot : snapshots) {
-      snapshot_raw_total += snapshot.raw_tail_len;
-      snapshot_raw_max = std::max(snapshot_raw_max, snapshot.raw_tail_len);
-      int64_t returned_len = static_cast<int64_t>(snapshot.tail_tokens.size());
-      snapshot_returned_total += returned_len;
-      snapshot_returned_max = std::max(snapshot_returned_max, returned_len);
-    }
-    print_debug_summary_locked(
-        "get_draft_snapshots",
-        static_cast<int64_t>(rids.size()),
-        tail_cap,
-        static_cast<int64_t>(snapshots.size()),
-        snapshot_raw_total,
-        snapshot_raw_max,
-        snapshot_returned_total,
-        snapshot_returned_max,
-        allow_partial);
     return {std::move(snapshots), wait_ns};
   }
 
  private:
-  static double avg_or_zero(int64_t total, int64_t count) {
-    return count == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(count);
-  }
-
-  void print_debug_summary_locked(
-      const std::string& op,
-      int64_t items,
-      int64_t tail_cap = -1,
-      int64_t snapshot_reqs = -1,
-      int64_t snapshot_raw_total = -1,
-      int64_t snapshot_raw_max = -1,
-      int64_t snapshot_returned_total = -1,
-      int64_t snapshot_returned_max = -1,
-      bool allow_partial = true) const {
-    if (!debug_buffer_enabled()) return;
-    int64_t active_reqs = static_cast<int64_t>(states_.size());
-    int64_t raw_tail_total = 0;
-    int64_t raw_tail_max = 0;
-    int64_t raw_ge_required_reqs = 0;
-    int64_t raw_ge_cap_reqs = 0;
-    int64_t consumable_tail_total = 0;
-    int64_t consumable_tail_max = 0;
-    int64_t consumable_ge_required_reqs = 0;
-    int64_t consumable_ge_cap_reqs = 0;
-    int64_t pending_expected_total = 0;
-    int64_t pending_expected_reqs = 0;
-    for (const auto& kv : states_) {
-      const auto& state = kv.second;
-      int64_t raw_len = static_cast<int64_t>(state.tail_tokens.size());
-      int64_t consumable_len = state.consumable_tail_len();
-      int64_t pending_len = static_cast<int64_t>(state.pending_expected_tokens.size());
-      raw_tail_total += raw_len;
-      raw_tail_max = std::max(raw_tail_max, raw_len);
-      consumable_tail_total += consumable_len;
-      consumable_tail_max = std::max(consumable_tail_max, consumable_len);
-      pending_expected_total += pending_len;
-      if (pending_len > 0) pending_expected_reqs += 1;
-      if (raw_len >= required_tail_len_) raw_ge_required_reqs += 1;
-      if (consumable_len >= required_tail_len_) consumable_ge_required_reqs += 1;
-      if (tail_cap >= 0 && raw_len >= tail_cap) raw_ge_cap_reqs += 1;
-      if (tail_cap >= 0 && consumable_len >= tail_cap) consumable_ge_cap_reqs += 1;
-    }
-    std::ostringstream os;
-    os << "verifier_rank=" << verifier_rank_
-       << " items=" << items
-       << " active_reqs=" << active_reqs
-       << " required_tail_len=" << required_tail_len_
-       << " raw_tail_total=" << raw_tail_total
-       << " raw_tail_avg=" << avg_or_zero(raw_tail_total, active_reqs)
-       << " raw_tail_max=" << raw_tail_max
-       << " raw_ge_required_reqs=" << raw_ge_required_reqs
-       << " consumable_tail_total=" << consumable_tail_total
-       << " consumable_tail_avg=" << avg_or_zero(consumable_tail_total, active_reqs)
-       << " consumable_tail_max=" << consumable_tail_max
-       << " consumable_ge_required_reqs=" << consumable_ge_required_reqs
-       << " pending_expected_total=" << pending_expected_total
-       << " pending_expected_reqs=" << pending_expected_reqs;
-    if (tail_cap >= 0) {
-      os << " tail_cap=" << tail_cap
-         << " raw_ge_cap_reqs=" << raw_ge_cap_reqs
-         << " consumable_ge_cap_reqs=" << consumable_ge_cap_reqs;
-    }
-    if (snapshot_reqs >= 0) {
-      os << " allow_partial=" << (allow_partial ? 1 : 0)
-         << " snapshot_reqs=" << snapshot_reqs
-         << " snapshot_raw_total=" << snapshot_raw_total
-         << " snapshot_raw_avg=" << avg_or_zero(snapshot_raw_total, snapshot_reqs)
-         << " snapshot_raw_max=" << snapshot_raw_max
-         << " snapshot_returned_total=" << snapshot_returned_total
-         << " snapshot_returned_avg=" << avg_or_zero(snapshot_returned_total, snapshot_reqs)
-         << " snapshot_returned_max=" << snapshot_returned_max;
-    }
-    print_debug_buffer("draft_tail_buffer", op, os.str());
-  }
-
   void open_request_locked(const DraftSyncCpp& message) {
     RequestDraftTailStateCpp state;
     state.drafter_rank = message.dst_drafter_rank;
@@ -1177,9 +927,6 @@ class DraftControlInboxCore {
   }
 
   void add_control_batch(const DraftControlBatchCpp& batch) {
-    DebugTimingScope timer("control_inbox.add_control_batch",
-                        static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                                             batch.close_messages.size()));
     std::lock_guard<std::mutex> guard(mu_);
     close_keys_.reserve(close_keys_.size() + batch.close_messages.size());
     sync_messages_.reserve(sync_messages_.size() + batch.sync_messages.size());
@@ -1193,7 +940,6 @@ class DraftControlInboxCore {
   }
 
   std::vector<VerifierCommitSegmentCpp> snapshot_pending_commit_segments_native() {
-    DebugTimingScope timer("control_inbox.snapshot_pending_commit_segments");
     std::lock_guard<std::mutex> guard(mu_);
     std::vector<VerifierCommitSegmentCpp> out;
     out.reserve(verifier_commit_segments_.size());
@@ -1204,8 +950,6 @@ class DraftControlInboxCore {
   }
 
   ReadyDraftControlsCpp extract_ready_controls_native(const std::vector<ExtractDecisionCpp>& decisions) {
-    DebugTimingScope timer("control_inbox.extract_ready_controls",
-                        static_cast<int64_t>(decisions.size()));
     ReadyDraftControlsCpp ready;
     std::lock_guard<std::mutex> guard(mu_);
     for (const auto& kv : close_keys_) ready.close_keys.push_back(kv.second);
@@ -1514,8 +1258,6 @@ class ZmqContextOwner {
 
 struct QueuedFrame {
   std::string frame;
-  int64_t enqueue_ns = 0;
-  int64_t items = 0;
 };
 
 }  // namespace
@@ -1534,9 +1276,6 @@ class DecoupledSpecDraftTailBuffer {
       const py::sequence& sync_rows,
       const py::sequence& commit_rows,
       const py::sequence& close_rows) {
-    DebugTimingScope debug_timer(
-        "pybind.tail_buffer.apply_control_batch_native",
-        static_cast<int64_t>(py::len(sync_rows) + py::len(commit_rows) + py::len(close_rows)));
     if (py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
       auto rows = build_sync_open_rows_native(sync_rows);
       {
@@ -1553,9 +1292,6 @@ class DecoupledSpecDraftTailBuffer {
   }
 
   void append_draft_stream_batch_native(const py::sequence& rows) {
-    DebugTimingScope debug_timer(
-        "pybind.tail_buffer.append_draft_stream_batch_native",
-        static_cast<int64_t>(py::len(rows)));
     auto batch = build_tail_stream_batch_native(rows);
     {
       py::gil_scoped_release release;
@@ -1564,9 +1300,6 @@ class DecoupledSpecDraftTailBuffer {
   }
 
   void wait_for_draft_tokens_native(const py::sequence& rids, int64_t min_draft_tokens) {
-    DebugTimingScope debug_timer(
-        "pybind.tail_buffer.wait_for_draft_tokens_native",
-        static_cast<int64_t>(py::len(rids)));
     auto rid_vec = py_string_vector(rids);
     py::gil_scoped_release release;
     core_->wait_for_draft_tokens(rid_vec, min_draft_tokens);
@@ -1576,9 +1309,6 @@ class DecoupledSpecDraftTailBuffer {
       const py::sequence& rids,
       bool allow_partial,
       int64_t max_tail_len) {
-    DebugTimingScope debug_timer(
-        "pybind.tail_buffer.get_draft_snapshots_native",
-        static_cast<int64_t>(py::len(rids)));
     auto rid_vec = py_string_vector(rids);
     DraftTailSnapshotBatchCpp snapshot_batch;
     {
@@ -1632,9 +1362,6 @@ class DecoupledSpecDraftProxyThread {
   std::string result_bind_endpoint() const { return result_bind_endpoint_; }
 
   void configure_peer_endpoints_native(const py::sequence& endpoint_rows) {
-    DebugTimingScope debug_timer(
-        "pybind.draft_proxy.configure_peer_endpoints_native",
-        static_cast<int64_t>(py::len(endpoint_rows)));
     check_thread_error();
     auto endpoints = py_string_vector(endpoint_rows);
     py::gil_scoped_release release;
@@ -1688,9 +1415,6 @@ class DecoupledSpecDraftProxyThread {
     int64_t sync_count = static_cast<int64_t>(py::len(sync_rows));
     int64_t commit_count = static_cast<int64_t>(py::len(commit_rows));
     int64_t close_count = static_cast<int64_t>(py::len(close_rows));
-    DebugTimingScope debug_timer(
-        "pybind.draft_proxy.submit_control_batch_native",
-        sync_count + commit_count + close_count);
     check_thread_error();
     if (sync_count > 0 && commit_count == 0 && close_count == 0) {
       auto rows = build_sync_open_rows_native(sync_rows);
@@ -1704,16 +1428,7 @@ class DecoupledSpecDraftProxyThread {
         draft_tail_buffer_->open_request_rows_native(std::move(rows));
         {
           std::lock_guard<std::mutex> guard(queue_mu_);
-          send_queue_.push_back(
-              QueuedFrame{std::move(frame), now_ns(), sync_count});
-          std::ostringstream os;
-          os << "verifier_rank=" << verifier_rank_
-             << " dst_drafter_rank=" << dst_drafter_rank
-             << " items=" << sync_count
-             << " sync_messages=" << sync_count
-             << " verify_commit_messages=0 close_messages=0"
-             << " send_queue_after=" << send_queue_.size();
-          print_debug_buffer("draft_proxy", "enqueue_control_batch", os.str());
+          send_queue_.push_back(QueuedFrame{std::move(frame)});
         }
       }
       queue_cv_.notify_one();
@@ -1730,19 +1445,7 @@ class DecoupledSpecDraftProxyThread {
       auto frame = encode_control_batch(batch);
       {
         std::lock_guard<std::mutex> guard(queue_mu_);
-        int64_t item_count = static_cast<int64_t>(
-            batch.sync_messages.size() + batch.verify_commit_messages.size() +
-            batch.close_messages.size());
-        send_queue_.push_back(QueuedFrame{std::move(frame), now_ns(), item_count});
-        std::ostringstream os;
-        os << "verifier_rank=" << verifier_rank_
-           << " dst_drafter_rank=" << batch.dst_drafter_rank
-           << " items=" << item_count
-           << " sync_messages=" << batch.sync_messages.size()
-           << " verify_commit_messages=" << batch.verify_commit_messages.size()
-           << " close_messages=" << batch.close_messages.size()
-           << " send_queue_after=" << send_queue_.size();
-        print_debug_buffer("draft_proxy", "enqueue_control_batch", os.str());
+        send_queue_.push_back(QueuedFrame{std::move(frame)});
       }
     }
     queue_cv_.notify_one();
@@ -1820,42 +1523,16 @@ class DecoupledSpecDraftProxyThread {
     if (it == control_send_sockets_.end()) {
       throw std::runtime_error("Missing control socket for dst_drafter_rank");
     }
-    DebugTimingScope timer("draft_proxy.send_control_batch",
-                        static_cast<int64_t>(batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                                             batch.close_messages.size()));
-    int64_t send_start_ns = now_ns();
     zmq_->api().send(it->second, queued.frame);
-    int64_t send_done_ns = now_ns();
-    std::ostringstream thread_os;
-    thread_os << "verifier_rank=" << verifier_rank_
-              << " dst_drafter_rank=" << batch.dst_drafter_rank
-              << " items=" << queued.items
-              << " enqueue_to_send_us=" << ((send_done_ns - queued.enqueue_ns) / 1000.0)
-              << " queue_delay_us=" << ((send_start_ns - queued.enqueue_ns) / 1000.0);
-    print_debug_thread("draft_proxy", "send_control_batch", thread_os.str());
-    std::ostringstream os;
-    os << "verifier_rank=" << verifier_rank_
-       << " dst_drafter_rank=" << batch.dst_drafter_rank
-       << " items=" << (batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                        batch.close_messages.size())
-       << " sync_messages=" << batch.sync_messages.size()
-       << " verify_commit_messages=" << batch.verify_commit_messages.size()
-       << " close_messages=" << batch.close_messages.size();
-    print_debug_buffer("draft_proxy", "send_control_batch", os.str());
   }
 
   void recv_tail_stream_batch(const std::string& frame) {
-    DebugTimingScope timer("draft_proxy.recv_tail_stream_batch");
     auto batch = parse_tail_stream_batch(frame);
     for (const auto& output : batch.outputs) {
       if (output.dst_verifier_rank != verifier_rank_) {
         throw std::runtime_error("Draft proxy received a tail stream batch for the wrong verifier");
       }
     }
-    std::ostringstream os;
-    os << "verifier_rank=" << verifier_rank_
-       << " items=" << batch.outputs.size();
-    print_debug_buffer("draft_proxy", "recv_tail_stream_batch", os.str());
     draft_tail_buffer_->append_draft_stream_batch_native(batch);
   }
 
@@ -1896,9 +1573,6 @@ class DecoupledSpecTokenSyncThread {
   std::string control_bind_endpoint() const { return control_bind_endpoint_; }
 
   void configure_peer_endpoints_native(const py::sequence& endpoint_rows) {
-    DebugTimingScope debug_timer(
-        "pybind.token_sync.configure_peer_endpoints_native",
-        static_cast<int64_t>(py::len(endpoint_rows)));
     check_thread_error();
     auto endpoints = py_string_vector(endpoint_rows);
     py::gil_scoped_release release;
@@ -1945,10 +1619,6 @@ class DecoupledSpecTokenSyncThread {
   }
 
   void submit_draft_results_native(const py::sequence& rows) {
-    int64_t row_count = static_cast<int64_t>(py::len(rows));
-    DebugTimingScope debug_timer(
-        "pybind.token_sync.submit_draft_results_native",
-        row_count);
     check_thread_error();
     auto batch = build_tail_stream_batch_native(rows);
     if (batch.outputs.empty()) return;
@@ -1957,12 +1627,7 @@ class DecoupledSpecTokenSyncThread {
       auto frame = encode_tail_stream_batch(batch);
       {
         std::lock_guard<std::mutex> guard(queue_mu_);
-        outgoing_results_.push_back(QueuedFrame{std::move(frame), now_ns(), row_count});
-        std::ostringstream os;
-        os << "drafter_rank=" << drafter_rank_
-           << " items=" << row_count
-           << " outgoing_queue_after=" << outgoing_results_.size();
-        print_debug_buffer("token_sync_thread", "enqueue_draft_results", os.str());
+        outgoing_results_.push_back(QueuedFrame{std::move(frame)});
       }
     }
     queue_cv_.notify_one();
@@ -1974,7 +1639,6 @@ class DecoupledSpecTokenSyncThread {
   }
 
   py::list snapshot_pending_commit_segments_native() {
-    DebugTimingScope debug_timer("pybind.token_sync.snapshot_pending_commit_segments_native");
     check_thread_error();
     std::vector<VerifierCommitSegmentCpp> segments;
     {
@@ -1989,9 +1653,6 @@ class DecoupledSpecTokenSyncThread {
   }
 
   py::tuple extract_ready_controls_native(const py::sequence& rows) {
-    DebugTimingScope debug_timer(
-        "pybind.token_sync.extract_ready_controls_native",
-        static_cast<int64_t>(py::len(rows)));
     check_thread_error();
     auto decisions = build_extract_decisions_native(rows);
     ReadyDraftControlsCpp ready;
@@ -2040,7 +1701,6 @@ class DecoupledSpecTokenSyncThread {
       did_work = drain_outgoing_results() || did_work;
       did_work = drain_control_socket() || did_work;
       if (!did_work) {
-        DebugTimingScope timer("token_sync_thread.idle_wait");
         std::unique_lock<std::mutex> lock(queue_mu_);
         queue_cv_.wait_for(lock, std::chrono::microseconds(500), [&] {
           return closed_.load() || !outgoing_results_.empty();
@@ -2051,51 +1711,16 @@ class DecoupledSpecTokenSyncThread {
 
   bool drain_outgoing_results() {
     bool did_work = false;
-    int64_t queue_size_before = 0;
-    int64_t num_result_batches = 0;
-    int64_t num_stream_outputs = 0;
-    double queue_delay_total_us = 0.0;
-    double queue_delay_max_us = 0.0;
     while (true) {
       QueuedFrame queued;
       {
         std::lock_guard<std::mutex> guard(queue_mu_);
-        if (!did_work) queue_size_before = static_cast<int64_t>(outgoing_results_.size());
         if (outgoing_results_.empty()) break;
         queued = std::move(outgoing_results_.front());
         outgoing_results_.pop_front();
       }
-      int64_t drain_start_ns = now_ns();
-      double queue_delay_us = (drain_start_ns - queued.enqueue_ns) / 1000.0;
-      queue_delay_total_us += queue_delay_us;
-      queue_delay_max_us = std::max(queue_delay_max_us, queue_delay_us);
-      num_stream_outputs += queued.items;
       send_draft_results(queued);
       did_work = true;
-      num_result_batches += 1;
-    }
-    if (did_work) {
-      int64_t queue_size_after = 0;
-      {
-        std::lock_guard<std::mutex> guard(queue_mu_);
-        queue_size_after = static_cast<int64_t>(outgoing_results_.size());
-      }
-      std::ostringstream os;
-      os << "drafter_rank=" << drafter_rank_
-         << " queue_size_before=" << queue_size_before
-         << " queue_size_after=" << queue_size_after
-         << " num_result_batches=" << num_result_batches;
-      print_debug_buffer("token_sync_thread", "drain_outgoing_results", os.str());
-      std::ostringstream thread_os;
-      thread_os << "drafter_rank=" << drafter_rank_
-                << " queue_size_before=" << queue_size_before
-                << " queue_size_after=" << queue_size_after
-                << " num_result_batches=" << num_result_batches
-                << " num_stream_outputs=" << num_stream_outputs
-                << " queue_delay_avg_us="
-                << (num_result_batches ? queue_delay_total_us / num_result_batches : 0.0)
-                << " queue_delay_max_us=" << queue_delay_max_us;
-      print_debug_thread("token_sync_thread", "draft_result_queue_delay", thread_os.str());
     }
     return did_work;
   }
@@ -2106,17 +1731,7 @@ class DecoupledSpecTokenSyncThread {
       std::string frame;
       bool received = zmq_->api().recv_nonblock(control_recv_socket_, frame);
       if (!received) break;
-      DebugTimingScope timer("token_sync_thread.recv_control_batch");
       auto batch = parse_control_batch(frame);
-      std::ostringstream os;
-      os << "drafter_rank=" << drafter_rank_
-         << " dst_drafter_rank=" << batch.dst_drafter_rank
-         << " items=" << (batch.sync_messages.size() + batch.verify_commit_messages.size() +
-                          batch.close_messages.size())
-         << " sync_messages=" << batch.sync_messages.size()
-         << " verify_commit_messages=" << batch.verify_commit_messages.size()
-         << " close_messages=" << batch.close_messages.size();
-      print_debug_buffer("token_sync_thread", "recv_control_batch", os.str());
       if (batch.dst_drafter_rank == drafter_rank_) inbox_.add_control_batch(batch);
       did_work = true;
     }
@@ -2134,23 +1749,7 @@ class DecoupledSpecTokenSyncThread {
       if (it == result_send_sockets_.end()) {
         throw std::runtime_error("Missing result socket for dst_verifier_rank");
       }
-      DebugTimingScope timer("token_sync_thread.send_result_batch",
-                          static_cast<int64_t>(kv.second.outputs.size()));
-      int64_t send_start_ns = now_ns();
       zmq_->api().send(it->second, encode_tail_stream_batch(kv.second));
-      int64_t send_done_ns = now_ns();
-      std::ostringstream thread_os;
-      thread_os << "drafter_rank=" << drafter_rank_
-                << " dst_verifier_rank=" << kv.first
-                << " items=" << kv.second.outputs.size()
-                << " enqueue_to_send_us=" << ((send_done_ns - queued.enqueue_ns) / 1000.0)
-                << " queue_delay_us=" << ((send_start_ns - queued.enqueue_ns) / 1000.0);
-      print_debug_thread("token_sync_thread", "send_result_batch", thread_os.str());
-      std::ostringstream os;
-      os << "drafter_rank=" << drafter_rank_
-         << " dst_verifier_rank=" << kv.first
-         << " items=" << kv.second.outputs.size();
-      print_debug_buffer("token_sync_thread", "send_result_batch", os.str());
     }
   }
 

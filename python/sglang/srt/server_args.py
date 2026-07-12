@@ -3522,18 +3522,6 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch in [
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3_5ForCausalLMMTP",
-        ]:
-            if not self.disable_radix_cache:
-                logger.info("Radix cache is disabled for Qwen3.5 models.")
-                self.disable_radix_cache = True
-            if self.disaggregation_decode_enable_radix_cache:
-                logger.info("Decode-side radix cache is disabled for Qwen3.5 models.")
-                self.disaggregation_decode_enable_radix_cache = False
-
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -6639,32 +6627,14 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
-        if (
-            self.speculative_algorithm == "DECOUPLED_VERIFY"
-            and self.speculative_adaptive_strategy == "throughput_aware"
-        ):
+        adaptive_config = getattr(self, "_adaptive_spec_config", None)
+        if adaptive_config is None:
             from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_decoupled_verify_throughput_aware_candidate_steps,
+                resolve_adaptive_spec_config,
             )
 
-            candidate_steps = resolve_decoupled_verify_throughput_aware_candidate_steps(
-                getattr(
-                    self,
-                    "_decoupled_verify_max_speculative_steps",
-                    self.speculative_num_steps,
-                )
-            )
-        else:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_candidate_steps_from_config,
-            )
-
-            candidate_steps = resolve_candidate_steps_from_config(
-                cfg_path=self.speculative_adaptive_config,
-            )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
+            adaptive_config = resolve_adaptive_spec_config(self)
+        return adaptive_config.max_num_draft_tokens
 
     @property
     def mamba_cache_chunk_size(self) -> int:

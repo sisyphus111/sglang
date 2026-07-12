@@ -22,10 +22,9 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.speculative.decoupled_speculation import common
+import common
 
 LOCAL_HOST = "127.0.0.1"
-DPA_DIST_INIT_PORT_BLOCK_SIZE = 6
 DPA_ENV_FIXED_PORT_COUNT = 6
 
 
@@ -429,7 +428,6 @@ def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
     for env_name in (
         "CUDA_LAUNCH_BLOCKING",
         "SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND",
-        "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):
         env_value = os.environ.get(env_name)
         if env_value:
@@ -482,41 +480,21 @@ def _port_from_dist_init_addr(addr: str | None) -> int | None:
 
 
 def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
-    if raw_ports is None:
-        return []
-    ports: list[int] = []
-    for raw_port in raw_ports.replace(",", " ").split():
-        try:
-            port = int(raw_port)
-        except ValueError as exc:
-            raise ValueError(f"invalid reserved port: {raw_port!r}") from exc
-        if port <= 0 or port > 65535:
-            raise ValueError(f"reserved port out of range: {port}")
-        ports.append(port)
-    if len(set(ports)) != len(ports):
-        raise ValueError(f"reserved ports must be unique: {ports}")
-    return ports
+    return common.parse_reserved_ports(raw_ports)
 
 
 def _target_uses_env_available_ports(args: argparse.Namespace) -> bool:
-    return args.target_use_env_ports
+    return common.target_uses_env_available_ports(args)
 
 
 def _target_dp_attention_uses_dist_init_derived_ports(
     args: argparse.Namespace,
 ) -> bool:
-    return (
-        args.target_enable_dp_attention
-        and not args.target_use_env_ports
-    )
+    return common.target_dp_attention_uses_dist_init_derived_ports(args)
 
 
 def _dist_init_port_stride(args: argparse.Namespace) -> int:
-    return (
-        DPA_DIST_INIT_PORT_BLOCK_SIZE
-        if _target_dp_attention_uses_dist_init_derived_ports(args)
-        else 1
-    )
+    return common.dist_init_port_stride(args)
 
 
 def _reserved_port_block_bases(
@@ -525,25 +503,9 @@ def _reserved_port_block_bases(
     num_blocks: int,
     block_size: int,
 ) -> list[int]:
-    required_ports = num_blocks * block_size
-    if len(reserved_ports) < required_ports:
-        raise ValueError(
-            f"--reserved-ports provides {len(reserved_ports)} ports, but this "
-            f"run needs {required_ports}"
-        )
-    bases = []
-    for block_index in range(num_blocks):
-        start = block_index * block_size
-        block = reserved_ports[start : start + block_size]
-        expected = list(range(block[0], block[0] + block_size))
-        if block != expected:
-            raise ValueError(
-                "DP attention requires each reserved dist-init allocation to be "
-                f"a contiguous {block_size}-port block; block {block_index} is "
-                f"{block}, expected {expected}"
-            )
-        bases.append(block[0])
-    return bases
+    return common.reserved_port_block_bases(
+        reserved_ports, num_blocks=num_blocks, block_size=block_size
+    )
 
 
 def _allocate_local_ports(
@@ -743,9 +705,7 @@ def _select_target_available_ports(
 
 
 def get_target_engine_tp_size(args: argparse.Namespace) -> int:
-    if args.target_enable_dp_attention:
-        return args.target_tp_size * args.target_dp_size
-    return args.target_tp_size
+    return common.get_target_engine_tp_size(args)
 
 
 def validate_single_node_args(args: argparse.Namespace) -> None:

@@ -250,10 +250,6 @@ from sglang.srt.speculative.dflash_utils import (
     should_delay_dflash_prefill_for_batching,
     validate_dflash_request,
 )
-from sglang.srt.speculative.decoupled_spec_io import (
-    decoupled_spec_print_timing,
-    decoupled_spec_timing_start,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -3261,31 +3257,10 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        decoupled_timing_role = None
-        if self.spec_algorithm.is_decoupled_verify() and self.is_verify_entry_rank():
-            decoupled_timing_role = "verifier"
-        elif self.spec_algorithm.is_decoupled_draft() and self.is_draft_entry_rank():
-            decoupled_timing_role = "drafter"
-
-        decoupled_iter_start_ns = (
-            decoupled_spec_timing_start() if decoupled_timing_role is not None else 0
-        )
-        decoupled_prepare_start_ns = decoupled_iter_start_ns
         if self.spec_algorithm.is_decoupled_verify():
             self.prepare_verify_inputs(batch)
         if self.spec_algorithm.is_decoupled_draft():
             self.prepare_draft_mamba_routing(batch)
-        if decoupled_timing_role is not None:
-            decoupled_spec_print_timing(
-                component=f"scheduler.{decoupled_timing_role}",
-                op=f"iter.prepare.{batch.forward_mode.name.lower()}",
-                start_ns=decoupled_prepare_start_ns,
-                items=batch.batch_size(),
-            )
-
-        decoupled_forward_call_start_ns = (
-            decoupled_spec_timing_start() if decoupled_timing_role is not None else 0
-        )
 
         # Run forward
         if self.is_generation:
@@ -3441,16 +3416,6 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
-        if decoupled_timing_role is not None:
-            decoupled_spec_print_timing(
-                component=f"scheduler.{decoupled_timing_role}",
-                op=f"iter.forward_call.{batch.forward_mode.name.lower()}",
-                start_ns=decoupled_forward_call_start_ns,
-                items=batch.batch_size(),
-            )
-            ret.decoupled_timing_role = decoupled_timing_role
-            ret.decoupled_iter_start_ns = decoupled_iter_start_ns
-
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3505,10 +3470,6 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        decoupled_timing_role = getattr(result, "decoupled_timing_role", None)
-        decoupled_process_start_ns = (
-            decoupled_spec_timing_start() if decoupled_timing_role is not None else 0
-        )
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
@@ -3525,39 +3486,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        if decoupled_timing_role is not None:
-            decoupled_spec_print_timing(
-                component=f"scheduler.{decoupled_timing_role}",
-                op=f"iter.process_result.{batch.forward_mode.name.lower()}",
-                start_ns=decoupled_process_start_ns,
-                items=batch.batch_size(),
-            )
-
-        decoupled_submit_start_ns = (
-            decoupled_spec_timing_start()
-            if decoupled_timing_role == "verifier"
-            else 0
-        )
         if self.spec_algorithm.is_decoupled_verify():
             self.submit_verify_updates(batch)
-        if decoupled_timing_role == "verifier":
-            decoupled_spec_print_timing(
-                component="scheduler.verifier",
-                op=f"iter.submit_updates.{batch.forward_mode.name.lower()}",
-                start_ns=decoupled_submit_start_ns,
-                items=batch.batch_size(),
-            )
-
-        decoupled_iter_start_ns = getattr(result, "decoupled_iter_start_ns", None)
-        if decoupled_timing_role is not None and decoupled_iter_start_ns:
-            decoupled_spec_print_timing(
-                component=f"scheduler.{decoupled_timing_role}",
-                op=f"iter.total.{batch.forward_mode.name.lower()}",
-                start_ns=decoupled_iter_start_ns,
-                items=batch.batch_size(),
-            )
-            result.decoupled_timing_role = None
-            result.decoupled_iter_start_ns = None
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 

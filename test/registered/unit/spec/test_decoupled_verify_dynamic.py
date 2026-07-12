@@ -19,7 +19,9 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftTailStreamOutputBatch,
 )
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpecConfig
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.decoupled_verify_state import DecoupledVerifySnapshot
 from sglang.srt.speculative.spec_info import DecoupledVerifySpecAlgo
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -130,9 +132,15 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         worker.enable_adaptive_verify = True
         worker.speculative_num_steps = 1
         worker.speculative_num_draft_tokens = 2
+        worker.adaptive_config = AdaptiveSpecConfig(
+            strategy="throughput_aware",
+            candidate_steps=(0, 1, 2),
+            initial_steps=1,
+            max_num_draft_tokens=3,
+            params_config=None,
+        )
         worker.server_args = SimpleNamespace(
             speculative_adaptive_strategy="throughput_aware",
-            _decoupled_verify_max_speculative_steps=2,
             decoupled_verify_throughput_profile_path=cache_path,
             decoupled_verify_throughput_profile_ctx_lens="256",
             model_path="/models/target-model",
@@ -267,8 +275,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertEqual(scheduler.activations, [2])
         self.assertFalse(hasattr(batch, self.runtime_state_attr_name))
         for req in batch.reqs:
-            self.assertEqual(req._decoupled_verify_num_speculative_steps, 3)
-            self.assertEqual(req._decoupled_verify_tokens_per_req, 4)
+            self.assertEqual(req.decoupled_verify_snapshot.pre_committed_len, 2)
             self.assertEqual(req.kv_committed_len, 2)
 
     def test_scheduler_zero_step_uses_active_worker_config(self):
@@ -282,9 +289,30 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         self.assertEqual(scheduler.activations, [2])
         self.assertFalse(hasattr(batch, self.runtime_state_attr_name))
         for req in batch.reqs:
-            self.assertEqual(req._decoupled_verify_num_speculative_steps, 0)
-            self.assertEqual(req._decoupled_verify_tokens_per_req, 1)
+            self.assertEqual(req.decoupled_verify_snapshot.pre_committed_len, 2)
             self.assertEqual(req.kv_committed_len, 2)
+
+    def test_scheduler_reuses_live_request_snapshot_storage(self):
+        scheduler = _Scheduler(steps=0, draft_tokens=1)
+        batch = _Batch()
+
+        SchedulerDecoupledVerifyMixin._prepare_verify_decode_inputs(
+            scheduler, batch
+        )
+        snapshots = [req.decoupled_verify_snapshot for req in batch.reqs]
+        draft_token_lists = [snapshot.draft_tokens for snapshot in snapshots]
+        snapshots[0].draft_tokens.extend([10, 11])
+
+        SchedulerDecoupledVerifyMixin._prepare_verify_decode_inputs(
+            scheduler, batch
+        )
+
+        for req, snapshot, draft_tokens in zip(
+            batch.reqs, snapshots, draft_token_lists
+        ):
+            self.assertIs(req.decoupled_verify_snapshot, snapshot)
+            self.assertIs(snapshot.draft_tokens, draft_tokens)
+            self.assertEqual(snapshot.draft_tokens, [])
 
     def test_verify_worker_activate_step_by_batch_applies_state(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
@@ -316,7 +344,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             def __init__(self):
                 self.activated_steps = []
 
-            def activate_step_by_batch(self, batch_size):
+            def activate_step_by_batch(self, batch_size, ctx_len=1):
                 self.batch_size = batch_size
                 self.activated_steps.append(3)
                 VerifyWorker.apply_runtime_state(worker, state)
@@ -339,7 +367,9 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
         req = SimpleNamespace(
             rid="req-a",
-            draft_buffer=[10],
+            decoupled_verify_snapshot=DecoupledVerifySnapshot(
+                pre_committed_len=2, draft_tokens=[10]
+            ),
             kv_committed_len=2,
             kv_allocated_len=2,
             spec_valid_draft_tokens=0,
@@ -653,7 +683,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not selected"):
             VerifyWorker._validate_decoupled_runtime_state(worker, state)
 
-    def test_throughput_profile_draft_buffers_populate_nonzero_steps(self):
+    def test_throughput_profile_draft_snapshots_populate_nonzero_steps(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
@@ -665,11 +695,19 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             ]
         )
 
-        VerifyWorker._prepare_throughput_profile_draft_buffers(worker, batch, 3)
+        VerifyWorker._prepare_throughput_profile_draft_snapshots(worker, batch, 3)
 
-        self.assertEqual([len(req.draft_buffer) for req in batch.reqs], [3, 3])
+        self.assertEqual(
+            [len(req.decoupled_verify_snapshot.draft_tokens) for req in batch.reqs],
+            [3, 3],
+        )
         for req in batch.reqs:
-            self.assertTrue(all(1 <= token_id < 100 for token_id in req.draft_buffer))
+            self.assertTrue(
+                all(
+                    1 <= token_id < 100
+                    for token_id in req.decoupled_verify_snapshot.draft_tokens
+                )
+            )
 
     def test_throughput_profile_capture_bs_uses_decode_graph_buckets(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
@@ -725,8 +763,14 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
         worker = object.__new__(VerifyWorker)
+        worker.adaptive_config = AdaptiveSpecConfig(
+            strategy="throughput_aware",
+            candidate_steps=(0, 1, 2),
+            initial_steps=1,
+            max_num_draft_tokens=3,
+            params_config=None,
+        )
         worker.server_args = SimpleNamespace(
-            _decoupled_verify_max_speculative_steps=2,
             speculative_num_steps=1,
             cuda_graph_config=SimpleNamespace(
                 decode=SimpleNamespace(bs=[8, 4], max_bs=None)
@@ -775,9 +819,15 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         worker.enable_adaptive_verify = True
         worker.speculative_num_steps = 1
         worker.speculative_num_draft_tokens = 2
+        worker.adaptive_config = AdaptiveSpecConfig(
+            strategy="throughput_aware",
+            candidate_steps=(0, 1, 2),
+            initial_steps=1,
+            max_num_draft_tokens=3,
+            params_config=None,
+        )
         worker.server_args = SimpleNamespace(
             speculative_adaptive_strategy="throughput_aware",
-            _decoupled_verify_max_speculative_steps=2,
             decoupled_verify_throughput_profile_path=None,
             decoupled_verify_throughput_profile_ctx_lens="256",
         )
@@ -813,7 +863,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with (
             patch.object(VerifyWorker, "_profile_throughput_shape", profile_shape),
             patch(
-                "sglang.srt.speculative.decoupled_verify_worker.log_info_on_rank0"
+                "sglang.srt.speculative.decoupled_verify_profiler.log_info_on_rank0"
             ),
         ):
             VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
@@ -846,8 +896,14 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
 
         worker = object.__new__(VerifyWorker)
         worker.speculative_num_steps = 5
+        worker.adaptive_config = AdaptiveSpecConfig(
+            strategy="throughput_aware",
+            candidate_steps=(0, 1, 2, 3, 4, 5),
+            initial_steps=5,
+            max_num_draft_tokens=6,
+            params_config=None,
+        )
         worker.server_args = SimpleNamespace(
-            _decoupled_verify_max_speculative_steps=5,
             chunked_prefill_size=8192,
             max_prefill_tokens=16384,
         )
@@ -877,7 +933,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch(
-                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                "sglang.srt.speculative.decoupled_verify_profiler.get_device_name",
                 return_value="NVIDIA H100",
             ),
         ):
@@ -901,7 +957,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                     side_effect=AssertionError("cache hit should not profile"),
                 ),
                 patch(
-                    "sglang.srt.speculative.decoupled_verify_worker.log_info_on_rank0"
+                    "sglang.srt.speculative.decoupled_verify_profiler.log_info_on_rank0"
                 ) as log_mock,
             ):
                 VerifyWorker.run_startup_spec_profiling(worker, tree_cache=object())
@@ -930,7 +986,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch(
-                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                "sglang.srt.speculative.decoupled_verify_profiler.get_device_name",
                 return_value="NVIDIA H100",
             ),
         ):
@@ -956,7 +1012,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                     profile_shape,
                 ),
                 patch(
-                    "sglang.srt.speculative.decoupled_verify_worker."
+                    "sglang.srt.speculative.decoupled_verify_profiler."
                     "log_info_on_rank0"
                 ),
             ):
@@ -980,7 +1036,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch(
-                "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                "sglang.srt.speculative.decoupled_verify_profiler.get_device_name",
                 return_value="NVIDIA H100",
             ),
         ):
@@ -1006,7 +1062,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                     profile_shape,
                 ),
                 patch(
-                    "sglang.srt.speculative.decoupled_verify_worker."
+                    "sglang.srt.speculative.decoupled_verify_profiler."
                     "log_info_on_rank0"
                 ) as log_mock,
             ):
@@ -1040,7 +1096,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                 self.subTest(case=case),
                 tempfile.TemporaryDirectory() as tmpdir,
                 patch(
-                    "sglang.srt.speculative.decoupled_verify_worker.get_device_name",
+                    "sglang.srt.speculative.decoupled_verify_profiler.get_device_name",
                     return_value="NVIDIA H100",
                 ),
             ):
@@ -1093,7 +1149,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                         profile_shape,
                     ),
                     patch(
-                        "sglang.srt.speculative.decoupled_verify_worker."
+                        "sglang.srt.speculative.decoupled_verify_profiler."
                         "log_info_on_rank0"
                     ),
                 ):

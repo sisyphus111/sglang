@@ -13,9 +13,6 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
     VerifyCommit,
-    decoupled_spec_print_buffer,
-    decoupled_spec_print_timing,
-    decoupled_spec_timing_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -211,118 +208,18 @@ class DraftTailBuffer:
     def _close_request_locked(self, message: DraftClose) -> None:
         self._states.pop(message.request_id, None)
 
-    def _print_buffer_debug_locked(
-        self,
-        *,
-        op: str,
-        items: int = 0,
-        snapshot_raw_lens: list[int] | None = None,
-        snapshot_returned_lens: list[int] | None = None,
-        tail_cap: int | None = None,
-        allow_partial: bool | None = None,
-    ) -> None:
-        raw_lens = [len(state.tail_tokens) for state in self._states.values()]
-        consumable_lens = [
-            state.consumable_tail_len() for state in self._states.values()
-        ]
-        pending_lens = [
-            len(state.pending_expected_tokens) for state in self._states.values()
-        ]
-        required_tail_len = int(self.required_tail_len)
-        fields = {
-            "verifier_rank": int(self.verifier_rank),
-            "items": int(items),
-            "active_reqs": len(self._states),
-            "required_tail_len": required_tail_len,
-            "raw_tail_total": sum(raw_lens),
-            "raw_tail_avg": (sum(raw_lens) / len(raw_lens) if raw_lens else 0.0),
-            "raw_tail_max": max(raw_lens) if raw_lens else 0,
-            "raw_ge_required_reqs": sum(
-                1 for value in raw_lens if value >= required_tail_len
-            ),
-            "consumable_tail_total": sum(consumable_lens),
-            "consumable_tail_avg": (
-                sum(consumable_lens) / len(consumable_lens)
-                if consumable_lens
-                else 0.0
-            ),
-            "consumable_tail_max": max(consumable_lens) if consumable_lens else 0,
-            "consumable_ge_required_reqs": sum(
-                1 for value in consumable_lens if value >= required_tail_len
-            ),
-            "pending_expected_total": sum(pending_lens),
-            "pending_expected_reqs": sum(1 for value in pending_lens if value > 0),
-        }
-        if tail_cap is not None:
-            fields["tail_cap"] = int(tail_cap)
-            fields["raw_ge_cap_reqs"] = sum(
-                1 for value in raw_lens if value >= int(tail_cap)
-            )
-            fields["consumable_ge_cap_reqs"] = sum(
-                1 for value in consumable_lens if value >= int(tail_cap)
-            )
-        if allow_partial is not None:
-            fields["allow_partial"] = bool(allow_partial)
-        if snapshot_raw_lens is not None:
-            fields["snapshot_reqs"] = len(snapshot_raw_lens)
-            fields["snapshot_raw_total"] = sum(snapshot_raw_lens)
-            fields["snapshot_raw_avg"] = (
-                sum(snapshot_raw_lens) / len(snapshot_raw_lens)
-                if snapshot_raw_lens
-                else 0.0
-            )
-            fields["snapshot_raw_max"] = (
-                max(snapshot_raw_lens) if snapshot_raw_lens else 0
-            )
-        if snapshot_returned_lens is not None:
-            fields["snapshot_returned_total"] = sum(snapshot_returned_lens)
-            fields["snapshot_returned_avg"] = (
-                sum(snapshot_returned_lens) / len(snapshot_returned_lens)
-                if snapshot_returned_lens
-                else 0.0
-            )
-            fields["snapshot_returned_max"] = (
-                max(snapshot_returned_lens) if snapshot_returned_lens else 0
-            )
-        decoupled_spec_print_buffer(
-            component="draft_tail_buffer",
-            op=op,
-            **fields,
-        )
-
     def apply_control_batch(
         self,
         batch: DraftControlBatch,
     ) -> None:
-        start_ns = decoupled_spec_timing_start()
-        try:
-            with self._condition:
-                for message in batch.sync_messages:
-                    self._open_request_locked(message)
-                for message in batch.verify_commit_messages:
-                    self._apply_commit_locked(message)
-                for message in batch.close_messages:
-                    self._close_request_locked(message)
-                self._condition.notify_all()
-                self._print_buffer_debug_locked(
-                    op="apply_control_batch",
-                    items=(
-                        len(batch.sync_messages)
-                        + len(batch.verify_commit_messages)
-                        + len(batch.close_messages)
-                    ),
-                )
-        finally:
-            decoupled_spec_print_timing(
-                component="draft_tail_buffer",
-                op="apply_control_batch",
-                start_ns=start_ns,
-                items=(
-                    len(batch.sync_messages)
-                    + len(batch.verify_commit_messages)
-                    + len(batch.close_messages)
-                ),
-            )
+        with self._condition:
+            for message in batch.sync_messages:
+                self._open_request_locked(message)
+            for message in batch.verify_commit_messages:
+                self._apply_commit_locked(message)
+            for message in batch.close_messages:
+                self._close_request_locked(message)
+            self._condition.notify_all()
 
     def append_draft_stream_batch(
         self,
@@ -330,23 +227,10 @@ class DraftTailBuffer:
     ) -> None:
         if not batch.outputs:
             return
-        start_ns = decoupled_spec_timing_start()
-        try:
-            with self._condition:
-                for output in batch.outputs:
-                    self._push_one_locked(batch, output)
-                self._condition.notify_all()
-                self._print_buffer_debug_locked(
-                    op="append_draft_stream_batch",
-                    items=len(batch.outputs),
-                )
-        finally:
-            decoupled_spec_print_timing(
-                component="draft_tail_buffer",
-                op="append_draft_stream_batch",
-                start_ns=start_ns,
-                items=len(batch.outputs),
-            )
+        with self._condition:
+            for output in batch.outputs:
+                self._push_one_locked(batch, output)
+            self._condition.notify_all()
 
     def _push_one_locked(
         self,
@@ -557,51 +441,32 @@ class DraftTailBuffer:
         allow_partial: bool = True,
         max_tail_len: int | None = None,
     ) -> list[DraftTailSnapshot]:
-        start_ns = decoupled_spec_timing_start()
         tail_cap = None if max_tail_len is None else max(0, int(max_tail_len))
-        try:
-            with self._condition:
-                self.last_draft_wait_ns = 0
-                if not allow_partial:
-                    required_tail_len = self.required_tail_len
-                    if tail_cap is not None:
-                        required_tail_len = min(required_tail_len, tail_cap)
-                    min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
-                    self.last_draft_wait_ns = self._wait_for_draft_tokens_locked(
-                        [req.rid for req in reqs], min_raw_tail_len
-                    )
-
-                snapshots: list[DraftTailSnapshot] = []
-                for req in reqs:
-                    state = self._states.get(req.rid)
-                    assert state, f"unexpected request_id={req.rid}"
-                    snapshots.append(
-                        DraftTailSnapshot(
-                            request_id=req.rid,
-                            committed_len=int(state.committed_len),
-                            tail_tokens=(
-                                state.consumable_tail_tokens()
-                                if tail_cap is None
-                                else state.consumable_tail_tokens()[:tail_cap]
-                            ),
-                            raw_tail_len=len(state.tail_tokens),
-                        )
-                    )
-                self._print_buffer_debug_locked(
-                    op="get_draft_snapshots",
-                    items=len(reqs),
-                    snapshot_raw_lens=[snapshot.raw_tail_len for snapshot in snapshots],
-                    snapshot_returned_lens=[
-                        len(snapshot.tail_tokens) for snapshot in snapshots
-                    ],
-                    tail_cap=tail_cap,
-                    allow_partial=allow_partial,
+        with self._condition:
+            self.last_draft_wait_ns = 0
+            if not allow_partial:
+                required_tail_len = self.required_tail_len
+                if tail_cap is not None:
+                    required_tail_len = min(required_tail_len, tail_cap)
+                min_raw_tail_len = max(0 if tail_cap == 0 else 1, required_tail_len)
+                self.last_draft_wait_ns = self._wait_for_draft_tokens_locked(
+                    [req.rid for req in reqs], min_raw_tail_len
                 )
-                return snapshots
-        finally:
-            decoupled_spec_print_timing(
-                component="draft_tail_buffer",
-                op="get_draft_snapshots",
-                start_ns=start_ns,
-                items=len(reqs),
-            )
+
+            snapshots: list[DraftTailSnapshot] = []
+            for req in reqs:
+                state = self._states.get(req.rid)
+                assert state, f"unexpected request_id={req.rid}"
+                snapshots.append(
+                    DraftTailSnapshot(
+                        request_id=req.rid,
+                        committed_len=int(state.committed_len),
+                        tail_tokens=(
+                            state.consumable_tail_tokens()
+                            if tail_cap is None
+                            else state.consumable_tail_tokens()[:tail_cap]
+                        ),
+                        raw_tail_len=len(state.tail_tokens),
+                    )
+                )
+            return snapshots

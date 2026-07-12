@@ -9,6 +9,7 @@ import bisect
 import json
 import logging
 import math
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,17 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
         "ceiling_coeff": 0,
     },
 }
+
+
+@dataclass(frozen=True)
+class AdaptiveSpecConfig:
+    """Normalized adaptive-spec configuration shared by setup and workers."""
+
+    strategy: str
+    candidate_steps: tuple[int, ...]
+    initial_steps: int
+    max_num_draft_tokens: int
+    params_config: dict | None = None
 
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
@@ -164,6 +176,45 @@ def resolve_decoupled_verify_throughput_aware_candidate_steps(
             f"--speculative-num-steps, got {max_steps}."
         )
     return list(range(max_steps + 1))
+
+
+def resolve_adaptive_spec_config(server_args: ServerArgs) -> AdaptiveSpecConfig:
+    strategy = server_args.speculative_adaptive_strategy
+    is_decoupled_verify = server_args.speculative_algorithm == "DECOUPLED_VERIFY"
+    is_throughput_aware = strategy == "throughput_aware"
+
+    params_config = None
+    if is_throughput_aware:
+        if not is_decoupled_verify:
+            raise ValueError(
+                "--speculative-adaptive-strategy=throughput_aware is currently "
+                "supported for DECOUPLED_VERIFY only in this branch."
+            )
+        candidate_steps = resolve_decoupled_verify_throughput_aware_candidate_steps(
+            server_args.speculative_num_steps
+        )
+        initial_steps = min(step for step in candidate_steps if step > 0)
+    else:
+        params_config, _ = _resolve_adaptive_config(
+            cfg_path=server_args.speculative_adaptive_config
+        )
+        candidate_steps = resolve_candidate_steps_from_config(config=params_config)
+        initial_steps = server_args.speculative_num_steps
+        if initial_steps is None:
+            initial_steps = candidate_steps[len(candidate_steps) // 2]
+        if initial_steps not in candidate_steps:
+            raise ValueError(
+                f"--speculative-num-steps={initial_steps} is not in the adaptive "
+                f"config candidate_steps {candidate_steps}. Pass one of those values."
+            )
+
+    return AdaptiveSpecConfig(
+        strategy=strategy,
+        candidate_steps=tuple(candidate_steps),
+        initial_steps=int(initial_steps),
+        max_num_draft_tokens=max(candidate_steps) + 1,
+        params_config=params_config,
+    )
 
 
 class AdaptiveStepSlot:

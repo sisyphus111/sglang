@@ -1,126 +1,8 @@
 from __future__ import annotations
 
-import os
-import sys
-import threading
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
-
-
-def _decoupled_spec_env_flag_enabled(name: str) -> bool:
-    value = os.environ.get(name)
-    if not value:
-        return False
-    return value.lower() not in ("0", "false", "off", "no")
-
-
-def decoupled_spec_timing_start() -> int:
-    if not _decoupled_spec_env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_TIMING"):
-        return 0
-    return time.perf_counter_ns()
-
-
-def decoupled_spec_print_timing(
-    *, component: str, op: str, start_ns: int, items: int = 0
-) -> None:
-    if start_ns <= 0:
-        return
-    duration_ns = time.perf_counter_ns() - start_ns
-    print(
-        "[decoupled-spec-timing] "
-        f"impl=py component={component} op={op} ns={duration_ns} items={items}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-_DEBUG_BUFFER_PRINT_LOCK = threading.Lock()
-_DEBUG_BUFFER_LAST_PRINT_NS: dict[str, int] = {}
-_DEBUG_THREAD_PRINT_LOCK = threading.Lock()
-_DEBUG_THREAD_LAST_PRINT_NS: dict[str, int] = {}
-
-
-def decoupled_spec_debug_buffer_enabled() -> bool:
-    return _decoupled_spec_env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_BUFFER")
-
-
-def decoupled_spec_print_buffer(
-    *, component: str, op: str, force: bool = False, **fields
-) -> None:
-    if not decoupled_spec_debug_buffer_enabled():
-        return
-    key = f"{component}:{op}"
-    now_ns = time.perf_counter_ns()
-    interval_ms = int(os.environ.get("SGLANG_DECOUPLED_SPEC_DEBUG_BUFFER_INTERVAL_MS", "1000"))
-    interval_ns = max(0, interval_ms) * 1_000_000
-    if not force and interval_ns > 0:
-        with _DEBUG_BUFFER_PRINT_LOCK:
-            last_ns = _DEBUG_BUFFER_LAST_PRINT_NS.get(key, 0)
-            if now_ns - last_ns < interval_ns:
-                return
-            _DEBUG_BUFFER_LAST_PRINT_NS[key] = now_ns
-
-    def format_value(value) -> str:
-        if isinstance(value, bool):
-            return "1" if value else "0"
-        if isinstance(value, float):
-            return f"{value:.3f}"
-        text = str(value)
-        return text.replace(" ", "_")
-
-    payload = " ".join(
-        f"{name}={format_value(value)}" for name, value in sorted(fields.items())
-    )
-    print(
-        "[decoupled-spec-buffer] "
-        f"impl=py component={component} op={op} {payload}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-def decoupled_spec_debug_thread_enabled() -> bool:
-    return _decoupled_spec_env_flag_enabled("SGLANG_DECOUPLED_SPEC_DEBUG_THREAD")
-
-
-def decoupled_spec_print_thread(
-    *, component: str, op: str, force: bool = False, **fields
-) -> None:
-    if not decoupled_spec_debug_thread_enabled():
-        return
-    key = f"{component}:{op}"
-    now_ns = time.perf_counter_ns()
-    interval_ms = int(
-        os.environ.get("SGLANG_DECOUPLED_SPEC_DEBUG_THREAD_INTERVAL_MS", "0")
-    )
-    interval_ns = max(0, interval_ms) * 1_000_000
-    if not force and interval_ns > 0:
-        with _DEBUG_THREAD_PRINT_LOCK:
-            last_ns = _DEBUG_THREAD_LAST_PRINT_NS.get(key, 0)
-            if now_ns - last_ns < interval_ns:
-                return
-            _DEBUG_THREAD_LAST_PRINT_NS[key] = now_ns
-
-    def format_value(value) -> str:
-        if isinstance(value, bool):
-            return "1" if value else "0"
-        if isinstance(value, float):
-            return f"{value:.3f}"
-        text = str(value)
-        return text.replace(" ", "_")
-
-    payload = " ".join(
-        f"{name}={format_value(value)}" for name, value in sorted(fields.items())
-    )
-    print(
-        "[decoupled-spec-thread] "
-        f"impl=py component={component} op={op} {payload}",
-        file=sys.stderr,
-        flush=True,
-    )
-
 
 class DraftMeshMessageType(str, Enum):
     CONTROL_BATCH = "control_batch"
@@ -383,26 +265,13 @@ class DraftControlInbox:
         )
 
     def add_control_batch_locked(self, batch: DraftControlBatch) -> None:
-        start_ns = decoupled_spec_timing_start()
-        try:
-            for message in batch.close_messages:
-                self.add_close_key_locked(message.draft_key)
-            for message in batch.sync_messages:
-                if message.draft_key not in self.close_keys:
-                    self.sync_messages.append(message)
-            for message in batch.verify_commit_messages:
-                self.add_verify_commit_locked(message)
-        finally:
-            decoupled_spec_print_timing(
-                component="control_inbox",
-                op="add_control_batch",
-                start_ns=start_ns,
-                items=(
-                    len(batch.sync_messages)
-                    + len(batch.verify_commit_messages)
-                    + len(batch.close_messages)
-                ),
-            )
+        for message in batch.close_messages:
+            self.add_close_key_locked(message.draft_key)
+        for message in batch.sync_messages:
+            if message.draft_key not in self.close_keys:
+                self.sync_messages.append(message)
+        for message in batch.verify_commit_messages:
+            self.add_verify_commit_locked(message)
 
     def add_close_key_locked(self, draft_key: DraftReqKey) -> None:
         self.close_keys.add(draft_key)
@@ -432,37 +301,28 @@ class DraftControlInbox:
         self,
         consumable_commit_len: Callable[[VerifierCommitSegment], int],
     ) -> "ReadyDraftControls":
-        start_ns = decoupled_spec_timing_start()
-        try:
-            ready_controls = ReadyDraftControls()
+        ready_controls = ReadyDraftControls()
 
-            if self.close_keys:
-                ready_controls.close_keys = self.close_keys
-                self.close_keys = set()
+        if self.close_keys:
+            ready_controls.close_keys = self.close_keys
+            self.close_keys = set()
 
-            if self.sync_messages:
-                ready_controls.sync_messages = self.sync_messages
-                self.sync_messages = []
+        if self.sync_messages:
+            ready_controls.sync_messages = self.sync_messages
+            self.sync_messages = []
 
-            for draft_key, segment in list(self.verifier_commit_segments.items()):
-                consumable_len = consumable_commit_len(segment)
-                if consumable_len <= 0:
-                    continue
+        for draft_key, segment in list(self.verifier_commit_segments.items()):
+            consumable_len = consumable_commit_len(segment)
+            if consumable_len <= 0:
+                continue
 
-                ready_controls.ready_commit_segments.append(
-                    segment.extract_prefix(consumable_len)
-                )
-                if not segment.committed_token_ids:
-                    self.verifier_commit_segments.pop(draft_key, None)
-
-            return ready_controls
-        finally:
-            decoupled_spec_print_timing(
-                component="control_inbox",
-                op="extract_ready_controls",
-                start_ns=start_ns,
-                items=len(self.verifier_commit_segments),
+            ready_controls.ready_commit_segments.append(
+                segment.extract_prefix(consumable_len)
             )
+            if not segment.committed_token_ids:
+                self.verifier_commit_segments.pop(draft_key, None)
+
+        return ready_controls
 
 
 @dataclass

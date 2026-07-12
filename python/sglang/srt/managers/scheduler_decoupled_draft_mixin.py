@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from contextlib import suppress
 from array import array
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
@@ -12,10 +12,8 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.cpp_decoupled_spec import CppTokenSyncThread
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlInbox,
     DraftReqKey,
@@ -25,19 +23,18 @@ from sglang.srt.speculative.decoupled_spec_io import (
     ReadyDraftControls,
     VerifierCommitSegment,
     build_draft_scheduler_rid,
-    decoupled_spec_print_buffer,
-    decoupled_spec_print_timing,
-    decoupled_spec_timing_start,
     parse_draft_scheduler_rid,
 )
-from sglang.srt.speculative.token_sync_thread import TokenSyncThread
+from sglang.srt.speculative.decoupled_spec_transport import (
+    get_decoupled_spec_transport,
+)
+from sglang.srt.speculative.decoupled_draft_mamba import (
+    DecoupledDraftMambaStateManager,
+)
 from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass
 class DraftReqState:
@@ -105,15 +102,12 @@ class SchedulerDecoupledDraftMixin:
     """Drafter-side scheduler hooks for decoupled speculation."""
 
     def start_token_sync_thread(self: Scheduler) -> None:
+        self.decoupled_draft_mamba = DecoupledDraftMambaStateManager(self)
         self.token_sync_thread = None
         if not self.is_draft_entry_rank():
             return
-        token_sync_cls = (
-            CppTokenSyncThread
-            if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
-            else TokenSyncThread
-        )
-        self.token_sync_thread = token_sync_cls(
+        transport = get_decoupled_spec_transport()
+        self.token_sync_thread = transport.token_sync_thread_cls(
             context=self.ipc_channels.context,
             drafter_rank=self.get_decoupled_spec_rank(),
         )
@@ -130,14 +124,7 @@ class SchedulerDecoupledDraftMixin:
             emit_candidate_indices = list(range(len(batch.reqs)))
         else:
             emit_candidate_indices = list(req_indices)
-        draft_ahead_lens: list[int] = []
-        for req in batch.reqs:
-            state = self._get_draft_state_by_req(req)
-            draft_ahead_lens.append(
-                max(0, len(req.output_ids) - int(state.verifier_committed_prefix_len))
-            )
-
-        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+        if get_decoupled_spec_transport().supports_native_rows:
             stream_output_rows: list[tuple] = []
             src_drafter_rank = self.get_decoupled_spec_rank()
             for req_batch_idx in emit_candidate_indices:
@@ -172,25 +159,6 @@ class SchedulerDecoupledDraftMixin:
                         "C++ decoupled token sync thread does not expose row API"
                     )
                 submit_rows(stream_output_rows)
-            decoupled_spec_print_buffer(
-                component="scheduler.drafter",
-                op="emit_draft_tokens",
-                drafter_rank=int(self.get_decoupled_spec_rank()),
-                num_emit_candidates=len(emit_candidate_indices),
-                num_stream_outputs=len(stream_output_rows),
-                draft_ahead_total=sum(draft_ahead_lens),
-                draft_ahead_avg=(
-                    sum(draft_ahead_lens) / len(draft_ahead_lens)
-                    if draft_ahead_lens
-                    else 0.0
-                ),
-                draft_ahead_max=max(draft_ahead_lens) if draft_ahead_lens else 0,
-                draft_ahead_ge_required_reqs=sum(
-                    1
-                    for value in draft_ahead_lens
-                    if value >= int(self.server_args.speculative_num_steps or 0)
-                ),
-            )
             return None
 
         stream_output_batch = DraftTailStreamOutputBatch()
@@ -220,25 +188,6 @@ class SchedulerDecoupledDraftMixin:
 
         if stream_output_batch.outputs and self.is_draft_entry_rank():
             self._get_token_sync_thread().submit_draft_results(stream_output_batch)
-        decoupled_spec_print_buffer(
-            component="scheduler.drafter",
-            op="emit_draft_tokens",
-            drafter_rank=int(self.get_decoupled_spec_rank()),
-            num_emit_candidates=len(emit_candidate_indices),
-            num_stream_outputs=len(stream_output_batch.outputs),
-            draft_ahead_total=sum(draft_ahead_lens),
-            draft_ahead_avg=(
-                sum(draft_ahead_lens) / len(draft_ahead_lens)
-                if draft_ahead_lens
-                else 0.0
-            ),
-            draft_ahead_max=max(draft_ahead_lens) if draft_ahead_lens else 0,
-            draft_ahead_ge_required_reqs=sum(
-                1
-                for value in draft_ahead_lens
-                if value >= int(self.server_args.speculative_num_steps or 0)
-            ),
-        )
         return stream_output_batch
 
     def _broadcast_ready_draft_controls(
@@ -329,232 +278,15 @@ class SchedulerDecoupledDraftMixin:
             )
         return state
 
-    def _release_draft_mamba_ckpt_slots(
-        self: Scheduler,
-        state: DraftReqState,
-    ) -> None:
-        """
-        Release the draft mamba checkpoint slots back to the pool when a draft request is released.
-        """
-        slots = state.mamba_checkpoint_slots
-        state.mamba_checkpoint_positions.clear()
-        state.mamba_checkpoint_slots = None
-        if slots is None:
-            return
-
-        self.req_to_token_pool.mamba_allocator.free(slots)
-
-    def _ensure_draft_mamba_ckpt_slots(
-        self: Scheduler,
-        state: DraftReqState,
-    ) -> torch.Tensor:
-        """
-        Ensure the draft request can allocate mamba checkpoint slots
-        for its potential future rollback.
-        """
-        if state.mamba_checkpoint_slots is not None:
-            return state.mamba_checkpoint_slots
-
-        window = self._draft_ahead_window()
-        if window <= 0:
-            raise RuntimeError(
-                "Decoupled drafter mamba rollback requires a positive draft "
-                f"ahead window. request_id={state.key.request_id}, window={window}"
-            )
-
-        mamba_pool = self.req_to_token_pool.mamba_pool
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        if mamba_pool is None or mamba_allocator is None:
-            raise RuntimeError(
-                "Decoupled drafter mamba checkpoint requested without a mamba pool: "
-                f"request_id={state.key.request_id}"
-            )
-
-        slots = mamba_allocator.alloc(window)
-        if slots is None:
-            raise RuntimeError(
-                "Not enough space for decoupled drafter mamba rollback "
-                "checkpoints. Try to increase --mamba-full-memory-ratio or "
-                f"--max-mamba-cache-size. request_id={state.key.request_id}, "
-                f"window={window}, mamba_pool_size={mamba_pool.size}, "
-                f"mamba_available_size={mamba_allocator.available_size()}"
-            )
-
-        state.mamba_checkpoint_slots = slots
-        return slots
-
-    def _draft_mamba_ckpt_slot(
-        self: Scheduler,
-        state: DraftReqState,
-        token_pos: int,
-        *,
-        for_write: bool,
-    ) -> torch.Tensor:
-        if for_write:
-            slots = self._ensure_draft_mamba_ckpt_slots(state)
-        else:
-            if token_pos not in state.mamba_checkpoint_positions:
-                req = state.req
-                raise RuntimeError(
-                    "Missing decoupled drafter mamba checkpoint. "
-                    f"request_id={state.key.request_id}, "
-                    f"token_pos={token_pos}, "
-                    f"output_len={len(req.output_ids) if req else None}, "
-                    "available_checkpoint_positions="
-                    f"{sorted(state.mamba_checkpoint_positions)}"
-                )
-            slots = state.mamba_checkpoint_slots
-            if slots is None:
-                raise RuntimeError(
-                    "Decoupled drafter mamba checkpoint metadata exists without "
-                    "allocated checkpoint slots. "
-                    f"request_id={state.key.request_id}, "
-                    f"token_pos={token_pos}"
-                )
-
-        slot_count = int(slots.numel())
-        slot_offset = token_pos % slot_count
-        if for_write:
-            for existing_pos in state.mamba_checkpoint_positions:
-                if (
-                    existing_pos != token_pos
-                    and existing_pos % slot_count == slot_offset
-                ):
-                    raise RuntimeError(
-                        "Decoupled drafter mamba checkpoint ring would overwrite a "
-                        "live checkpoint. This indicates the drafter exceeded its "
-                        "rollback window. "
-                        f"request_id={state.key.request_id}, token_pos={token_pos}, "
-                        f"existing_pos={existing_pos}, slot_count={slot_count}"
-                    )
-        return slots[slot_offset : slot_offset + 1]
-
-    def _prune_draft_mamba_ckpts(self: Scheduler, state: DraftReqState) -> None:
-        """
-        Prune the draft mamba checkpoints that are no longer needed
-        after the verifier has committed a longer prefix.
-        """
-        req = state.req
-        if req is None or not state.mamba_checkpoint_positions:
-            return
-        committed_len = int(state.verifier_committed_prefix_len)
-        output_len = len(req.output_ids)
-        tail_pos = output_len - 1
-        # Only keep checkpoints for tokens that are still in the drafter's
-        # uncommitted suffix.
-        # Also keep the current tail checkpoint: the next decode consumes that
-        # tail token even when the verifier has already committed it.
-        positions_to_invalidate = [
-            pos
-            for pos in state.mamba_checkpoint_positions
-            if pos >= output_len or (pos < committed_len and pos != tail_pos)
-        ]
-        for pos in positions_to_invalidate:
-            state.mamba_checkpoint_positions.discard(pos)
-
     def commit_draft_mamba_ckpts(
         self: Scheduler,
         batch: ScheduleBatch,
         req_indices: Optional[list[int]] = None,
     ) -> None:
-        """
-        Commit the drafter mamba checkpoint metadata after the forward pass has
-        written the routed dst slot.
-        """
-        if not self.is_draft_worker_batch(batch):
-            return
-        try:
-            if req_indices is None:
-                checkpoint_candidate_indices = range(len(batch.reqs))
-            else:
-                checkpoint_candidate_indices = req_indices
-
-            for req_batch_idx in checkpoint_candidate_indices:
-                if not (0 <= req_batch_idx < len(batch.reqs)):
-                    continue
-                req = batch.reqs[req_batch_idx]
-                if req.mamba_pool_idx is None or not req.output_ids:
-                    continue
-
-                state = self._get_draft_state_by_req(req)
-                self._prune_draft_mamba_ckpts(state)
-                token_pos = len(req.output_ids) - 1
-                if token_pos in state.mamba_checkpoint_positions:
-                    continue
-
-                if batch.mamba_cache_dst_indices is None:
-                    raise RuntimeError(
-                        "Decoupled drafter emitted a token without mamba "
-                        "routing metadata. "
-                        f"request_id={state.key.request_id}, token_pos={token_pos}"
-                    )
-
-                state.mamba_checkpoint_positions.add(token_pos)
-        finally:
-            if (
-                batch.forward_mode.is_decode()
-                or batch.forward_mode.is_extend(include_draft_extend_v2=True)
-            ):
-                batch.mamba_cache_src_indices = None
-                batch.mamba_cache_dst_indices = None
+        self.decoupled_draft_mamba.commit(batch, req_indices)
 
     def prepare_draft_mamba_routing(self: Scheduler, batch: ScheduleBatch) -> None:
-        if not self.is_draft_worker_batch(batch):
-            return
-        if not isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            return
-        is_decode = batch.forward_mode.is_decode()
-        is_prefill = batch.forward_mode.is_extend(include_draft_extend_v2=True)
-        if not is_decode and not is_prefill:
-            return
-
-        src_indices: list[torch.Tensor] = []
-        dst_indices: list[torch.Tensor] = []
-        for req in batch.reqs:
-            if req.mamba_pool_idx is None:
-                raise RuntimeError(
-                    "Decoupled drafter mamba routing requires every req "
-                    "to own a mamba slot. "
-                    f"rid={req.rid}"
-                )
-            if is_decode and not req.output_ids:
-                raise RuntimeError(
-                    "Decoupled drafter mamba routing requires a tail token. "
-                    f"rid={req.rid}"
-                )
-
-            state = self._get_draft_state_by_req(req)
-            if is_decode:
-                self._prune_draft_mamba_ckpts(state)
-                token_pos = len(req.output_ids) - 1
-                src_indices.append(
-                    self._draft_mamba_ckpt_slot(
-                        state, token_pos, for_write=False
-                    )
-                )
-                dst_indices.append(
-                    self._draft_mamba_ckpt_slot(
-                        state, token_pos + 1, for_write=True
-                    )
-                )
-            else:
-                token_pos = len(req.output_ids)
-                dst_slot = self._draft_mamba_ckpt_slot(
-                    state, token_pos, for_write=True
-                )
-                src_indices.append(dst_slot)
-                dst_indices.append(dst_slot)
-
-        if not src_indices:
-            return
-
-        device = batch.seq_lens.device
-        batch.mamba_cache_src_indices = torch.cat(src_indices).to(
-            device=device, dtype=torch.int64, non_blocking=True
-        )
-        batch.mamba_cache_dst_indices = torch.cat(dst_indices).to(
-            device=device, dtype=torch.int64, non_blocking=True
-        )
+        self.decoupled_draft_mamba.prepare_routing(batch)
 
     def _flush_draft_kv_truncations(
         self: Scheduler,
@@ -767,7 +499,7 @@ class SchedulerDecoupledDraftMixin:
         if matched_segment_len == committed_segment_len:
             # all committed_tokens match the drafter's output, simply advance the committed prefix
             state.verifier_committed_prefix_len = new_committed_len
-            self._prune_draft_mamba_ckpts(state)
+            self.decoupled_draft_mamba.prune(state)
             return
 
         remaining_committed_token_ids = committed_token_ids[matched_segment_len:]
@@ -841,13 +573,13 @@ class SchedulerDecoupledDraftMixin:
 
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
             # check the committed_token_pos's mamba ckpt exiests
-            self._draft_mamba_ckpt_slot(state, committed_token_pos, for_write=False)
+            self.decoupled_draft_mamba.checkpoint_slot(
+                state, committed_token_pos, for_write=False
+            )
 
         if req.grammar is not None:
-            try:
+            with suppress(Exception):
                 req.grammar.rollback(removed)
-            except Exception:
-                logger.debug("Draft grammar rollback failed for req %s", req.rid)
 
         if req.req_pool_idx is not None and not req.kv_committed_freed:
             # Only free KV slots that are currently allocated for this req.
@@ -884,13 +616,8 @@ class SchedulerDecoupledDraftMixin:
 
         req.output_ids.append(committed_token_id)
         if req.grammar is not None:
-            try:
+            with suppress(Exception):
                 req.grammar.accept_token(committed_token_id)
-            except Exception:
-                logger.debug(
-                    "Draft grammar accept failed during verify commit for req %s",
-                    req.rid,
-                )
         req.finished_reason = None
         req.finished_len = None
         req.finished_output = None
@@ -916,7 +643,7 @@ class SchedulerDecoupledDraftMixin:
             )
 
         state.verifier_committed_prefix_len = new_committed_len
-        self._prune_draft_mamba_ckpts(state)
+        self.decoupled_draft_mamba.prune(state)
 
         if req_batch_idx is not None:
             batch = self.running_batch
@@ -1008,7 +735,7 @@ class SchedulerDecoupledDraftMixin:
                 batch.filter_batch(keep_indices=keep_indices)
                 batch.batch_is_full = False
         self.draft_sleeping_reqs.pop(state.key, None)
-        self._release_draft_mamba_ckpt_slots(state)
+        self.decoupled_draft_mamba.release(state)
         self.draft_req_table.pop(state.key, None)
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache, is_insert=False)
@@ -1138,8 +865,8 @@ class SchedulerDecoupledDraftMixin:
     ) -> int:
         kv_truncations: list[DraftKVTruncation] = []
         batch_metadata_updates: list[DraftBatchMetadataUpdate] = []
-        use_cpp_pybind = envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
-        commit_echo_batch = None if use_cpp_pybind else DraftTailStreamOutputBatch()
+        use_native_rows = get_decoupled_spec_transport().supports_native_rows
+        commit_echo_batch = None if use_native_rows else DraftTailStreamOutputBatch()
         commit_echo_rows: list[tuple] = []
         if not ready_commit_segments:
             return 0
@@ -1189,7 +916,7 @@ class SchedulerDecoupledDraftMixin:
                 # Echo the last applied committed token so verifier-side
                 # pending expected tokens can advance when no comparable
                 # draft-tail anchor was available in its buffer.
-                if use_cpp_pybind:
+                if use_native_rows:
                     commit_echo_rows.append(
                         (
                             self.get_decoupled_spec_rank(),
@@ -1215,7 +942,7 @@ class SchedulerDecoupledDraftMixin:
 
         self._flush_draft_kv_truncations(kv_truncations)
         self._flush_draft_batch_metadata_updates(batch_metadata_updates)
-        if use_cpp_pybind:
+        if use_native_rows:
             if commit_echo_rows:
                 submit_rows = getattr(
                     self._get_token_sync_thread(), "submit_draft_result_rows", None
@@ -1270,10 +997,6 @@ class SchedulerDecoupledDraftMixin:
         if not self.spec_algorithm.is_decoupled_draft():
             return None
 
-        timing_start_ns = (
-            decoupled_spec_timing_start() if self.is_draft_entry_rank() else 0
-        )
-        timing_items = 0
         ready_controls: ReadyDraftControls | None = None
         if self.is_draft_entry_rank():
             ready_controls = (
@@ -1283,13 +1006,6 @@ class SchedulerDecoupledDraftMixin:
             )
 
         ready_controls = self._broadcast_ready_draft_controls(ready_controls)
-        if ready_controls is not None:
-            timing_items = (
-                len(ready_controls.sync_messages)
-                + len(ready_controls.ready_commit_segments)
-                + len(ready_controls.close_keys)
-            )
-
         closed_keys = ready_controls.close_keys
         for draft_key in closed_keys:
             self._handle_draft_close_key(draft_key)
@@ -1300,14 +1016,8 @@ class SchedulerDecoupledDraftMixin:
                 continue
             self._handle_draft_sync_message(message)
 
-        num_commit_echo = self._apply_ready_verifier_commit_segments(
+        self._apply_ready_verifier_commit_segments(
             ready_controls.ready_commit_segments
-        )
-        decoupled_spec_print_timing(
-            component="scheduler.drafter",
-            op="control_sync",
-            start_ns=timing_start_ns,
-            items=timing_items + num_commit_echo,
         )
 
     def _draft_ahead_window(self: Scheduler) -> int:

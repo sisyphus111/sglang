@@ -26,10 +26,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.decoupled_spec_io import (
-    decoupled_spec_print_timing,
-    decoupled_spec_timing_start,
-)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -92,15 +88,8 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         if not batch.spec_algorithm.is_decoupled_draft():
             return
-        start_ns = decoupled_spec_timing_start()
         self.decoupled_commit_draft_mamba_ckpts(batch, req_indices)
         self.decoupled_flush_draft_updates(batch, req_indices)
-        decoupled_spec_print_timing(
-            component="scheduler.drafter",
-            op=f"iter.flush_outputs.{batch.forward_mode.name.lower()}",
-            start_ns=start_ns,
-            items=batch.batch_size(),
-        )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
