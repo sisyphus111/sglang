@@ -38,6 +38,10 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.decoupled_verify_throughput_controller import (
     DecoupledVerifyThroughputAwareController,
 )
+from sglang.srt.speculative.decoupled_verify_input import (
+    build_next_draft_input_stub,
+    get_req_tail_token_id,
+)
 from sglang.srt.speculative.decoupled_verify_profiler import (
     DecoupledVerifyProfilerMixin,
 )
@@ -68,17 +72,6 @@ _THROUGHPUT_PROFILE_WARMUP_ITERS = 5
 _THROUGHPUT_PROFILE_MEASURE_ITERS = 1000
 
 
-def _get_req_tail_token_id(req) -> int:
-    if req.output_ids:
-        return int(req.output_ids[-1])
-    if req.origin_input_ids:
-        return int(req.origin_input_ids[-1])
-    raise RuntimeError(
-        f"Request {req.rid} has no committed token to anchor external "
-        "draft verification."
-    )
-
-
 def _get_req_draft_tokens(req) -> list[int]:
     snapshot = getattr(req, "decoupled_verify_snapshot", None)
     return snapshot.draft_tokens if snapshot is not None else []
@@ -93,25 +86,6 @@ def _build_bonus_tokens_from_accepts(
     row_indices = torch.arange(accept_lens.numel(), device=accept_lens.device)
     bonus_indices = torch.clamp(accept_lens.to(torch.long) - 1, min=0)
     return accept_tokens[row_indices, bonus_indices].to(dtype=torch.int32)
-
-
-def _build_next_draft_input_stub(
-    bonus_tokens: torch.Tensor,
-    topk: int,
-) -> EagleDraftInput:
-    bonus_tokens = bonus_tokens.to(dtype=torch.int32)
-    batch_size = int(bonus_tokens.numel())
-    device = bonus_tokens.device
-    return EagleDraftInput(
-        bonus_tokens=bonus_tokens,
-        topk_p=torch.zeros(
-            (batch_size, int(topk)), device=device, dtype=torch.float32
-        ),
-        topk_index=torch.zeros(
-            (batch_size, int(topk)), device=device, dtype=torch.int64
-        ),
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-    )
 
 
 def _normalize_token_id(value) -> Optional[int]:
@@ -605,7 +579,7 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
     def _build_req_verify_tokens(
         self, req, pad_token_id: int, spec_depth: int
     ) -> List[int]:
-        tail_token = _get_req_tail_token_id(req)
+        tail_token = get_req_tail_token_id(req)
         draft_tokens = list(_get_req_draft_tokens(req)[:spec_depth])
         if len(draft_tokens) < spec_depth:
             draft_tokens.extend([int(pad_token_id)] * (spec_depth - len(draft_tokens)))
@@ -678,7 +652,7 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
         batch_size = batch.batch_size()
         device = batch.device
         draft_token = torch.tensor(
-            [_get_req_tail_token_id(req) for req in batch.reqs],
+            [get_req_tail_token_id(req) for req in batch.reqs],
             dtype=torch.long,
             device=device,
         )
@@ -757,7 +731,7 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
         ):
             penalizer_orchestrator.cumulate_output_tokens(
                 torch.tensor(
-                    [_get_req_tail_token_id(req) for req in batch.reqs],
+                    [get_req_tail_token_id(req) for req in batch.reqs],
                     dtype=torch.int64,
                     device=batch.device,
                 )
@@ -949,7 +923,7 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             spec_valid_draft_tokens=valid_draft_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=verify_input.draft_token_num,
-            next_draft_input=_build_next_draft_input_stub(
+            next_draft_input=build_next_draft_input_stub(
                 bonus_tokens, verify_input.topk
             ),
             accept_lens=accept_lens,
@@ -966,7 +940,7 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             batch.capture_hidden_mode = CaptureHiddenMode.NULL
             batch_output = self.target_worker.forward_batch_generation(batch)
             if isinstance(batch_output.next_token_ids, torch.Tensor):
-                batch_output.next_draft_input = _build_next_draft_input_stub(
+                batch_output.next_draft_input = build_next_draft_input_stub(
                     bonus_tokens=batch_output.next_token_ids.flatten().to(
                         dtype=torch.int32
                     ),

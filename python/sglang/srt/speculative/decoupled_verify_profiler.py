@@ -22,6 +22,10 @@ from sglang.srt.speculative.decoupled_verify_throughput_controller import (
     DecoupledVerifyThroughputAwareController,
     parse_decoupled_verify_throughput_profile_ctx_lens,
 )
+from sglang.srt.speculative.decoupled_verify_input import (
+    build_next_draft_input_stub,
+    get_req_tail_token_id,
+)
 from sglang.srt.speculative.decoupled_verify_state import (
     prepare_decoupled_verify_snapshot,
 )
@@ -592,11 +596,11 @@ class DecoupledVerifyProfilerMixin:
             req.kv_allocated_len = seq_len
 
         bonus_tokens = torch.tensor(
-            [_get_req_tail_token_id(req) for req in batch.reqs],
+            [get_req_tail_token_id(req) for req in batch.reqs],
             dtype=torch.int32,
             device=batch.device,
         )
-        batch.spec_info = _build_next_draft_input_stub(bonus_tokens, self.topk)
+        batch.spec_info = build_next_draft_input_stub(bonus_tokens, self.topk)
 
     def _throughput_profile_decode_headroom(self, *, extra_iters: int) -> int:
         max_steps = self._throughput_max_speculative_steps()

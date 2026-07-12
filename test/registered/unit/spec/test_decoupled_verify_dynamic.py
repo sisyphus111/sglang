@@ -709,6 +709,39 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
                 )
             )
 
+    def test_throughput_profile_decode_state_builds_spec_input(self):
+        from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+        worker = object.__new__(VerifyWorker)
+        worker.page_size = 1
+        worker.topk = 1
+        req = SimpleNamespace(
+            rid="profile-req",
+            output_ids=[17],
+            origin_input_ids=[3],
+            fill_len=0,
+            kv_committed_len=0,
+            kv_allocated_len=0,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            device=torch.device("cpu"),
+            input_ids=object(),
+            prefill_input_ids_cpu=object(),
+            prepare_for_extend=lambda: None,
+            batch_size=lambda: 1,
+        )
+
+        VerifyWorker._prepare_throughput_profile_decode_state(
+            worker, batch=batch, seq_len=1
+        )
+
+        self.assertEqual(batch.spec_info.bonus_tokens.tolist(), [17])
+        self.assertEqual(batch.spec_info.topk_p.shape, (1, 1))
+        self.assertEqual(req.fill_len, 1)
+        self.assertEqual(req.kv_committed_len, 1)
+        self.assertEqual(req.kv_allocated_len, 1)
+
     def test_throughput_profile_capture_bs_uses_decode_graph_buckets(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
