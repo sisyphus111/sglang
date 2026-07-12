@@ -26,6 +26,7 @@ class DraftTailSnapshot:
     committed_len: int
     tail_tokens: list[int]
     raw_tail_len: int = 0
+    num_consumable_drafts: int = 0
 
 
 @dataclass
@@ -457,15 +458,17 @@ class DraftTailBuffer:
             for req in reqs:
                 state = self._states.get(req.rid)
                 assert state, f"unexpected request_id={req.rid}"
+                consumable_tail_tokens = state.consumable_tail_tokens()
                 snapshots.append(
                     DraftTailSnapshot(
                         request_id=req.rid,
                         committed_len=int(state.committed_len),
                         tail_tokens=(
-                            state.consumable_tail_tokens()
+                            consumable_tail_tokens
                             if tail_cap is None
-                            else state.consumable_tail_tokens()[:tail_cap]
+                            else consumable_tail_tokens[:tail_cap]
                         ),
+                        num_consumable_drafts=len(consumable_tail_tokens),
                         raw_tail_len=len(state.tail_tokens),
                     )
                 )

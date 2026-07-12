@@ -448,6 +448,9 @@ class SchedulerDecoupledVerifyMixin:
                     f"Missing decoupled verify state for request {req.rid}"
                 )
             verify_snapshot.draft_tokens.extend(snapshot.tail_tokens)
+            verify_snapshot.num_consumable_drafts = int(
+                snapshot.num_consumable_drafts
+            )
 
     def _sync_verify_requests(
         self,

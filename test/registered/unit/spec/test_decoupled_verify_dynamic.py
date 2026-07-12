@@ -23,7 +23,10 @@ from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpecConfig
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.decoupled_verify_state import DecoupledVerifySnapshot
 from sglang.srt.speculative.spec_info import DecoupledVerifySpecAlgo
-from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
+from sglang.srt.speculative.draft_tail_buffer import (
+    DraftTailBuffer,
+    DraftTailSnapshot,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -314,6 +317,26 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             self.assertIs(snapshot.draft_tokens, draft_tokens)
             self.assertEqual(snapshot.draft_tokens, [])
 
+    def test_bind_snapshot_keeps_uncapped_consumable_draft_count(self):
+        req = _SchedReq("req-a")
+        req.decoupled_verify_snapshot = DecoupledVerifySnapshot(
+            pre_committed_len=len(req.output_ids)
+        )
+        snapshot = DraftTailSnapshot(
+            request_id=req.rid,
+            committed_len=len(req.output_ids),
+            tail_tokens=[10],
+            raw_tail_len=3,
+            num_consumable_drafts=3,
+        )
+
+        SchedulerDecoupledVerifyMixin._bind_verify_snapshots(
+            SimpleNamespace(), [req], [snapshot]
+        )
+
+        self.assertEqual(req.decoupled_verify_snapshot.draft_tokens, [10])
+        self.assertEqual(req.decoupled_verify_snapshot.num_consumable_drafts, 3)
+
     def test_verify_worker_activate_step_by_batch_applies_state(self):
         from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
 
@@ -368,7 +391,9 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         req = SimpleNamespace(
             rid="req-a",
             decoupled_verify_snapshot=DecoupledVerifySnapshot(
-                pre_committed_len=2, draft_tokens=[10]
+                pre_committed_len=2,
+                draft_tokens=[10],
+                num_consumable_drafts=3,
             ),
             kv_committed_len=2,
             kv_allocated_len=2,
@@ -496,6 +521,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
         )
         self.assertEqual(result.num_correct_drafts, 1)
         self.assertEqual(result.num_correct_drafts_per_req_cpu, [1])
+        self.assertEqual(result.num_consumable_drafts_per_req_cpu, [3])
         self.assertTrue(result.can_run_cuda_graph)
         self.assertEqual(result.speculative_num_draft_tokens, 2)
         self.assertEqual(result.accept_lens.tolist(), [2])
@@ -1341,6 +1367,7 @@ class TestDecoupledVerifyDynamic(unittest.TestCase):
             )[0]
 
             self.assertEqual(snapshot.tail_tokens, [10])
+            self.assertEqual(snapshot.num_consumable_drafts, 3)
             self.assertEqual(snapshot.raw_tail_len, 3)
         finally:
             buffer.close()

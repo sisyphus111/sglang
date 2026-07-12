@@ -12,20 +12,15 @@ DEFAULT_DECOUPLED_VERIFY_TP_AWARE_UPDATE_INTERVAL = 5
 DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS = 0.05
 DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS = 3.0
 
+
 def _with_runtime_cpu_overhead_ms(profile_cost_ms: Optional[float]) -> Optional[float]:
     if profile_cost_ms is None:
         return None
     return float(profile_cost_ms) + DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS
 
 
-class PositionAcceptanceTracker:
-    """Tracks per-draft-position acceptance rates with an EMA.
-
-    A position is observed only while the active verify width reaches it.  The
-    first unseen position receives a conservative geometric estimate so the
-    controller can probe one position deeper; positions beyond that remain
-    unscored until the probe supplies real verifier evidence.
-    """
+class DraftPositionStatsTracker:
+    """Tracks global per-position draft supply and conditional accept EMAs."""
 
     def __init__(
         self,
@@ -47,66 +42,81 @@ class PositionAcceptanceTracker:
             raise ValueError(
                 f"warmup_batches must be positive, got {self.warmup_batches}."
             )
-        self._ema_rates: list[Optional[float]] = [None] * self.max_steps
-        self._update_counts: list[int] = [0] * self.max_steps
-        self._projected: list[bool] = [False] * self.max_steps
+        self._supply_ema_rates: list[Optional[float]] = [None] * self.max_steps
+        self._accept_ema_rates: list[Optional[float]] = [None] * self.max_steps
+        self._accept_update_counts: list[int] = [0] * self.max_steps
+        self._accept_sample_counts: list[int] = [0] * self.max_steps
 
-    def update(self, num_correct_drafts_per_req: list[int], current_steps: int) -> None:
+    def update(
+        self,
+        num_correct_drafts_per_req: list[int],
+        num_consumable_drafts_per_req: list[int],
+        verified_steps: int,
+    ) -> None:
+        if len(num_correct_drafts_per_req) != len(
+            num_consumable_drafts_per_req
+        ):
+            raise ValueError(
+                "Correct-draft and consumable-draft observations must have the "
+                "same number of requests."
+            )
         num_reqs = len(num_correct_drafts_per_req)
-        steps = min(max(0, int(current_steps)), self.max_steps)
-        if num_reqs == 0 or steps == 0:
+        if num_reqs == 0:
             return
 
-        counts = [0] * (steps + 1)
-        for raw_accept_len in num_correct_drafts_per_req:
-            accept_len = max(0, min(int(raw_accept_len), steps))
-            counts[accept_len] += 1
-
-        cumulative_rejected_or_stopped = 0
-        for position in range(steps):
-            cumulative_rejected_or_stopped += counts[position]
-            accepted = num_reqs - cumulative_rejected_or_stopped
-            batch_rate = accepted / num_reqs
-            old_rate = self._ema_rates[position]
-            self._ema_rates[position] = (
-                batch_rate
-                if old_rate is None
-                else (1.0 - self.ema_alpha) * old_rate
-                + self.ema_alpha * batch_rate
+        steps = int(verified_steps)
+        if not 0 <= steps <= self.max_steps:
+            raise ValueError(
+                f"verified_steps must be in [0, {self.max_steps}], got {steps}."
             )
-            self._update_counts[position] += 1
-            self._projected[position] = False
+        if any(int(value) < 0 for value in num_consumable_drafts_per_req):
+            raise ValueError("Consumable-draft counts must be non-negative.")
+        num_consumable = [
+            min(int(value), self.max_steps)
+            for value in num_consumable_drafts_per_req
+        ]
+        num_correct = [int(value) for value in num_correct_drafts_per_req]
+        for correct, consumable in zip(num_correct, num_consumable):
+            if correct < 0 or correct > steps or correct > consumable:
+                raise ValueError(
+                    "Each correct-draft count must be non-negative and no larger "
+                    "than both verified_steps and the matching snapshot supply, "
+                    f"got correct={correct}, consumable={consumable}, "
+                    f"verified_steps={steps}."
+                )
 
-        # Higher positions may be stale after a step reduction.  Acceptance is
-        # cumulative by construction (p[k + 1] <= p[k]), so conservatively
-        # clamp preserved estimates whenever a newly updated lower position
-        # drops below them.
-        invalidate_higher = False
-        for position in range(1, self.max_steps):
-            previous_rate = self._ema_rates[position - 1]
-            rate = self._ema_rates[position]
-            if previous_rate is None:
-                break
-            if rate is not None and rate > previous_rate:
-                self._ema_rates[position] = previous_rate
-                invalidate_higher = True
-            if invalidate_higher and rate is not None:
-                self._update_counts[position] = 0
-                self._projected[position] = True
+        for position in range(self.max_steps):
+            num_supplied = sum(value > position for value in num_consumable)
+            batch_supply_rate = num_supplied / num_reqs
+            self._supply_ema_rates[position] = self._update_ema(
+                self._supply_ema_rates[position], batch_supply_rate
+            )
+
+            if position >= steps or num_supplied == 0:
+                continue
+            batch_accept_rate = (
+                sum(value > position for value in num_correct) / num_supplied
+            )
+            self._accept_ema_rates[position] = self._update_ema(
+                self._accept_ema_rates[position], batch_accept_rate
+            )
+            self._accept_update_counts[position] += 1
+            self._accept_sample_counts[position] += num_supplied
+
+    def _update_ema(self, old_value: Optional[float], batch_value: float) -> float:
+        return (
+            float(batch_value)
+            if old_value is None
+            else (1.0 - self.ema_alpha) * old_value
+            + self.ema_alpha * float(batch_value)
+        )
 
     def all_positions_warmed(self, target_steps: int) -> bool:
         target_steps = min(max(0, int(target_steps)), self.max_steps)
         return all(
-            not self._projected[position]
-            and self._update_counts[position] >= self.warmup_batches
+            self._accept_update_counts[position] >= self.warmup_batches
             for position in range(target_steps)
         )
-
-    def observed_depth(self) -> int:
-        depth = 0
-        while depth < self.max_steps and self._ema_rates[depth] is not None:
-            depth += 1
-        return depth
 
     def get_expected_tokens(self, target_steps: int) -> Optional[float]:
         target_steps = int(target_steps)
@@ -115,67 +125,56 @@ class PositionAcceptanceTracker:
         if target_steps == 0:
             return 1.0
 
-        rates: list[float] = []
+        expected = 1.0
         for position in range(target_steps):
-            rate = self._rate_or_extrapolate(position, rates)
-            if rate is None:
+            supply_rate = self.supply_rate(position)
+            accept_rate = self.accept_rate(position)
+            if supply_rate is None or accept_rate is None:
                 return None
-            rates.append(rate)
-        return 1.0 + sum(rates)
+            expected += supply_rate * accept_rate
+        return expected
 
-    def snapshot_position_rates(self, num_positions: int) -> list[Optional[float]]:
-        rates: list[Optional[float]] = []
-        known_rates: list[float] = []
-        for position in range(max(0, int(num_positions))):
-            rate = self._rate_or_extrapolate(position, known_rates)
-            rates.append(rate)
-            if rate is not None:
-                known_rates.append(rate)
-        return rates
+    def get_optimistic_expected_tokens(self, target_steps: int) -> Optional[float]:
+        target_steps = int(target_steps)
+        if target_steps < 0:
+            return None
+        expected = 1.0
+        for position in range(target_steps):
+            supply_rate = self.supply_rate(position)
+            if supply_rate is None:
+                return None
+            accept_rate = self.accept_rate(position)
+            expected += supply_rate * (1.0 if accept_rate is None else accept_rate)
+        return expected
 
-    def is_position_extrapolated(self, position: int) -> bool:
-        return (
-            0 <= int(position) < self.max_steps
-            and self._ema_rates[int(position)] is None
-        )
+    def supply_rate(self, position: int) -> Optional[float]:
+        if not 0 <= int(position) < self.max_steps:
+            return None
+        return self._supply_ema_rates[int(position)]
 
-    def position_update_count(self, position: int) -> int:
+    def accept_rate(self, position: int) -> Optional[float]:
+        if not 0 <= int(position) < self.max_steps:
+            return None
+        return self._accept_ema_rates[int(position)]
+
+    def accept_update_count(self, position: int) -> int:
         if not 0 <= int(position) < self.max_steps:
             return 0
-        return self._update_counts[int(position)]
+        return self._accept_update_counts[int(position)]
+
+    def accept_sample_count(self, position: int) -> int:
+        if not 0 <= int(position) < self.max_steps:
+            return 0
+        return self._accept_sample_counts[int(position)]
 
     def position_source(self, position: int) -> str:
-        if not 0 <= int(position) < self.max_steps:
-            return "unknown"
-        position = int(position)
-        if self._ema_rates[position] is None:
-            return "probe"
-        return "projected" if self._projected[position] else "ema"
-
-    def _ema_rate(self, position: int) -> Optional[float]:
-        if position >= self.max_steps:
-            return None
-        return self._ema_rates[position]
-
-    def _rate_or_extrapolate(
-        self, position: int, known_rates: list[float]
-    ) -> Optional[float]:
-        rate = self._ema_rate(position)
-        if rate is not None:
-            return rate
-        # At most one unseen position can be estimated.  This prevents the old
-        # p2=p3=p1 cold-start path from jumping directly from DL1 to DL3.
-        if not known_rates or position > self.observed_depth():
-            return None
-        if len(known_rates) == 1:
-            return known_rates[0] * known_rates[0]
-
-        previous_rate = known_rates[-2]
-        last_rate = known_rates[-1]
-        if previous_rate <= 0:
-            return 0.0
-        decay = last_rate / previous_rate
-        return max(0.0, min(last_rate, last_rate * decay))
+        if self.accept_rate(position) is None:
+            return "unobserved"
+        return (
+            "ema"
+            if self.accept_update_count(position) >= self.warmup_batches
+            else "warming"
+        )
 
 
 class BatchSizeCostTable:
@@ -275,7 +274,7 @@ class BatchSizeCostTable:
 
 
 def score_decoupled_verify_candidates(
-    tracker: PositionAcceptanceTracker,
+    tracker: DraftPositionStatsTracker,
     cost_table: BatchSizeCostTable,
     candidate_steps: list[int],
     batch_size: int,
@@ -285,7 +284,12 @@ def score_decoupled_verify_candidates(
     ctx_len = max(1, int(ctx_len))
     for raw_steps in candidate_steps:
         steps = int(raw_steps)
-        position_accept_rates = tracker.snapshot_position_rates(steps)
+        position_supply_rates = [
+            tracker.supply_rate(position) for position in range(steps)
+        ]
+        position_accept_rates = [
+            tracker.accept_rate(position) for position in range(steps)
+        ]
         expected = tracker.get_expected_tokens(steps)
         profile_cost_ms, matched_batch_size, matched_ctx_len = (
             cost_table.lookup_with_match(batch_size, steps, ctx_len)
@@ -311,10 +315,19 @@ def score_decoupled_verify_candidates(
                 "matched_batch_size": matched_batch_size,
                 "matched_ctx_len": matched_ctx_len,
                 "score": score,
+                "eligible": steps == 0 or tracker.all_positions_warmed(steps),
+                "expected_source": (
+                    "fixed"
+                    if steps == 0
+                    else "global_position_ema"
+                    if expected is not None
+                    else "unobserved"
+                ),
+                "position_supply_rates": position_supply_rates,
                 "position_accept_rates": position_accept_rates,
                 "position_accept_sources": [
-                    "unknown" if rate is None else tracker.position_source(position)
-                    for position, rate in enumerate(position_accept_rates)
+                    tracker.position_source(position)
+                    for position in range(len(position_accept_rates))
                 ],
             }
         )
@@ -364,32 +377,35 @@ def format_score_rows(rows: list[dict], best_steps: int) -> str:
         runtime_cpu_overhead_ms = row.get("runtime_cpu_overhead_ms")
         score = row["score"]
         expected_source = row.get("expected_source")
-        tier_update_count = row.get("tier_update_count")
-        tier_age_batches = row.get("tier_age_batches")
         ctx_len = row.get("ctx_len")
         matched_ctx_len = row.get("matched_ctx_len")
         ctx_text = ""
         if ctx_len is not None:
             matched_text = "?" if matched_ctx_len is None else str(int(matched_ctx_len))
             ctx_text = f",ctx={int(ctx_len)}->{matched_text}"
+        supply_rates = row.get("position_supply_rates") or []
         accept_rates = row.get("position_accept_rates") or []
         accept_sources = row.get("position_accept_sources") or []
         rate_parts = []
-        for position, rate in enumerate(accept_rates):
+        for position, accept_rate in enumerate(accept_rates):
+            supply_rate = (
+                supply_rates[position] if position < len(supply_rates) else None
+            )
             source = accept_sources[position] if position < len(accept_sources) else "?"
-            if rate is None:
-                rate_parts.append(f"p{position + 1}=?")
+            supply_text = "?" if supply_rate is None else f"{supply_rate:.3f}"
+            if accept_rate is None:
+                rate_parts.append(
+                    f"p{position + 1}=supply:{supply_text}/accept:?:{source}"
+                )
             else:
-                rate_parts.append(f"p{position + 1}={rate:.3f}:{source}")
+                rate_parts.append(
+                    f"p{position + 1}=supply:{supply_text}/"
+                    f"accept:{accept_rate:.3f}:{source}"
+                )
         rate_text = f",rates=[{','.join(rate_parts)}]" if rate_parts else ""
         expected_source_text = (
-            f",expected_source={expected_source},tier_updates={tier_update_count}"
-            + (
-                f",tier_age={tier_age_batches}"
-                if tier_age_batches is not None
-                else ""
-            )
-            if expected_source is not None and tier_update_count is not None
+            f",expected_source={expected_source}"
+            if expected_source is not None
             else ""
         )
         if score is None:

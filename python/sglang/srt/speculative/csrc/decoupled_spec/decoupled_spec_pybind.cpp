@@ -618,6 +618,7 @@ struct DraftTailSnapshotCpp {
   std::string request_id;
   int64_t committed_len = 0;
   std::vector<int32_t> tail_tokens;
+  int64_t num_consumable_drafts = 0;
   int64_t raw_tail_len = 0;
 };
 
@@ -762,6 +763,8 @@ class DraftTailBufferCore {
       snapshot.request_id = rid;
       snapshot.committed_len = state.committed_len;
       snapshot.tail_tokens = state.consumable_tail_tokens();
+      snapshot.num_consumable_drafts =
+          static_cast<int64_t>(snapshot.tail_tokens.size());
       if (tail_cap >= 0 && static_cast<int64_t>(snapshot.tail_tokens.size()) > tail_cap) {
         snapshot.tail_tokens.resize(static_cast<size_t>(tail_cap));
       }
@@ -1324,7 +1327,8 @@ class DecoupledSpecDraftTailBuffer {
           snapshot.request_id,
           snapshot.committed_len,
           snapshot.tail_tokens,
-          snapshot.raw_tail_len));
+          snapshot.raw_tail_len,
+          snapshot.num_consumable_drafts));
     }
     return py::make_tuple(out, snapshot_batch.wait_ns);
   }

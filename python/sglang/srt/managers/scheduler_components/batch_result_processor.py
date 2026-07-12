@@ -559,8 +559,18 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        hook_kwargs = {"batch_size": len(batch.reqs)}
+        num_consumable_drafts_per_req = getattr(
+            result, "num_consumable_drafts_per_req_cpu", None
+        )
+        if num_consumable_drafts_per_req is not None:
+            assert result.speculative_num_draft_tokens is not None
+            hook_kwargs.update(
+                num_consumable_drafts_per_req=num_consumable_drafts_per_req,
+                verified_steps=int(result.speculative_num_draft_tokens) - 1,
+            )
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu, **hook_kwargs
         )
 
         predict_tokens = []

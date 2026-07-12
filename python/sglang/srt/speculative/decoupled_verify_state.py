@@ -7,10 +7,12 @@ class DecoupledVerifySnapshot:
 
     pre_committed_len: int
     draft_tokens: list[int] = field(default_factory=list)
+    num_consumable_drafts: int = 0
 
     def reset(self, pre_committed_len: int) -> None:
         self.pre_committed_len = int(pre_committed_len)
         self.draft_tokens.clear()
+        self.num_consumable_drafts = 0
 
 
 def prepare_decoupled_verify_snapshot(req, pre_committed_len: int):

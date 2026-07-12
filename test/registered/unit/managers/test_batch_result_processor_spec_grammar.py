@@ -49,7 +49,7 @@ class _FakeBatch:
         self.spec_algorithm = _FakeSpecAlgorithm()
 
 
-def _make_processor() -> SchedulerBatchResultProcessor:
+def _make_processor(model_worker=None) -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -65,10 +65,15 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         metrics_collector=None,
         metrics_reporter=SimpleNamespace(),
         draft_worker=None,
-        model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
+        model_worker=(
+            model_worker
+            or SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None)
+        ),
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
+        decoupled_commit_draft_mamba_ckpts=lambda *a, **k: None,
+        decoupled_flush_draft_updates=lambda *a, **k: None,
     )
 
 
@@ -93,10 +98,41 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         speculative_num_draft_tokens=num_draft_tokens,
         num_correct_drafts=None,
         num_correct_drafts_per_req_cpu=None,
+        num_consumable_drafts_per_req_cpu=None,
     )
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_resolve_forwards_matching_snapshot_supply_to_verify_hook(self):
+        req = _make_req(terminate_after=99)
+        batch = _FakeBatch([req])
+        result = _make_result(2, [2], [10, 11])
+        result.num_consumable_drafts_per_req_cpu = [3]
+        hook_calls = []
+        proc = _make_processor(
+            SimpleNamespace(
+                on_verify_complete_cpu=lambda *args, **kwargs: hook_calls.append(
+                    (args, kwargs)
+                )
+            )
+        )
+
+        proc._resolve_spec_v2_tokens(result, batch)
+
+        self.assertEqual(
+            hook_calls,
+            [
+                (
+                    ([1],),
+                    {
+                        "batch_size": 1,
+                        "num_consumable_drafts_per_req": [3],
+                        "verified_steps": 1,
+                    },
+                )
+            ],
+        )
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()

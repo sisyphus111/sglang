@@ -273,11 +273,23 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: List[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: List[int],
+        batch_size: int = 0,
+        num_consumable_drafts_per_req: Optional[List[int]] = None,
+        verified_steps: Optional[int] = None,
     ) -> None:
         if self.adaptive_controller is not None:
+            if num_consumable_drafts_per_req is None or verified_steps is None:
+                raise ValueError(
+                    "Decoupled verifier adaptive statistics require the matching "
+                    "snapshot supply observation and verified step count."
+                )
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req,
+                num_consumable_drafts_per_req=num_consumable_drafts_per_req,
+                verified_steps=verified_steps,
+                batch_size=batch_size,
             )
 
     def activate_step_by_batch(self, batch_size: int, ctx_len: int = 1) -> None:
@@ -897,6 +909,12 @@ class VerifyWorker(DecoupledVerifyProfilerMixin, BaseSpecWorker):
             next_token_ids=predict,
             num_correct_drafts=sum(num_correct_drafts_per_req_cpu),
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
+            num_consumable_drafts_per_req_cpu=[
+                int(req.decoupled_verify_snapshot.num_consumable_drafts)
+                if req.decoupled_verify_snapshot is not None
+                else 0
+                for req in batch.reqs
+            ],
             spec_valid_draft_tokens=valid_draft_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=verify_input.draft_token_num,

@@ -237,6 +237,7 @@ class CppDraftTailBuffer:
                 committed_len=int(row[1]),
                 tail_tokens=[int(x) for x in row[2]],
                 raw_tail_len=int(row[3]),
+                num_consumable_drafts=int(row[4]),
             )
             for row in rows
         ]

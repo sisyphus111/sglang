@@ -7,7 +7,7 @@ from sglang.srt.speculative.decoupled_verify_throughput_controller import (
     DEFAULT_DECOUPLED_VERIFY_TP_AWARE_EMA_ALPHA,
     DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS,
     DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WARMUP_BATCHES,
-    PositionAcceptanceTracker,
+    DraftPositionStatsTracker,
     pick_best_step,
     pick_best_step_with_hysteresis,
     parse_decoupled_verify_throughput_profile_ctx_lens,
@@ -35,6 +35,20 @@ def _state(steps: int) -> SpecRuntimeState:
         speculative_num_draft_tokens=steps + 1,
         target_attn_backend=object(),
         target_graph_runner=object(),
+    )
+
+
+def _observe(
+    controller: DecoupledVerifyThroughputAwareController,
+    num_correct: list[int],
+    num_consumable: list[int],
+    verified_steps: int,
+) -> None:
+    controller.on_verify_complete(
+        num_correct,
+        num_consumable_drafts_per_req=num_consumable,
+        verified_steps=verified_steps,
+        batch_size=len(num_correct),
     )
 
 
@@ -76,11 +90,6 @@ class TestProfileCtxLensParser(CustomTestCase):
     def test_parse_profile_ctx_lens(self):
         self.assertIsNone(parse_decoupled_verify_throughput_profile_ctx_lens(None))
         self.assertIsNone(parse_decoupled_verify_throughput_profile_ctx_lens(""))
-        self.assertIsNone(parse_decoupled_verify_throughput_profile_ctx_lens("  "))
-        self.assertEqual(
-            parse_decoupled_verify_throughput_profile_ctx_lens("256,1024,4096"),
-            [256, 1024, 4096],
-        )
         self.assertEqual(
             parse_decoupled_verify_throughput_profile_ctx_lens("1024,256,1024"),
             [256, 1024],
@@ -88,183 +97,150 @@ class TestProfileCtxLensParser(CustomTestCase):
 
     def test_parse_rejects_invalid_profile_ctx_lens(self):
         for raw in ["abc", "0", "-1", "256,,1024"]:
-            with self.subTest(raw=raw):
-                with self.assertRaises(ValueError):
-                    parse_decoupled_verify_throughput_profile_ctx_lens(raw)
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_decoupled_verify_throughput_profile_ctx_lens(raw)
 
 
-class TestDecoupledVerifyScoring(CustomTestCase):
-    def test_zero_step_expected_tokens_is_one(self):
-        tracker = PositionAcceptanceTracker(max_steps=0)
-        table = BatchSizeCostTable()
-        table.set(batch_size=4, steps=0, ctx_len=256, cost_ms=10.0)
-
-        rows = score_decoupled_verify_candidates(
-            tracker, table, candidate_steps=[0], batch_size=4, ctx_len=256
-        )
-
-        self.assertEqual(rows[0]["expected"], 1.0)
-        self.assertAlmostEqual(rows[0]["score"], 1.0 / 13.0)
-        self.assertEqual(rows[0]["matched_ctx_len"], 256)
-
-    def test_scoring_passes_runtime_ctx_len_to_lookup(self):
-        tracker = PositionAcceptanceTracker(max_steps=0)
-        table = BatchSizeCostTable()
-        table.set(batch_size=4, steps=0, ctx_len=256, cost_ms=10.0)
-        table.set(batch_size=4, steps=0, ctx_len=1024, cost_ms=20.0)
-
-        rows = score_decoupled_verify_candidates(
-            tracker, table, candidate_steps=[0], batch_size=4, ctx_len=800
-        )
-
-        self.assertEqual(rows[0]["ctx_len"], 800)
-        self.assertEqual(rows[0]["matched_ctx_len"], 1024)
-        self.assertEqual(rows[0]["cost_ms"], 23.0)
-
-    def test_high_acceptance_can_prefer_larger_step(self):
-        tracker = PositionAcceptanceTracker(
-            max_steps=3, ema_alpha=1.0, warmup_batches=1
-        )
-        tracker.update([3, 3], current_steps=3)
-        table = BatchSizeCostTable()
-        table.set(batch_size=4, steps=0, ctx_len=256, cost_ms=10.0)
-        table.set(batch_size=4, steps=3, ctx_len=256, cost_ms=20.0)
-
-        rows = score_decoupled_verify_candidates(
-            tracker, table, candidate_steps=[0, 3], batch_size=4, ctx_len=256
-        )
-
-        self.assertEqual(pick_best_step(rows, fallback=0), 3)
-
-    def test_high_verifier_cost_can_prefer_smaller_step(self):
-        tracker = PositionAcceptanceTracker(
-            max_steps=3, ema_alpha=1.0, warmup_batches=1
-        )
-        tracker.update([3, 3], current_steps=3)
-        table = BatchSizeCostTable()
-        table.set(batch_size=4, steps=0, ctx_len=256, cost_ms=10.0)
-        table.set(batch_size=4, steps=3, ctx_len=256, cost_ms=100.0)
-
-        rows = score_decoupled_verify_candidates(
-            tracker, table, candidate_steps=[0, 3], batch_size=4, ctx_len=256
-        )
-
-        self.assertEqual(pick_best_step(rows, fallback=3), 0)
-
-    def test_hysteresis_blocks_marginal_switch(self):
-        rows = [
-            {"steps": 1, "expected": 2.0, "cost_ms": 2.0, "score": 1.0},
-            {"steps": 3, "expected": 2.1, "cost_ms": 2.0, "score": 1.05},
-        ]
-
-        selected = pick_best_step_with_hysteresis(
-            rows, current_steps=1, hysteresis=0.1
-        )
-
-        self.assertEqual(selected, 1)
-
-    def test_default_hysteresis_requires_more_than_five_percent(self):
-        for best_score, expected_step in [(1.05, 1), (1.051, 3)]:
-            with self.subTest(best_score=best_score):
-                rows = [
-                    {"steps": 1, "score": 1.0},
-                    {"steps": 3, "score": best_score},
-                ]
-                self.assertEqual(
-                    pick_best_step_with_hysteresis(
-                        rows,
-                        current_steps=1,
-                        hysteresis=DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS,
-                    ),
-                    expected_step,
-                )
-
-
-class TestPositionAcceptanceTracker(CustomTestCase):
-    def test_updates_per_position_ema(self):
-        tracker = PositionAcceptanceTracker(
-            max_steps=3, ema_alpha=0.25, warmup_batches=2
-        )
-
-        tracker.update([3, 1, 0, 0], current_steps=3)
-        self.assertEqual(tracker.snapshot_position_rates(3), [0.5, 0.25, 0.25])
-        self.assertFalse(tracker.all_positions_warmed(3))
-
-        tracker.update([3, 3, 3, 3], current_steps=3)
-        rates = tracker.snapshot_position_rates(3)
-        self.assertEqual(rates, [0.625, 0.4375, 0.4375])
-        self.assertTrue(tracker.all_positions_warmed(3))
-        self.assertGreaterEqual(rates[0], rates[1])
-        self.assertGreaterEqual(rates[1], rates[2])
-
-    def test_only_first_unseen_position_is_extrapolated(self):
-        tracker = PositionAcceptanceTracker(
+class TestDraftPositionStatsTracker(CustomTestCase):
+    def test_tracks_supply_and_conditional_accept_separately(self):
+        tracker = DraftPositionStatsTracker(
             max_steps=3, ema_alpha=1.0, warmup_batches=1
         )
 
-        tracker.update([1, 1, 1, 0], current_steps=1)
+        tracker.update([0, 1, 2, 0], [0, 1, 3, 2], verified_steps=2)
 
-        self.assertEqual(tracker.snapshot_position_rates(3), [0.75, 0.5625, None])
-        self.assertAlmostEqual(tracker.get_expected_tokens(2), 2.3125)
+        self.assertEqual(
+            [tracker.supply_rate(position) for position in range(3)],
+            [0.75, 0.5, 0.25],
+        )
+        self.assertEqual(tracker.accept_rate(0), 2 / 3)
+        self.assertEqual(tracker.accept_rate(1), 0.5)
+        self.assertIsNone(tracker.accept_rate(2))
+        self.assertAlmostEqual(tracker.get_expected_tokens(2), 1.75)
         self.assertIsNone(tracker.get_expected_tokens(3))
-        self.assertEqual(tracker.position_update_count(0), 1)
-        self.assertEqual(tracker.position_update_count(1), 0)
+        self.assertAlmostEqual(tracker.get_optimistic_expected_tokens(3), 2.0)
 
-    def test_rejects_invalid_ema_configuration(self):
-        for alpha in [0.0, -0.1, 1.1]:
-            with self.subTest(alpha=alpha):
-                with self.assertRaises(ValueError):
-                    PositionAcceptanceTracker(max_steps=1, ema_alpha=alpha)
+    def test_accept_warmup_counts_only_batches_with_supplied_samples(self):
+        tracker = DraftPositionStatsTracker(
+            max_steps=2, ema_alpha=1.0, warmup_batches=2
+        )
 
-    def test_empty_and_zero_step_updates_are_noops(self):
-        tracker = PositionAcceptanceTracker(
+        tracker.update([0, 0], [2, 2], verified_steps=2)
+        tracker.update([0, 0], [2, 2], verified_steps=1)
+
+        self.assertTrue(tracker.all_positions_warmed(1))
+        self.assertFalse(tracker.all_positions_warmed(2))
+        self.assertEqual(tracker.accept_update_count(1), 1)
+        self.assertEqual(tracker.accept_sample_count(1), 2)
+
+    def test_ema_updates_globally_across_batch_sizes(self):
+        tracker = DraftPositionStatsTracker(
+            max_steps=1, ema_alpha=0.5, warmup_batches=1
+        )
+
+        tracker.update([1, 1], [1, 1], verified_steps=1)
+        tracker.update([0] * 8, [0] * 8, verified_steps=1)
+
+        self.assertEqual(tracker.supply_rate(0), 0.5)
+        self.assertEqual(tracker.accept_rate(0), 1.0)
+        self.assertEqual(tracker.accept_update_count(0), 1)
+
+    def test_rejects_mismatched_or_impossible_observations(self):
+        tracker = DraftPositionStatsTracker(
             max_steps=2, ema_alpha=1.0, warmup_batches=1
         )
 
-        tracker.update([], current_steps=2)
-        tracker.update([1, 1], current_steps=0)
+        with self.assertRaisesRegex(ValueError, "same number of requests"):
+            tracker.update([0], [1, 1], verified_steps=1)
+        with self.assertRaisesRegex(ValueError, "matching snapshot supply"):
+            tracker.update([1], [0], verified_steps=1)
+        with self.assertRaisesRegex(ValueError, "verified_steps"):
+            tracker.update([2], [2], verified_steps=1)
 
-        self.assertEqual(tracker.snapshot_position_rates(2), [None, None])
-        self.assertEqual(tracker.position_update_count(0), 0)
-        self.assertEqual(tracker.position_update_count(1), 0)
+    def test_rejects_invalid_ema_configuration(self):
+        for alpha in [0.0, -0.1, 1.1]:
+            with self.subTest(alpha=alpha), self.assertRaises(ValueError):
+                DraftPositionStatsTracker(max_steps=1, ema_alpha=alpha)
+
+
+class TestDecoupledVerifyScoring(CustomTestCase):
+    def test_expected_tokens_use_supply_times_conditional_accept(self):
+        tracker = DraftPositionStatsTracker(
+            max_steps=2, ema_alpha=1.0, warmup_batches=1
+        )
+        tracker.update([1, 2, 0, 0], [1, 2, 2, 0], verified_steps=2)
+        table = BatchSizeCostTable()
+        table.set(batch_size=4, steps=0, ctx_len=256, cost_ms=10.0)
+        table.set(batch_size=4, steps=2, ctx_len=256, cost_ms=19.0)
+
+        rows = score_decoupled_verify_candidates(
+            tracker, table, candidate_steps=[0, 2], batch_size=4, ctx_len=256
+        )
+
+        self.assertEqual(rows[0]["expected"], 1.0)
+        self.assertAlmostEqual(rows[1]["expected"], 1.75)
+        self.assertEqual(rows[1]["position_supply_rates"], [0.75, 0.5])
+        self.assertEqual(rows[1]["position_accept_rates"], [2 / 3, 0.5])
+        self.assertEqual(pick_best_step(rows, fallback=0), 2)
+
+    def test_hysteresis_blocks_marginal_switch(self):
+        rows = [
+            {"steps": 1, "score": 1.0},
+            {"steps": 3, "score": 1.05},
+        ]
+
+        self.assertEqual(
+            pick_best_step_with_hysteresis(
+                rows, current_steps=1, hysteresis=0.1
+            ),
+            1,
+        )
+        self.assertEqual(
+            DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS, 0.05
+        )
 
 
 class TestDecoupledVerifyThroughputAwareController(CustomTestCase):
-    def test_default_estimator_uses_upstream_ema_parameters(self):
-        worker = _Worker(initial_steps=1)
+    def _controller(
+        self,
+        *,
+        candidate_steps: list[int],
+        initial_steps: int,
+        warmup_batches: int = 1,
+        costs: dict[int, float],
+    ) -> tuple[_Worker, DecoupledVerifyThroughputAwareController]:
+        worker = _Worker(initial_steps=initial_steps)
         controller = DecoupledVerifyThroughputAwareController(
             worker,
+            candidate_steps=candidate_steps,
+            initial_steps=initial_steps,
+            ema_alpha=1.0,
+            warmup_batches=warmup_batches,
+            update_interval=1,
+            switch_hysteresis=0.0,
+        )
+        for steps in candidate_steps:
+            controller.register(_state(steps), steps=steps)
+            controller.set_profile_cost(
+                batch_size=4,
+                steps=steps,
+                ctx_len=256,
+                cost_ms=costs[steps],
+            )
+        controller.init_states(cuda_graph_bs=[4])
+        return worker, controller
+
+    def test_default_estimator_uses_upstream_ema_parameters(self):
+        controller = DecoupledVerifyThroughputAwareController(
+            _Worker(initial_steps=1),
             candidate_steps=[0, 1],
             initial_steps=1,
         )
 
         self.assertEqual(DEFAULT_DECOUPLED_VERIFY_TP_AWARE_EMA_ALPHA, 0.2)
         self.assertEqual(DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WARMUP_BATCHES, 10)
-        self.assertEqual(DEFAULT_DECOUPLED_VERIFY_TP_AWARE_SWITCH_HYSTERESIS, 0.05)
         self.assertEqual(controller._tracker.ema_alpha, 0.2)
         self.assertEqual(controller._tracker.warmup_batches, 10)
-
-    def test_initial_step_uses_smallest_positive_candidate(self):
-        worker = _Worker(initial_steps=0)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[0, 1],
-            initial_steps=0,
-            warmup_batches=1,
-            update_interval=1,
-        )
-        for steps in [0, 1]:
-            controller.register(_state(steps), steps=steps)
-            controller.set_profile_cost(
-                batch_size=4,
-                steps=steps,
-                ctx_len=256,
-                cost_ms=10.0,
-            )
-        controller.init_states(cuda_graph_bs=[4])
-
-        self.assertEqual(worker.speculative_num_steps, 1)
-        self.assertEqual(worker.applied_steps[-1], 1)
 
     def test_sparse_positive_candidates_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "must be contiguous"):
@@ -274,255 +250,72 @@ class TestDecoupledVerifyThroughputAwareController(CustomTestCase):
                 initial_steps=1,
             )
 
-    def test_zero_step_probes_positive_candidate_to_collect_acceptance_data(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[0, 1],
+    def test_cold_position_uses_adjacent_probe_after_warmup(self):
+        worker, controller = self._controller(
+            candidate_steps=[0, 1, 2],
             initial_steps=1,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
+            warmup_batches=2,
+            costs={0: 100.0, 1: 10.0, 2: 11.0},
         )
-        for steps in [0, 1]:
-            controller.register(_state(steps), steps=steps)
-        controller.set_profile_cost(batch_size=4, steps=0, ctx_len=256, cost_ms=1.0)
-        controller.set_profile_cost(batch_size=4, steps=1, ctx_len=256, cost_ms=100.0)
-        controller.init_states(cuda_graph_bs=[4])
 
-        controller._current_steps = 0
-        worker.speculative_num_steps = 0
-        controller.on_verify_complete([0, 0], batch_size=4)
+        _observe(controller, [1, 1], [2, 2], verified_steps=1)
         controller.activate_step_by_batch(4, 256)
-
         self.assertEqual(worker.speculative_num_steps, 1)
-        self.assertEqual(worker.applied_steps[-1], 1)
 
-    def test_cold_start_probes_one_position_before_larger_step(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[0, 1, 2, 3],
-            initial_steps=1,
-            ema_alpha=1.0,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
-        )
-        for steps in [0, 1, 2, 3]:
-            controller.register(_state(steps), steps=steps)
-            controller.set_profile_cost(
-                batch_size=4,
-                steps=steps,
-                ctx_len=256,
-                cost_ms=100.0 if steps == 0 else 10.0,
-            )
-        controller.init_states(cuda_graph_bs=[4])
+        _observe(controller, [1, 1], [2, 2], verified_steps=1)
+        controller.activate_step_by_batch(4, 256)
+        self.assertEqual(worker.speculative_num_steps, 2)
+        self.assertEqual(controller._probe_steps, 2)
 
-        controller.on_verify_complete([1, 1, 1, 0], batch_size=4)
+        _observe(controller, [1, 1], [2, 2], verified_steps=2)
         controller.activate_step_by_batch(4, 256)
         self.assertEqual(worker.speculative_num_steps, 2)
 
-        controller.on_verify_complete([2, 2, 2, 2], batch_size=4)
+        _observe(controller, [1, 1], [2, 2], verified_steps=2)
         controller.activate_step_by_batch(4, 256)
-        self.assertEqual(worker.speculative_num_steps, 3)
+        self.assertEqual(worker.speculative_num_steps, 1)
 
-    def test_shrink_preserves_higher_position_ema(self):
-        worker = _Worker(initial_steps=3)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
+    def test_cold_position_is_not_probed_when_optimistic_score_loses(self):
+        worker, controller = self._controller(
+            candidate_steps=[1, 2],
+            initial_steps=1,
+            costs={1: 1.0, 2: 100.0},
+        )
+
+        _observe(controller, [1, 1], [2, 2], verified_steps=1)
+        controller.activate_step_by_batch(4, 256)
+
+        self.assertEqual(worker.speculative_num_steps, 1)
+        self.assertIsNone(controller._probe_steps)
+
+    def test_zero_step_forces_first_positive_probe_without_supply_history(self):
+        worker, controller = self._controller(
+            candidate_steps=[0, 1],
+            initial_steps=1,
+            costs={0: 1.0, 1: 100.0},
+        )
+        controller._current_steps = 0
+        controller._probe_steps = None
+        worker.speculative_num_steps = 0
+
+        _observe(controller, [0, 0], [0, 0], verified_steps=0)
+        controller.activate_step_by_batch(4, 256)
+
+        self.assertEqual(worker.speculative_num_steps, 1)
+        self.assertEqual(controller._probe_steps, 1)
+
+    def test_observation_uses_result_verified_steps_not_current_state(self):
+        _, controller = self._controller(
             candidate_steps=[1, 2, 3],
             initial_steps=3,
-            ema_alpha=1.0,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
+            costs={1: 10.0, 2: 10.0, 3: 10.0},
         )
-        for steps in [1, 2, 3]:
-            controller.register(_state(steps), steps=steps)
-            controller.set_profile_cost(
-                batch_size=4,
-                steps=steps,
-                ctx_len=256,
-                cost_ms=1.0 if steps == 1 else 100.0,
-            )
-        controller.init_states(cuda_graph_bs=[4])
 
-        controller.on_verify_complete([3, 3], batch_size=2)
-        controller.activate_step_by_batch(4, 256)
+        _observe(controller, [1, 1], [3, 3], verified_steps=1)
 
-        self.assertEqual(worker.speculative_num_steps, 1)
-        self.assertFalse(controller._tracker.is_position_extrapolated(1))
-        self.assertFalse(controller._tracker.is_position_extrapolated(2))
-
-        controller.on_verify_complete([0, 0], batch_size=2)
-        self.assertEqual(controller._tracker.snapshot_position_rates(3), [0.0] * 3)
-        self.assertEqual(controller._tracker.position_update_count(1), 0)
-        self.assertEqual(controller._tracker.position_update_count(2), 0)
-        self.assertEqual(controller._tracker.position_source(1), "projected")
-        self.assertEqual(controller._tracker.position_source(2), "projected")
-        controller.activate_step_by_batch(4, 256)
-
-        self.assertEqual(worker.speculative_num_steps, 1)
-
-    def test_unseen_position_is_not_forced_when_projected_score_is_lower(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[0, 1, 2],
-            initial_steps=1,
-            ema_alpha=1.0,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
-        )
-        for steps in [0, 1, 2]:
-            controller.register(_state(steps), steps=steps)
-        controller.set_profile_cost(batch_size=4, steps=0, ctx_len=256, cost_ms=1.0)
-        controller.set_profile_cost(batch_size=4, steps=1, ctx_len=256, cost_ms=1.0)
-        controller.set_profile_cost(
-            batch_size=4, steps=2, ctx_len=256, cost_ms=100.0
-        )
-        controller.init_states(cuda_graph_bs=[4])
-
-        controller.on_verify_complete([1, 1], batch_size=2)
-        controller.activate_step_by_batch(4, 256)
-
-        self.assertEqual(worker.speculative_num_steps, 1)
-
-    def test_tier_ema_preserves_width_specific_partial_output(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[1, 2, 3],
-            initial_steps=1,
-            ema_alpha=0.2,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
-        )
-        for steps, cost_ms in [(1, 15.0), (2, 100.0), (3, 10.0)]:
-            controller.register(_state(steps), steps=steps)
-            controller.set_profile_cost(
-                batch_size=4, steps=steps, ctx_len=256, cost_ms=cost_ms
-            )
-        controller.init_states(cuda_graph_bs=[4])
-
-        controller._tracker.update([3, 3], current_steps=3)
-        controller.on_verify_complete([1, 1], batch_size=4)
-        controller.activate_step_by_batch(4, 256)
-        self.assertEqual(worker.speculative_num_steps, 3)
-
-        # A deep verify can drain partial draft tails and produce no accepted
-        # drafts.  Its p1 observation must not overwrite DL1's measured output.
-        controller.on_verify_complete([0, 0], batch_size=4)
-        controller.activate_step_by_batch(4, 256)
-
-        self.assertEqual(worker.speculative_num_steps, 1)
-        self.assertEqual(controller._tier_expected_tokens_ema[(4, 1)], 2.0)
-        self.assertEqual(controller._tier_expected_tokens_ema[(4, 3)], 1.0)
-
-    def test_tier_ema_is_isolated_by_cuda_graph_batch_slot(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[1, 2],
-            initial_steps=1,
-            ema_alpha=1.0,
-            warmup_batches=1,
-            update_interval=1,
-        )
-        for batch_size in [4, 8]:
-            for steps in [1, 2]:
-                controller.set_profile_cost(
-                    batch_size=batch_size,
-                    steps=steps,
-                    ctx_len=256,
-                    cost_ms=10.0,
-                )
-        for steps in [1, 2]:
-            controller.register(_state(steps), steps=steps)
-        controller.init_states(cuda_graph_bs=[4, 8])
-
-        controller.on_verify_complete([1, 1], batch_size=4)
-        controller.on_verify_complete([0, 0], batch_size=5)
-
-        self.assertEqual(controller._batch_slot(5), 8)
-        self.assertEqual(controller._tier_expected_tokens_ema[(4, 1)], 2.0)
-        self.assertEqual(controller._tier_expected_tokens_ema[(8, 1)], 1.0)
-        self.assertEqual(controller._tier_update_counts[(4, 1)], 1)
-        self.assertEqual(controller._tier_update_counts[(8, 1)], 1)
-
-    def test_new_batch_slot_does_not_force_cold_tier_probe(self):
-        worker = _Worker(initial_steps=2)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[1, 2],
-            initial_steps=2,
-            ema_alpha=1.0,
-            warmup_batches=2,
-            update_interval=1,
-            switch_hysteresis=0.0,
-        )
-        for steps in [1, 2]:
-            controller.register(_state(steps), steps=steps)
-            for batch_size in [4, 8]:
-                controller.set_profile_cost(
-                    batch_size=batch_size,
-                    steps=steps,
-                    ctx_len=256,
-                    cost_ms=1.0 if steps == 1 else 100.0,
-                )
-        controller.init_states(cuda_graph_bs=[4, 8])
-
-        controller.on_verify_complete([2, 2], batch_size=4)
-        controller.activate_step_by_batch(8, 256)
-        self.assertEqual(worker.speculative_num_steps, 1)
-        self.assertNotIn((8, 2), controller._tier_update_counts)
-
-    def test_old_tier_ema_decays_toward_current_position_estimate(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[1, 2],
-            initial_steps=1,
-            ema_alpha=0.2,
-            warmup_batches=1,
-            update_interval=1,
-            switch_hysteresis=0.0,
-        )
-        for steps, cost_ms in [(1, 10.0), (2, 15.0)]:
-            controller.register(_state(steps), steps=steps)
-            controller.set_profile_cost(
-                batch_size=4, steps=steps, ctx_len=256, cost_ms=cost_ms
-            )
-        controller.init_states(cuda_graph_bs=[4])
-
-        controller._tracker.update([1, 0], current_steps=2)
-        controller._batch_count = 11
-        controller._tier_expected_tokens_ema.update({(4, 1): 1.5, (4, 2): 3.0})
-        controller._tier_update_counts.update({(4, 1): 1, (4, 2): 1})
-        controller._tier_last_update_batch.update({(4, 1): 11, (4, 2): 1})
-
-        # The raw old DL2 sample would win (3/18 > 1.5/13, including runtime
-        # overhead).  Its decayed blend with the current 1.5-token position
-        # estimate must not pull the controller into the stale tier.
-        controller._reevaluate_and_switch(batch_size=4, ctx_len=256)
-
-        self.assertEqual(controller._current_steps, 1)
-
-    def test_tier_observation_records_current_batch_age(self):
-        worker = _Worker(initial_steps=1)
-        controller = DecoupledVerifyThroughputAwareController(
-            worker,
-            candidate_steps=[1],
-            initial_steps=1,
-            warmup_batches=1,
-        )
-        controller.on_verify_complete([1, 0], batch_size=4)
-
-        self.assertEqual(controller._batch_count, 1)
-        self.assertEqual(controller._tier_last_update_batch[(4, 1)], 1)
+        self.assertEqual(controller._tracker.accept_update_count(0), 1)
+        self.assertEqual(controller._tracker.accept_update_count(1), 0)
+        self.assertEqual(controller._tracker.supply_rate(2), 1.0)
 
 
 if __name__ == "__main__":

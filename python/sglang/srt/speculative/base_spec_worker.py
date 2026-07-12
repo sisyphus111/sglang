@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -311,12 +311,18 @@ class BaseSpecWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        num_consumable_drafts_per_req: Optional[list[int]] = None,
+        verified_steps: Optional[int] = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        Decoupled verify also supplies the matching snapshot observation and
+        the exact verify width carried by the delayed result.
         """
         pass
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 import logging
 import math
 from typing import Optional
@@ -18,7 +17,7 @@ from sglang.srt.speculative.decoupled_verify_cost_model import (
     DEFAULT_DECOUPLED_VERIFY_TP_AWARE_WARMUP_BATCHES,
     DECOUPLED_VERIFY_RUNTIME_CPU_OVERHEAD_MS,
     BatchSizeCostTable,
-    PositionAcceptanceTracker,
+    DraftPositionStatsTracker,
     _format_optional_score,
     _score_for_step,
     _with_runtime_cpu_overhead_ms,
@@ -30,6 +29,7 @@ from sglang.srt.speculative.decoupled_verify_cost_model import (
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
 
 def parse_decoupled_verify_throughput_profile_ctx_lens(
     raw: Optional[str],
@@ -66,7 +66,7 @@ def parse_decoupled_verify_throughput_profile_ctx_lens(
 
 
 class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
-    """Select decoupled verifier steps from accept rates and profiled cost."""
+    """Select verify steps from global draft supply/accept EMAs and profile cost."""
 
     def __init__(
         self,
@@ -106,17 +106,9 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
             self._current_steps = positive_steps[0]
         self._update_interval = max(1, int(update_interval))
         self._switch_hysteresis = float(switch_hysteresis)
-        self._ema_alpha = float(ema_alpha)
-        self._warmup_batches = int(warmup_batches)
         self._batch_count = 0
-        self._cuda_graph_bs: list[int] | None = None
-        # With partial draft tails, changing verify width also changes draft
-        # availability.  Preserve each tier's measured output instead of using
-        # one tier's position rates as a counterfactual estimate for another.
-        self._tier_expected_tokens_ema: dict[tuple[int, int], float] = {}
-        self._tier_update_counts: dict[tuple[int, int], int] = {}
-        self._tier_last_update_batch: dict[tuple[int, int], int] = {}
-        self._tracker = PositionAcceptanceTracker(
+        self._probe_steps: Optional[int] = self._current_steps
+        self._tracker = DraftPositionStatsTracker(
             max_steps=max(self._candidate_steps),
             ema_alpha=ema_alpha,
             warmup_batches=warmup_batches,
@@ -128,7 +120,6 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
         return list(self._candidate_steps)
 
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
-        self._cuda_graph_bs = sorted({int(bs) for bs in cuda_graph_bs or []}) or None
         missing_steps = [
             steps for steps in self._candidate_steps if steps not in self._states
         ]
@@ -179,26 +170,27 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
         }
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        *,
+        num_consumable_drafts_per_req: list[int],
+        verified_steps: int,
+        batch_size: int = 0,
     ) -> None:
         if not num_correct_drafts_per_req:
             return
+        if batch_size and int(batch_size) != len(num_correct_drafts_per_req):
+            raise ValueError(
+                "Decoupled verifier batch_size must match the number of per-request "
+                f"observations, got batch_size={batch_size}, "
+                f"observations={len(num_correct_drafts_per_req)}."
+            )
         self._batch_count += 1
-        self._tracker.update(num_correct_drafts_per_req, self._current_steps)
-        slot = self._batch_slot(batch_size)
-        key = (slot, self._current_steps)
-        batch_expected_tokens = 1.0 + sum(num_correct_drafts_per_req) / len(
-            num_correct_drafts_per_req
+        self._tracker.update(
+            num_correct_drafts_per_req,
+            num_consumable_drafts_per_req,
+            verified_steps,
         )
-        old_expected_tokens = self._tier_expected_tokens_ema.get(key)
-        self._tier_expected_tokens_ema[key] = (
-            batch_expected_tokens
-            if old_expected_tokens is None
-            else (1.0 - self._ema_alpha) * old_expected_tokens
-            + self._ema_alpha * batch_expected_tokens
-        )
-        self._tier_update_counts[key] = self._tier_update_counts.get(key, 0) + 1
-        self._tier_last_update_batch[key] = self._batch_count
 
     def activate_step_by_batch(self, batch_size: int, ctx_len: int = 1) -> None:
         if self._should_reevaluate():
@@ -220,74 +212,59 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
     def _reevaluate_and_switch(self, batch_size: int, ctx_len: int) -> None:
         ctx_len = max(1, int(ctx_len))
         switch_reason = "score_hysteresis"
+        if self._probe_steps is not None:
+            if not self._tracker.all_positions_warmed(self._probe_steps):
+                return
+            self._probe_steps = None
+
+        rows = score_decoupled_verify_candidates(
+            self._tracker,
+            self._cost_table,
+            self._candidate_steps,
+            batch_size,
+            ctx_len,
+        )
         if self._current_steps == 0 and not self._has_positive_score(
             batch_size, ctx_len
         ):
             best_steps = self._positive_candidate_steps()[0]
-            rows = []
             switch_reason = "positive_probe"
+            self._probe_steps = best_steps
         else:
-            rows = score_decoupled_verify_candidates(
-                self._tracker,
-                self._cost_table,
-                self._candidate_steps,
-                batch_size,
-                ctx_len,
-            )
-            slot = self._batch_slot(batch_size)
-            for row in rows:
-                steps = int(row["steps"])
-                key = (slot, steps)
-                update_count = self._tier_update_counts.get(key, 0)
-                row["tier_update_count"] = update_count
-                row["tier_age_batches"] = None
-                if steps == 0:
-                    row["expected"] = 1.0
-                    row["expected_source"] = "fixed"
-                elif update_count >= self._warmup_batches:
-                    tier_expected = self._tier_expected_tokens_ema[key]
-                    tier_age_batches = max(
-                        0,
-                        self._batch_count - self._tier_last_update_batch[key],
-                    )
-                    row["tier_age_batches"] = tier_age_batches
-                    position_expected = row.get("expected")
-                    if position_expected is None or tier_age_batches == 0:
-                        row["expected"] = tier_expected
-                        row["expected_source"] = "tier_ema"
-                    else:
-                        # A width-specific sample is valuable for partial draft
-                        # tails, but it should not stay authoritative while the
-                        # workload moves through a different context regime.
-                        # Reuse EMA's own decay instead of a separate hard age
-                        # threshold, and fall back continuously to the current
-                        # position estimate.
-                        tier_confidence = (1.0 - self._ema_alpha) ** tier_age_batches
-                        row["expected"] = (
-                            tier_confidence * tier_expected
-                            + (1.0 - tier_confidence) * position_expected
-                        )
-                        row["expected_source"] = "tier_ema_decay"
-                else:
-                    row["expected_source"] = "position_ema"
-                cost_ms = row.get("cost_ms")
-                expected = row.get("expected")
-                row["score"] = (
-                    expected / cost_ms
-                    if expected is not None and cost_ms is not None and cost_ms > 0
-                    else None
-                )
-                # A new CUDA-graph BS slot should not force every tier to run.
-                # The global position EMA is already a counterfactual estimate;
-                # let a cold tier collect width-specific samples only after its
-                # estimated throughput wins the normal score comparison.
-                row["eligible"] = steps == 0 or expected is not None
             eligible_rows = [row for row in rows if row["eligible"]]
             best_steps = pick_best_step_with_hysteresis(
                 eligible_rows,
                 current_steps=self._current_steps,
                 hysteresis=self._switch_hysteresis,
             )
+            if best_steps == self._current_steps:
+                probe_steps = self._next_cold_probe_steps()
+                probe_row = self._row_for_step(rows, probe_steps)
+                current_score = _score_for_step(rows, self._current_steps)
+                if probe_row is not None and current_score is not None:
+                    optimistic_expected = self._tracker.get_optimistic_expected_tokens(
+                        probe_steps
+                    )
+                    probe_cost_ms = probe_row.get("cost_ms")
+                    optimistic_score = (
+                        optimistic_expected / probe_cost_ms
+                        if optimistic_expected is not None
+                        and probe_cost_ms is not None
+                        and probe_cost_ms > 0
+                        else None
+                    )
+                    if (
+                        optimistic_score is not None
+                        and optimistic_score
+                        > current_score * (1.0 + self._switch_hysteresis)
+                    ):
+                        probe_row["expected"] = optimistic_expected
+                        probe_row["score"] = optimistic_score
+                        probe_row["eligible"] = True
+                        probe_row["expected_source"] = "optimistic_probe"
+                        best_steps = probe_steps
+                        self._probe_steps = probe_steps
+                        switch_reason = "cold_position_probe"
 
         if best_steps == self._current_steps:
             return
@@ -317,15 +294,20 @@ class DecoupledVerifyThroughputAwareController(_SpecAdaptiveBase):
     def _positive_candidate_steps(self) -> list[int]:
         return [steps for steps in self._candidate_steps if steps > 0]
 
-    def _batch_slot(self, batch_size: int) -> int:
-        batch_size = max(1, int(batch_size))
-        if not self._cuda_graph_bs:
-            return batch_size
-        index = bisect.bisect_left(self._cuda_graph_bs, batch_size)
-        return (
-            self._cuda_graph_bs[index]
-            if index < len(self._cuda_graph_bs)
-            else batch_size
+    def _next_cold_probe_steps(self) -> Optional[int]:
+        next_steps = self._current_steps + 1
+        if next_steps not in self._candidate_steps:
+            return None
+        if self._tracker.all_positions_warmed(next_steps):
+            return None
+        return next_steps
+
+    @staticmethod
+    def _row_for_step(rows: list[dict], steps: Optional[int]) -> Optional[dict]:
+        if steps is None:
+            return None
+        return next(
+            (row for row in rows if int(row["steps"]) == int(steps)), None
         )
 
     def _has_positive_score(self, batch_size: int, ctx_len: int) -> bool:

@@ -85,6 +85,7 @@ def _exercise_tail_buffer(buffer):
         (
             item.committed_len,
             item.tail_tokens,
+            item.num_consumable_drafts,
             item.raw_tail_len,
         )
         for item in [first, second, third, fourth, fifth]
@@ -249,6 +250,7 @@ class TestDecoupledSpecCppPybind(unittest.TestCase):
                     break
                 time.sleep(0.001)
             self.assertEqual(snapshot.committed_len, 2)
+            self.assertEqual(snapshot.num_consumable_drafts, 0)
             self.assertEqual(snapshot.raw_tail_len, 0)
         finally:
             token_sync.close()
