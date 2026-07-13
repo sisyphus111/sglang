@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--runtime-cpu-overhead-ms", type=float, default=3.0)
+    parser.add_argument("--runtime-cpu-overhead-ms", type=float, default=2.0)
     parser.add_argument("--smooth-window", type=int, default=10)
     parser.add_argument("--latency-cutoff-ms", type=float, default=100.0)
     parser.add_argument(

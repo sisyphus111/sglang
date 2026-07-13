@@ -35,7 +35,7 @@ experiment cases. The normalized CSV files are the handoff to oracle replay.
 - Match the runtime controller exactly: choose the smallest profile BS greater than
   or equal to runtime BS (clamp above the largest), then choose nearest ctx bucket
   with lower-bucket tie breaking.
-- Add the configured runtime CPU overhead, currently 3ms, exactly once when deriving
+- Add the configured runtime CPU overhead, currently 2ms, exactly once when deriving
   modeled verifier iteration latency from raw profile cost. Prefer the scheduler's
   `modeled cost` when present. Scheduler-provided `EMA modeled throughput` is
   already the controller prediction from that cost and the current
