@@ -20,7 +20,6 @@ from profile_cache import ProfileTable
 
 
 DEBUG_ENV_KEYS = (
-    "SGLANG_TA_DEBUG",
     "SGLANG_LOG_FORWARD_ITERS",
     "SGLANG_RECORD_STEP_TIME",
 )

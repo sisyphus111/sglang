@@ -30,8 +30,8 @@ experiment cases. The normalized CSV files are the handoff to oracle replay.
 
 ## Measurement Invariants
 
-- Do not require `SGLANG_TA_DEBUG`, `SGLANG_LOG_FORWARD_ITERS`, or
-  `SGLANG_RECORD_STEP_TIME`; scheduler INFO is the base data source.
+- Do not require `SGLANG_LOG_FORWARD_ITERS` or `SGLANG_RECORD_STEP_TIME`;
+  scheduler INFO is the base data source.
 - Match the runtime controller exactly: choose the smallest profile BS greater than
   or equal to runtime BS (clamp above the largest), then choose nearest ctx bucket
   with lower-bucket tie breaking.

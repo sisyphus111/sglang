@@ -40,6 +40,5 @@ allow_partial = [true, false]
 
 [environment]
 # Scheduler INFO remains enabled; these high-volume debug streams are deliberately off.
-SGLANG_TA_DEBUG = ""
 SGLANG_LOG_FORWARD_ITERS = ""
 SGLANG_RECORD_STEP_TIME = ""
