@@ -1,0 +1,21 @@
+schema_version: 1
+server:
+  base_url: http://127.0.0.1:30000
+target_tokenizer:
+  model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-27B
+batch:
+  size: 1
+dataset:
+  format: gsm8k
+  path: /path/to/ssd_dtgl/datasets/gsm8k
+  seed: 0
+  shuffle: false
+  prompt_column: question
+  reference_column: answer
+chat_template:
+  mode: tokenizer
+  enable_thinking: false
+generation:
+  output_len: 256
+  temperature: 0
+  ignore_eos: false

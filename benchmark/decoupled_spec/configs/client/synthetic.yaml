@@ -1,0 +1,16 @@
+schema_version: 1
+server:
+  base_url: http://127.0.0.1:30000
+target_tokenizer:
+  model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-27B
+batch:
+  size: 1
+dataset:
+  format: synthetic_ids
+  prompt_len: 1024
+  output_len: 1024
+  token_id: 1
+generation:
+  output_len: 1024
+  temperature: 0
+  ignore_eos: true

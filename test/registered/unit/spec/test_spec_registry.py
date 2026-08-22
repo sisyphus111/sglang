@@ -4,8 +4,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    create_dummy_verify_input,
+)
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
     CustomSpecAlgo,
@@ -40,6 +46,10 @@ class TestFromString(_RegistryIsolated):
         )
         self.assertIs(
             SpeculativeAlgorithm.from_string("NGRAM"), SpeculativeAlgorithm.NGRAM
+        )
+        self.assertIs(
+            SpeculativeAlgorithm.from_string("DECOUPLED_VERIFY"),
+            SpeculativeAlgorithm.DECOUPLED_VERIFY,
         )
 
     def test_builtin_name_is_case_insensitive(self):
@@ -154,6 +164,7 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertFalse(self.algo.is_dflash())
         self.assertFalse(self.algo.is_standalone())
         self.assertFalse(self.algo.is_ngram())
+        self.assertFalse(self.algo.is_decoupled_verify())
         self.assertTrue(self.algo.is_speculative())
         # A registered plugin is never NONE -> is_some() mirrors the enum.
         self.assertTrue(self.algo.is_some())
@@ -344,6 +355,62 @@ class TestCrossTypeIdentity(_RegistryIsolated):
         self.assertNotEqual(algo, SpeculativeAlgorithm.EAGLE)
         self.assertNotEqual(algo, SpeculativeAlgorithm.NONE)
         self.assertIsNot(algo, SpeculativeAlgorithm.EAGLE)
+
+
+class TestDecoupledVerifyBuiltin(CustomTestCase):
+    def test_verify_only_capabilities(self):
+        algo = SpeculativeAlgorithm.DECOUPLED_VERIFY
+
+        self.assertTrue(algo.is_decoupled_verify())
+        self.assertTrue(algo.is_speculative())
+        self.assertFalse(algo.has_draft_kv())
+        self.assertFalse(algo.carries_draft_hidden_states())
+        self.assertFalse(algo.need_topk())
+
+    def test_create_worker_uses_decoupled_verify_worker(self):
+        from sglang.srt.speculative.decoupled_verify_worker import (
+            DecoupledVerifyWorker,
+        )
+
+        self.assertIs(
+            SpeculativeAlgorithm.DECOUPLED_VERIFY.create_worker(SimpleNamespace()),
+            DecoupledVerifyWorker,
+        )
+
+    def test_dummy_verify_input_reuses_linear_eagle_layout(self):
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        spec_info = create_dummy_verify_input(
+            SpeculativeAlgorithm.DECOUPLED_VERIFY,
+            SimpleNamespace(
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+            ),
+            custom_mask=torch.empty((0,), dtype=torch.bool),
+            num_tokens_per_req=4,
+            is_draft_worker=False,
+        )
+
+        self.assertIsInstance(spec_info, EagleVerifyInput)
+        self.assertEqual(spec_info.spec_steps, 3)
+        self.assertEqual(spec_info.topk, 1)
+        self.assertEqual(spec_info.draft_token_num, 4)
+        self.assertEqual(spec_info.capture_hidden_mode, CaptureHiddenMode.NULL)
+
+    def test_dummy_verify_input_rejects_draft_worker(self):
+        with self.assertRaisesRegex(RuntimeError, "should not happen"):
+            create_dummy_verify_input(
+                SpeculativeAlgorithm.DECOUPLED_VERIFY,
+                SimpleNamespace(
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                ),
+                custom_mask=torch.empty((0,), dtype=torch.bool),
+                num_tokens_per_req=4,
+                is_draft_worker=True,
+            )
 
 
 if __name__ == "__main__":

@@ -61,6 +61,7 @@ _PER_REQUEST_INT_FIELDS = frozenset(
         # Speculative-decoding int-scalar fields (current and historical names)
         "spec_verify_ct",
         "spec_accepted_drafts",
+        "spec_num_proposed_drafts",
         "spec_num_correct_drafts",
     }
 )

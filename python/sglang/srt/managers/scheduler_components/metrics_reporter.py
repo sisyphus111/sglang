@@ -5,7 +5,7 @@ import logging
 import math
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -17,6 +17,7 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.load_snapshot import DecodeMetricsWindow
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -27,7 +28,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.runtime_context import get_context, get_observability, get_spec
+from sglang.srt.runtime_context import get_context, get_observability
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+DECODE_METRICS_WINDOW_HISTORY = 64
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -122,7 +124,7 @@ class SchedulerMetricsReporter:
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.last_decode_stats_tic = time.perf_counter()
+        self.last_decode_stats_tic: Optional[float] = None
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
@@ -139,6 +141,8 @@ class SchedulerMetricsReporter:
         # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
         self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
+        self.spec_proposed_drafts_ct = 0
+        self.spec_nominal_drafts_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
@@ -150,6 +154,10 @@ class SchedulerMetricsReporter:
 
         self.enable_mfu_metrics = False
         self.decode_log_interval = self.scheduler.server_args.decode_log_interval
+        self.decode_metrics_window_id = 0
+        self.decode_metrics_windows = deque(maxlen=DECODE_METRICS_WINDOW_HISTORY)
+        self.decode_window_num_rows = 0
+        self.decode_window_sum_context_lens = 0
 
         if self.enable_metrics:
             self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics
@@ -358,16 +366,66 @@ class SchedulerMetricsReporter:
         self,
         bs: int,
         num_correct_drafts: int,
+        num_proposed_drafts: int,
+        num_nominal_drafts: int,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
     ):
         self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
+        self.spec_proposed_drafts_ct += num_proposed_drafts
+        self.spec_nominal_drafts_ct += num_nominal_drafts
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
+
+    def get_decode_metrics_windows(self) -> tuple[DecodeMetricsWindow, ...]:
+        return tuple(self.decode_metrics_windows)
+
+    def _record_decode_metrics_window(
+        self,
+        *,
+        elapsed_s: float,
+        num_decode_iters: int,
+        num_decode_rows: int,
+        sum_context_lens: int,
+        num_verify_rows: int,
+        num_accept_tokens: int,
+        num_proposed_drafts: int,
+    ) -> None:
+        """Freeze one CPU-only decode window for load-snapshot consumers."""
+        if elapsed_s <= 0 or num_decode_iters <= 0:
+            return
+        self.decode_metrics_window_id += 1
+        self.decode_metrics_windows.append(
+            DecodeMetricsWindow(
+                window_id=self.decode_metrics_window_id,
+                end_time=time.time(),
+                num_decode_iters=num_decode_iters,
+                iter_latency_ms=elapsed_s * 1000.0 / num_decode_iters,
+                num_decode_rows=num_decode_rows,
+                sum_context_lens=sum_context_lens,
+                mean_batch_size=(
+                    num_decode_rows / num_decode_iters if num_decode_iters > 0 else None
+                ),
+                mean_context_length=(
+                    sum_context_lens / num_decode_rows if num_decode_rows > 0 else None
+                ),
+                num_verify_rows=num_verify_rows,
+                num_accept_tokens=num_accept_tokens,
+                num_proposed_drafts=num_proposed_drafts,
+                accept_length=(
+                    num_accept_tokens / num_verify_rows if num_verify_rows > 0 else None
+                ),
+                proposed_draft_length=(
+                    num_proposed_drafts / num_verify_rows
+                    if num_verify_rows > 0
+                    else None
+                ),
+            )
+        )
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -519,13 +577,18 @@ class SchedulerMetricsReporter:
 
     def reset_metrics(self):
         self.forward_ct_decode = 0
+        self.last_decode_stats_tic = None
         self.num_generated_tokens = 0
         self.spec_num_accept_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_proposed_drafts_ct = 0
+        self.spec_nominal_drafts_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.decode_window_num_rows = 0
+        self.decode_window_sum_context_lens = 0
 
     def report_prefill_stats(
         self,
@@ -700,6 +763,13 @@ class SchedulerMetricsReporter:
     ):
         batch = running_batch or self.scheduler.running_batch
 
+        if self.forward_ct_decode == 1 and self.last_decode_stats_tic is None:
+            self.last_decode_stats_tic = batch.launch_ts or time.monotonic()
+
+        current_decode_sum_seq_lens = _decode_total_seq_lens(batch)
+        self.decode_window_num_rows += batch.batch_size()
+        self.decode_window_sum_context_lens += current_decode_sum_seq_lens
+
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
             decode_tokens = batch.batch_size() + num_correct_drafts
@@ -733,9 +803,13 @@ class SchedulerMetricsReporter:
         ):
             return
 
-        gap_latency = time.perf_counter() - self.last_decode_stats_tic
-        self.last_decode_stats_tic = time.perf_counter()
+        now = time.monotonic()
+        if self.last_decode_stats_tic is None:
+            self.last_decode_stats_tic = batch.launch_ts or now
+        gap_latency = now - self.last_decode_stats_tic
+        self.last_decode_stats_tic = now
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        iter_latency_ms = gap_latency * 1000.0 / self.decode_log_interval
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -754,25 +828,42 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, "
+            f"{token_usage_msg}iter latency (ms): {iter_latency_ms:.4f}, "
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
+        window_num_verify_rows = self.spec_num_forward_ct
+        window_num_accept_tokens = self.spec_num_accept_tokens
+        window_num_proposed_drafts = self.spec_proposed_drafts_ct
+        window_num_decode_rows = self.decode_window_num_rows
+        window_sum_context_lens = self.decode_window_sum_context_lens
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
+            spec_draft_occupancy_rate = 0
+            spec_proposed_draft_length = 0
             spec_cap_length = 0
             spec_block_accept_length = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if get_spec().speculative_num_draft_tokens:
-                draft_per_round = get_spec().speculative_num_draft_tokens - 1
-            else:
-                draft_per_round = get_spec().speculative_num_steps or 0
-            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
-                num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
+                num_correct_drafts / self.spec_proposed_drafts_ct
+                if self.spec_proposed_drafts_ct > 0
+                else 0
+            )
+            spec_draft_occupancy_rate = (
+                self.spec_proposed_drafts_ct / self.spec_nominal_drafts_ct
+                if self.spec_nominal_drafts_ct > 0
+                else 0
+            )
+            spec_proposed_draft_length = (
+                self.spec_proposed_drafts_ct / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
             )
             spec_cap_length = (
                 self.spec_num_cap_tokens / self.spec_num_forward_ct
@@ -793,9 +884,16 @@ class SchedulerMetricsReporter:
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
+            self.spec_proposed_drafts_ct = 0
+            self.spec_nominal_drafts_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            msg += (
+                f"accept len: {spec_accept_length:.2f}, "
+                f"proposed draft len: {spec_proposed_draft_length:.2f}, "
+                f"accept rate: {spec_accept_rate:.2f}, "
+                f"draft occupancy: {spec_draft_occupancy_rate:.2f}, "
+            )
             if spec_cap_length > 0:
                 msg += f"cap len: {spec_cap_length:.2f}, "
             if spec_block_accept_length > 0:
@@ -811,6 +909,18 @@ class SchedulerMetricsReporter:
                 spec_snapshot = self._active_spec_config_snapshot()
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
+
+        self._record_decode_metrics_window(
+            elapsed_s=gap_latency,
+            num_decode_iters=self.decode_log_interval,
+            num_decode_rows=window_num_decode_rows,
+            sum_context_lens=window_sum_context_lens,
+            num_verify_rows=window_num_verify_rows,
+            num_accept_tokens=window_num_accept_tokens,
+            num_proposed_drafts=window_num_proposed_drafts,
+        )
+        self.decode_window_num_rows = 0
+        self.decode_window_sum_context_lens = 0
 
         cache_hit_rate = 0.0
 
@@ -873,7 +983,7 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
+            self.stats.decode_sum_seq_lens = current_decode_sum_seq_lens
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -881,6 +991,8 @@ class SchedulerMetricsReporter:
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length
             self.stats.spec_accept_rate = spec_accept_rate
+            self.stats.spec_draft_occupancy_rate = spec_draft_occupancy_rate
+            self.stats.spec_proposed_draft_length = spec_proposed_draft_length
             self.stats.spec_cap_length = spec_cap_length
             self.stats.spec_block_accept_length = spec_block_accept_length
             self.stats.spec_num_steps = spec_num_steps

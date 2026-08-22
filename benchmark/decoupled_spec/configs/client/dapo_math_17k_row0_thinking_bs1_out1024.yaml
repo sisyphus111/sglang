@@ -1,0 +1,19 @@
+schema_version: 1
+server:
+  base_url: http://127.0.0.1:30000
+target_tokenizer:
+  model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-27B
+batch:
+  size: 1
+dataset:
+  format: dapo_math_17k
+  path: /path/to/ssd_dtgl/datasets/DAPO-Math-17k/data/dapo-math-17k.parquet
+  seed: 0
+  shuffle: false
+chat_template:
+  mode: tokenizer
+  enable_thinking: true
+generation:
+  output_len: 1024
+  temperature: 0
+  ignore_eos: true

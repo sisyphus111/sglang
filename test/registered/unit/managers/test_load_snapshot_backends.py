@@ -7,14 +7,19 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.load_snapshot import (
+    DecodeMetricsWindow,
     LoadSnapshot,
+    SLOT_LEN_STRUCT,
+    SLOT_SIZE,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
+    SpeculativeMetrics,
     ZmqLoadSnapshotWriter,
     ZmqShmLoadSnapshotReader,
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
+    snapshot_encoder,
     should_use_zmq,
     zmq_reader_owner,
 )
@@ -59,6 +64,32 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
 
 
 class TestShmRoundTrip(CustomTestCase):
+    def test_full_decode_metrics_history_fits_one_snapshot_slot(self):
+        windows = [
+            DecodeMetricsWindow(
+                window_id=index,
+                end_time=1000.0 + index,
+                num_decode_iters=40,
+                iter_latency_ms=10.0,
+                num_decode_rows=320,
+                sum_context_lens=3_200_000,
+                mean_batch_size=8.0,
+                mean_context_length=10_000.0,
+                num_verify_rows=320,
+                num_accept_tokens=640,
+                num_proposed_drafts=480,
+                accept_length=2.0,
+                proposed_draft_length=1.5,
+            )
+            for index in range(64)
+        ]
+
+        payload = snapshot_encoder.encode(
+            LoadSnapshot(dp_rank=0, decode_metrics_windows=windows)
+        )
+
+        self.assertLess(len(payload), SLOT_SIZE - SLOT_LEN_STRUCT.size)
+
     def test_single_rank_write_read(self):
         path = _temp_path()
         writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
@@ -73,6 +104,29 @@ class TestShmRoundTrip(CustomTestCase):
                     total_prefill_uncached_tokens=1000,
                     total_prefill_busy_us=250_000,
                     decode_moments=[2, 30, 3000, 500, 50_000, 60],
+                    decode_metrics_windows=[
+                        DecodeMetricsWindow(
+                            window_id=7,
+                            end_time=12.5,
+                            num_decode_iters=40,
+                            iter_latency_ms=10.0,
+                            num_decode_rows=320,
+                            sum_context_lens=3_200_000,
+                            mean_batch_size=8.0,
+                            mean_context_length=10_000.0,
+                            num_verify_rows=320,
+                            num_accept_tokens=640,
+                            num_proposed_drafts=480,
+                            accept_length=2.0,
+                            proposed_draft_length=1.5,
+                        )
+                    ],
+                    speculative=SpeculativeMetrics(
+                        accept_length=2.0,
+                        accept_rate=0.5,
+                        draft_occupancy_rate=0.25,
+                        proposed_draft_length=0.75,
+                    ),
                 )
             )
             load = reader.read(0)
@@ -86,6 +140,18 @@ class TestShmRoundTrip(CustomTestCase):
             self.assertEqual(load.total_prefill_busy_us, 250_000)
             self.assertEqual(load.decode_moments[0], 2)
             self.assertEqual(load.decode_moments[5], 60)
+            self.assertEqual(load.decode_metrics_windows[0].window_id, 7)
+            self.assertEqual(load.decode_metrics_windows[0].iter_latency_ms, 10.0)
+            self.assertEqual(load.decode_metrics_windows[0].mean_batch_size, 8.0)
+            self.assertEqual(
+                load.decode_metrics_windows[0].mean_context_length, 10_000.0
+            )
+            self.assertEqual(
+                load.to_dict()["decode_metrics_windows"][0]["accept_length"], 2.0
+            )
+            self.assertEqual(load.speculative.accept_rate, 0.5)
+            self.assertEqual(load.speculative.draft_occupancy_rate, 0.25)
+            self.assertEqual(load.speculative.proposed_draft_length, 0.75)
         finally:
             reader.close()
             writer.close()

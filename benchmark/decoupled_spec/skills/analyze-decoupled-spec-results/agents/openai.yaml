@@ -1,0 +1,6 @@
+interface:
+  display_name: "Analyze Decoupled-Spec Results"
+  short_description: "Plot and summarize one saved decoupled-spec run"
+  default_prompt: "Use $analyze-decoupled-spec-results to summarize this RUN_DIR and explain its TPOT, throughput, and speculative metrics."
+policy:
+  allow_implicit_invocation: true

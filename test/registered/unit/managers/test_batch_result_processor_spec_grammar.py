@@ -96,7 +96,13 @@ def _make_req(terminate_after: int) -> Req:
     return req
 
 
-def _make_result(num_draft_tokens, accept_lens, flat_tokens):
+def _make_result(
+    num_draft_tokens,
+    accept_lens,
+    flat_tokens,
+    *,
+    decoupled_selected_draft_lens=None,
+):
     return SimpleNamespace(
         next_token_ids=torch.tensor(flat_tokens, dtype=torch.long),
         accept_lens=torch.tensor(accept_lens, dtype=torch.long),
@@ -105,6 +111,12 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         num_correct_drafts_per_req_cpu=None,
         block_accept_lens=None,
         cap_lens=None,
+        decoupled_selected_draft_lens=(
+            None
+            if decoupled_selected_draft_lens is None
+            else torch.tensor(decoupled_selected_draft_lens, dtype=torch.int32)
+        ),
+        num_proposed_drafts_per_req_cpu=None,
         copy_done=None,
         grammar_advanced=False,
     )
@@ -132,6 +144,60 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv_committed_len, 3)
+
+    def test_decoupled_resolve_counts_only_selected_drafts(self):
+        req = _make_req(terminate_after=99)
+        proc = _make_processor()
+        result = _make_result(
+            4,
+            [2],
+            [301, 302, 0, 0],
+            decoupled_selected_draft_lens=[2],
+        )
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(result.num_proposed_drafts_per_req_cpu, [2])
+        self.assertEqual(req.spec_num_proposed_drafts, 2)
+        self.assertEqual(req.spec_num_correct_drafts, 1)
+        self.assertEqual(req.spec_proposed_drafts_histogram, [0, 0, 1])
+
+    def test_other_spec_resolve_uses_fixed_k_proposals(self):
+        req = _make_req(terminate_after=99)
+        proc = _make_processor()
+        result = _make_result(4, [2], [401, 402, 0, 0])
+
+        proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+
+        self.assertEqual(result.num_proposed_drafts_per_req_cpu, [3])
+        self.assertEqual(req.spec_num_proposed_drafts, 3)
+
+    def test_decoupled_position_counts_accumulate_across_rounds(self):
+        req = _make_req(terminate_after=99)
+        proc = _make_processor()
+
+        proc._resolve_spec_v2_tokens(
+            _make_result(
+                4,
+                [3],
+                [501, 502, 503, 0],
+                decoupled_selected_draft_lens=[3],
+            ),
+            _FakeBatch([req]),
+        )
+        proc._resolve_spec_v2_tokens(
+            _make_result(
+                4,
+                [1],
+                [601, 0, 0, 0],
+                decoupled_selected_draft_lens=[1],
+            ),
+            _FakeBatch([req]),
+        )
+
+        self.assertEqual(req.spec_num_proposed_drafts, 4)
+        self.assertEqual(req.spec_num_correct_drafts, 2)
+        self.assertEqual(req.spec_proposed_drafts_histogram, [0, 1, 0, 1])
 
 
 class TestReasoningTokenAccounting(CustomTestCase):

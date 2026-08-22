@@ -479,6 +479,7 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        self.num_new_req_slots = 0
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -549,6 +550,21 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _append_can_run(self, req: Req) -> None:
+        self.can_run_list.append(req)
+        if getattr(req, "req_pool_idx", None) is None:
+            self.num_new_req_slots += 1
+
+    def reached_req_pool_capacity(self, num_allocatable_reqs: int) -> bool:
+        """Whether requests needing a new request-pool slot fill this pass.
+
+        A continued chunked/session request can already own its slot. Counting
+        it against ``available_size()`` strands one free slot and delays one
+        waiting request until another running request finishes.
+        """
+
+        return self.num_new_req_slots >= num_allocatable_reqs
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -808,7 +824,7 @@ class PrefillAdder:
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 
-        self.can_run_list.append(req)
+        self._append_can_run(req)
 
         self._update_prefill_budget(
             prefix_len,
@@ -842,7 +858,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        self.can_run_list.append(req)
+        self._append_can_run(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
@@ -900,7 +916,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
-        self.can_run_list.append(req)
+        self._append_can_run(req)
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -1025,7 +1041,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
-            self.can_run_list.append(req)
+            self._append_can_run(req)
             self._update_prefill_budget(
                 0,
                 req.extend_range.length,
@@ -1044,7 +1060,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
-            self.can_run_list.append(req)
+            self._append_can_run(req)
             self.new_chunked_req = req
             self._update_prefill_budget(
                 0,
@@ -1197,7 +1213,7 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
-                self.can_run_list.append(req)
+                self._append_can_run(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
@@ -1240,7 +1256,7 @@ class PrefillAdder:
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
                 )
 
-                self.can_run_list.append(req)
+                self._append_can_run(req)
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)

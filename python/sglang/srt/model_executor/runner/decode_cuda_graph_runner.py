@@ -1108,6 +1108,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     max_num_tokens / self.captured_req_width
                     if self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
+                    or self.model_runner.spec_algorithm.is_decoupled_verify()
                     or self.model_runner.spec_algorithm.is_dflash_family()
                     else max_num_tokens
                 )
@@ -1271,6 +1272,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_decoupled_verify()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1280,7 +1282,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
                 capture_mode = (
                     CaptureHiddenMode.NULL
-                    if self.model_runner.spec_algorithm.is_standalone()
+                    if (
+                        self.model_runner.spec_algorithm.is_standalone()
+                        or self.model_runner.spec_algorithm.is_decoupled_verify()
+                    )
                     else CaptureHiddenMode.FULL
                 )
                 spec_info = EagleVerifyInput(
@@ -1298,12 +1303,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-                # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
-                spec_info.hidden_states = torch.zeros(
-                    (num_tokens, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                    device=self.model_runner.device,
-                )
+                if not self.model_runner.spec_algorithm.is_decoupled_verify():
+                    # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states.
+                    spec_info.hidden_states = torch.zeros(
+                        (num_tokens, self.model_runner.model_config.hidden_size),
+                        dtype=self.model_runner.dtype,
+                        device=self.model_runner.device,
+                    )
         elif self.model_runner.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (

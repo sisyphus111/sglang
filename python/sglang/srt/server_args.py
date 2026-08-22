@@ -2023,7 +2023,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: DECOUPLED_VERIFY, EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2215,7 +2215,9 @@ class ServerArgs:
     decoupled_spec_role: A[
         Literal["null", "verifier", "drafter"],
         "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
-        "runs the target/verify half, 'drafter' runs the draft half.",
+        "runs the target/verify half with --speculative-algorithm "
+        "DECOUPLED_VERIFY, and 'drafter' runs the plain decode half with no "
+        "speculative algorithm and --disable-overlap-schedule.",
         NS("disagg"),
     ] = "null"
     spec_trace_dir: A[

@@ -665,6 +665,35 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        max_proposed_drafts = max(int(stride) - 1, 0)
+        decoupled_selected_draft_lens = getattr(
+            result, "decoupled_selected_draft_lens", None
+        )
+        if decoupled_selected_draft_lens is not None:
+            assert decoupled_selected_draft_lens.is_cpu
+            proposed_drafts_per_req = [
+                int(value) for value in decoupled_selected_draft_lens.tolist()
+            ]
+            if len(proposed_drafts_per_req) != len(batch.reqs):
+                raise RuntimeError(
+                    "Decoupled selected draft lengths do not match the verify batch: "
+                    f"num_rows={len(proposed_drafts_per_req)} "
+                    f"batch_size={len(batch.reqs)}"
+                )
+            if any(
+                value < 0 or value > max_proposed_drafts
+                for value in proposed_drafts_per_req
+            ):
+                raise RuntimeError(
+                    "Decoupled selected draft length is outside the verify width: "
+                    f"selected_lens={proposed_drafts_per_req} "
+                    f"max_proposed_drafts={max_proposed_drafts}"
+                )
+        else:
+            # Existing speculative algorithms present a fixed K drafts per
+            # verify row. Keep that established denominator as their fallback.
+            proposed_drafts_per_req = [max_proposed_drafts] * len(batch.reqs)
+        result.num_proposed_drafts_per_req_cpu = proposed_drafts_per_req
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -685,8 +714,19 @@ class SchedulerBatchResultProcessor:
                 req.spec_verify_ct += 1
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                num_proposed_drafts = proposed_drafts_per_req[i]
                 req.spec_num_correct_drafts += num_correct_drafts
+                req.spec_num_proposed_drafts += num_proposed_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+                if decoupled_selected_draft_lens is not None:
+                    if num_correct_drafts > num_proposed_drafts:
+                        raise RuntimeError(
+                            "Decoupled correct drafts exceed selected drafts: "
+                            f"num_correct_drafts={num_correct_drafts} "
+                            f"num_proposed_drafts={num_proposed_drafts}"
+                        )
+                    req.update_spec_proposed_drafts_histogram(num_proposed_drafts)
 
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]
@@ -828,9 +868,13 @@ class SchedulerBatchResultProcessor:
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
+            assert result.num_proposed_drafts_per_req_cpu is not None
             self.metrics_reporter.update_spec_metrics(
                 batch.batch_size(),
                 result.num_correct_drafts,
+                num_proposed_drafts=sum(result.num_proposed_drafts_per_req_cpu),
+                num_nominal_drafts=batch.batch_size()
+                * max(int(result.speculative_num_draft_tokens or 1) - 1, 0),
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )

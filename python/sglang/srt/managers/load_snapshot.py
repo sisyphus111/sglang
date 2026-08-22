@@ -141,6 +141,26 @@ class SpeculativeMetrics(msgspec.Struct, array_like=True):
 
     accept_length: float
     accept_rate: float
+    draft_occupancy_rate: float
+    proposed_draft_length: float = 0.0
+
+
+class DecodeMetricsWindow(msgspec.Struct, array_like=True, frozen=True):
+    """One fixed-iteration decode window exposed through ``/v1/loads``."""
+
+    window_id: int
+    end_time: float
+    num_decode_iters: int
+    iter_latency_ms: float
+    num_decode_rows: int = 0
+    sum_context_lens: int = 0
+    mean_batch_size: Optional[float] = None
+    mean_context_length: Optional[float] = None
+    num_verify_rows: int = 0
+    num_accept_tokens: int = 0
+    num_proposed_drafts: int = 0
+    accept_length: Optional[float] = None
+    proposed_draft_length: Optional[float] = None
 
 
 class LoRAMetrics(msgspec.Struct, array_like=True):
@@ -205,6 +225,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     total_prefill_busy_us: int = 0
     # Decode step-time moment sums
     decode_moments: Optional[list[float]] = None
+    # Completed fixed-iteration windows. The SHM representation is compact
+    # array-like data; ``to_dict`` expands it into named HTTP fields.
+    decode_metrics_windows: Optional[list[DecodeMetricsWindow]] = None
 
     memory: Optional[MemoryMetrics] = None
     speculative: Optional[SpeculativeMetrics] = None
@@ -218,6 +241,10 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
         load = {key: getattr(self, key) for key in _CORE_KEYS}
+        if self.decode_metrics_windows is not None:
+            load["decode_metrics_windows"] = [
+                msgspec.structs.asdict(window) for window in self.decode_metrics_windows
+            ]
 
         if include is None or "all" in include:
             include_all = True

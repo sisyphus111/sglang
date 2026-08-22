@@ -186,6 +186,19 @@ def _ragged_verify_cap_accept() -> bool:
     return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
 
 
+def _draft_histogram_to_position_counts(
+    histogram: List[int], num_positions: int
+) -> List[int]:
+    """Convert a length histogram to counts for each present draft position."""
+    remaining = sum(histogram)
+    counts = []
+    for position in range(num_positions):
+        if position < len(histogram):
+            remaining -= int(histogram[position])
+        counts.append(remaining)
+    return counts
+
+
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -2753,25 +2766,87 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
+            # Decoupled verification may present fewer than K drafts when its
+            # GPU tail is only partially populated. Other algorithms retain
+            # the established fixed-K denominator as a compatibility fallback.
+            nominal_proposed_drafts = recv_obj.spec_verify_ct[i] * (
                 self.server_args.speculative_num_draft_tokens - 1
             )
+            if (
+                getattr(recv_obj, "spec_num_proposed_drafts", None) is not None
+                and len(recv_obj.spec_num_proposed_drafts) > i
+            ):
+                num_proposed_drafts = recv_obj.spec_num_proposed_drafts[i]
+            else:
+                num_proposed_drafts = nominal_proposed_drafts
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
-            # Calculate per-request acceptance rate and average acceptance length.
-            if num_proposed_drafts > 0:
-                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
-                # accept_length: completion_tokens / verify_ct (includes bonus token).
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+            meta_info["spec_accept_rate"] = (
+                num_correct_drafts / num_proposed_drafts
+                if num_proposed_drafts > 0
+                else None
+            )
+            meta_info["spec_accept_length"] = (
+                recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+            )
+            meta_info["spec_draft_occupancy_rate"] = (
+                num_proposed_drafts / nominal_proposed_drafts
+                if nominal_proposed_drafts > 0
+                else None
+            )
+            meta_info["spec_num_correct_drafts"] = num_correct_drafts
+            meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
+            meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+            meta_info["spec_proposed_draft_length"] = (
+                num_proposed_drafts / recv_obj.spec_verify_ct[i]
+            )
+
+            proposed_histogram = (
+                list(recv_obj.spec_proposed_drafts_histogram[i])
+                if getattr(recv_obj, "spec_proposed_drafts_histogram", None) is not None
+                and len(recv_obj.spec_proposed_drafts_histogram) > i
+                else []
+            )
+            if proposed_histogram:
+                correct_histogram = (
+                    list(recv_obj.spec_correct_drafts_histogram[i])
+                    if recv_obj.spec_correct_drafts_histogram
+                    and len(recv_obj.spec_correct_drafts_histogram) > i
+                    else []
+                )
+                num_positions = max(
+                    0, int(self.server_args.speculative_num_draft_tokens) - 1
                 )
 
-                meta_info["spec_num_correct_drafts"] = num_correct_drafts
-                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                proposed_by_position = _draft_histogram_to_position_counts(
+                    proposed_histogram, num_positions
+                )
+                correct_by_position = _draft_histogram_to_position_counts(
+                    correct_histogram, num_positions
+                )
+                if sum(proposed_by_position) != num_proposed_drafts:
+                    raise RuntimeError(
+                        "Per-position proposed drafts do not match their total: "
+                        f"by_position={proposed_by_position} "
+                        f"total={num_proposed_drafts}"
+                    )
+                if sum(correct_by_position) != num_correct_drafts:
+                    raise RuntimeError(
+                        "Per-position correct drafts do not match their total: "
+                        f"by_position={correct_by_position} "
+                        f"total={num_correct_drafts}"
+                    )
+                meta_info["spec_proposed_drafts_histogram"] = proposed_histogram
+                meta_info["spec_num_proposed_drafts_by_position"] = proposed_by_position
+                meta_info["spec_num_correct_drafts_by_position"] = correct_by_position
+                meta_info["spec_accept_rate_by_position"] = [
+                    correct / proposed if proposed > 0 else None
+                    for proposed, correct in zip(
+                        proposed_by_position, correct_by_position
+                    )
+                ]
 
+            if num_proposed_drafts > 0:
                 if (
                     getattr(recv_obj, "spec_num_cap_tokens", None) is not None
                     and len(recv_obj.spec_num_cap_tokens) > i

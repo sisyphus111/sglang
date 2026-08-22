@@ -17,6 +17,7 @@ from sglang.srt.managers.load_snapshot import (
     SLOT_LEN_STRUCT,
     SLOT_SIZE,
     VERSION,
+    DecodeMetricsWindow,
     DisaggregationMetrics,
     LoadSnapshot,
     QueueMetrics,
@@ -84,6 +85,43 @@ class _FakeHttpTokenizerManager:
 
 
 class TestLoadsResponse(CustomTestCase):
+    def test_response_exposes_named_decode_metrics_windows(self):
+        manager = _FakeHttpTokenizerManager(
+            [
+                LoadSnapshot(
+                    dp_rank=0,
+                    decode_metrics_windows=[
+                        DecodeMetricsWindow(
+                            window_id=3,
+                            end_time=10.0,
+                            num_decode_iters=40,
+                            iter_latency_ms=12.5,
+                            num_decode_rows=320,
+                            sum_context_lens=3_200_000,
+                            mean_batch_size=8.0,
+                            mean_context_length=10_000.0,
+                            num_verify_rows=320,
+                            num_accept_tokens=640,
+                            num_proposed_drafts=480,
+                            accept_length=2.0,
+                            proposed_draft_length=1.5,
+                        )
+                    ],
+                )
+            ]
+        )
+
+        response = asyncio.run(get_loads(tokenizer_manager=manager))
+
+        window = response["loads"][0]["decode_metrics_windows"][0]
+        self.assertEqual(window["window_id"], 3)
+        self.assertEqual(window["num_decode_iters"], 40)
+        self.assertEqual(window["iter_latency_ms"], 12.5)
+        self.assertEqual(window["mean_batch_size"], 8.0)
+        self.assertEqual(window["mean_context_length"], 10_000.0)
+        self.assertEqual(window["proposed_draft_length"], 1.5)
+        self.assertEqual(window["accept_length"], 2.0)
+
     def test_response_omits_server_side_aggregate_and_redundant_fields(self):
         manager = _FakeHttpTokenizerManager(
             [

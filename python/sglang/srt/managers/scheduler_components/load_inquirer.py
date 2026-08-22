@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
+    DecodeMetricsWindow,
     DisaggregationMetrics,
     LoadSnapshot,
     LoRAMetrics,
@@ -54,6 +55,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_decode_metrics_windows: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -153,6 +155,8 @@ class SchedulerLoadInquirer:
                     / self.get_spec_total_num_forward_ct()
                 ),
                 accept_rate=stats.spec_accept_rate,
+                draft_occupancy_rate=stats.spec_draft_occupancy_rate,
+                proposed_draft_length=stats.spec_proposed_draft_length,
             )
 
         lora = None
@@ -204,6 +208,9 @@ class SchedulerLoadInquirer:
 
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
+        decode_metrics_windows: list[DecodeMetricsWindow] = list(
+            self.get_decode_metrics_windows()
+        )
 
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
@@ -228,4 +235,5 @@ class SchedulerLoadInquirer:
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
             decode_moments=decode_moments,
+            decode_metrics_windows=decode_metrics_windows or None,
         )

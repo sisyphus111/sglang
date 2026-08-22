@@ -909,6 +909,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Select the native C++ transport/tail implementation for decoupled spec.
+    SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND = EnvBool(False)
+    # Optional absolute libzmq path used by the JIT-loaded native transport.
+    SGLANG_DECOUPLED_SPEC_ZMQ_LIB = EnvStr(None)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

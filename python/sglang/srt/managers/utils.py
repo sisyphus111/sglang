@@ -49,6 +49,7 @@ class GenerationBatchResult:
     ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_proposed_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
@@ -88,6 +89,12 @@ class GenerationBatchResult:
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
+
+    # Decoupled verifier observability. These stay on device until the standard
+    # result-copy phase; they never add a next-launch host dependency.
+    decoupled_rebase_valid: Optional[torch.Tensor] = None
+    decoupled_selected_draft_lens: Optional[torch.Tensor] = None
+    decoupled_pre_output_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -158,6 +165,15 @@ class GenerationBatchResult:
 
         if self.cap_lens is not None:
             self.cap_lens = _async_d2h(self.cap_lens)
+
+        if self.decoupled_rebase_valid is not None:
+            self.decoupled_rebase_valid = _async_d2h(self.decoupled_rebase_valid)
+        if self.decoupled_selected_draft_lens is not None:
+            self.decoupled_selected_draft_lens = _async_d2h(
+                self.decoupled_selected_draft_lens
+            )
+        if self.decoupled_pre_output_lens is not None:
+            self.decoupled_pre_output_lens = _async_d2h(self.decoupled_pre_output_lens)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -387,7 +403,7 @@ def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
     number to run the total-token check in Rust.
     """
     algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if not algorithm.is_eagle():
+    if not (algorithm.is_eagle() or algorithm.is_decoupled_verify()):
         return 0
     return max(
         server_args.speculative_eagle_topk * server_args.speculative_num_steps,

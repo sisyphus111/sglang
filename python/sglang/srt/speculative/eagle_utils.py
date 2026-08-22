@@ -544,7 +544,10 @@ def eagle_prepare_for_verify(
     )
     capture_mode = (
         CaptureHiddenMode.NULL
-        if target_worker.model_runner.spec_algorithm.is_standalone()
+        if (
+            target_worker.model_runner.spec_algorithm.is_standalone()
+            or target_worker.model_runner.spec_algorithm.is_decoupled_verify()
+        )
         else CaptureHiddenMode.FULL
     )
     verify_forward_batch = ForwardBatch.init_new(

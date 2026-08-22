@@ -2,7 +2,8 @@
 
 Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
 clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
-`spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
+`spec_verify_ct` / `spec_num_proposed_drafts`, and the `maybe_evict_swa()` call)
+must only be advanced by
 the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
 repeat any of them (the scheduler-driven free function / resolve path already
 does).
@@ -33,6 +34,7 @@ _TRACKED_ATTRS = (
     "kv_committed_len",
     "kv_allocated_len",
     "spec_verify_ct",
+    "spec_num_proposed_drafts",
 )
 _EVICT_METHOD = "maybe_evict_swa"
 
@@ -44,6 +46,10 @@ _EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
+)
+_DECOUPLED_DRAFT_TRUNCATE = (
+    "managers/scheduler_components/decoupled_spec/draft.py",
+    "DecoupledDraftManager._truncate_kv",
 )
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
@@ -69,6 +75,11 @@ _OWNER_SITES = {
     ): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
+    (*_RESOLVE, "spec_num_proposed_drafts"): 1,
+    # The decoupled drafter owns internal Req rollback and must move both KV
+    # watermarks together when verifier feedback rewrites its linear suffix.
+    (*_DECOUPLED_DRAFT_TRUNCATE, "kv_committed_len"): 1,
+    (*_DECOUPLED_DRAFT_TRUNCATE, "kv_allocated_len"): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (

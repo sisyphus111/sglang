@@ -42,7 +42,9 @@ def _make_batch_str_output() -> BatchStrOutput:
     return BatchStrOutput(
         rids=["rid-0", "rid-1"],
         spec_verify_ct=[0, 0],
+        spec_num_proposed_drafts=[1, 2],
         spec_num_correct_drafts=[0, 0],
+        spec_proposed_drafts_histogram=[[0, 1], [0, 2]],
         spec_correct_drafts_histogram=[[], []],
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
@@ -87,6 +89,8 @@ class TestMultiTokenizerMixin(unittest.TestCase):
 
         self.assertEqual(single_output.rids, ["rid-1"])
         self.assertEqual(single_output.cached_tokens, [4])
+        self.assertEqual(single_output.spec_num_proposed_drafts, [2])
+        self.assertEqual(single_output.spec_proposed_drafts_histogram, [[0, 2]])
         self.assertEqual(
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],

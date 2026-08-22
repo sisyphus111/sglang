@@ -602,6 +602,10 @@ class Scheduler(
         # Init overlap schedule
         self.init_overlap()
 
+        # Decoupled-spec is a role component layered on the v0.5.17 scheduler;
+        # it does not participate in Scheduler inheritance.
+        self.maybe_init_decoupled_spec_manager(port_args)
+
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
 
@@ -1465,6 +1469,32 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+    def maybe_init_decoupled_spec_manager(self, port_args: PortArgs) -> None:
+        self.decoupled_spec_manager = None
+        role = self.server_args.decoupled_spec_role
+        if role == "null":
+            return
+        config = port_args.decoupled_spec_ipc_config
+        if config is None:
+            raise RuntimeError(
+                "Active decoupled-spec role is missing its IPC configuration."
+            )
+        if role == "verifier":
+            from sglang.srt.managers.scheduler_components.decoupled_spec.verifier import (
+                DecoupledVerifyManager,
+            )
+
+            self.decoupled_spec_manager = DecoupledVerifyManager(self, config)
+            return
+        if role == "drafter":
+            from sglang.srt.managers.scheduler_components.decoupled_spec.draft import (
+                DecoupledDraftManager,
+            )
+
+            self.decoupled_spec_manager = DecoupledDraftManager(self, config)
+            return
+        raise ValueError(f"Unsupported decoupled-spec role: {role!r}")
+
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
             self.tp_worker.model_runner.ngram_embedding_manager
@@ -1622,6 +1652,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.close()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1695,6 +1727,8 @@ class Scheduler(
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            if self.decoupled_spec_manager is not None:
+                plan = self.decoupled_spec_manager.adjust_plan(plan)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -1703,6 +1737,11 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+            elif (
+                self.decoupled_spec_manager is not None
+                and self.decoupled_spec_manager.on_no_batch()
+            ):
+                pass
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1738,6 +1777,8 @@ class Scheduler(
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            if self.decoupled_spec_manager is not None:
+                plan = self.decoupled_spec_manager.adjust_plan(plan)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -1772,8 +1813,12 @@ class Scheduler(
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.on_idle()
+                if not (
+                    self.decoupled_spec_manager is not None
+                    and self.decoupled_spec_manager.on_no_batch()
+                ):
+                    # When the server is idle, do self-check and re-init some states
+                    self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1864,6 +1909,8 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.process_pending_controls()
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -2068,6 +2115,9 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_decode_metrics_windows=(
+                self.metrics_reporter.get_decode_metrics_windows
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2860,6 +2910,8 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.abort_request(req)
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
@@ -3200,12 +3252,16 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if adder.reached_req_pool_capacity(
+                self.get_num_allocatable_reqs(running_bs)
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if adder.reached_req_pool_capacity(
+                    self.req_to_token_pool.available_size()
+                ):
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
@@ -3389,6 +3445,12 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        if self.decoupled_spec_manager is not None:
+            batch = self.decoupled_spec_manager.sleep_overrun_requests(batch)
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
@@ -3406,6 +3468,12 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            if self.decoupled_spec_manager is not None:
+                retracted_reqs, reqs_to_abort = (
+                    self.decoupled_spec_manager.handle_retracted_requests(
+                        retracted_reqs, reqs_to_abort
+                    )
+                )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3552,6 +3620,9 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
+
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.prepare_batch(batch)
 
         # Run forward
         if self.is_generation:
@@ -3818,6 +3889,9 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.before_process_batch_result(batch, result)
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3831,6 +3905,9 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.after_process_batch_result(batch, result)
 
         self._record_step_counters(batch, result)
 
@@ -3982,6 +4059,11 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        if (
+            self.decoupled_spec_manager is not None
+            and self.decoupled_spec_manager.has_pending_work()
+        ):
+            idle = False
 
         if (
             for_health_check
@@ -4341,6 +4423,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.decoupled_spec_manager is not None:
+                self.decoupled_spec_manager.abort_request(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4457,6 +4541,8 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                if self.decoupled_spec_manager is not None:
+                    self.decoupled_spec_manager.abort_request(req)
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
@@ -4500,6 +4586,11 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.decoupled_spec_manager is not None:
+            retract_reqs = self.decoupled_spec_manager.prepare_pause_retract(
+                retract_reqs
+            )
 
         self.last_batch = None
         self.cur_batch_for_debug = None

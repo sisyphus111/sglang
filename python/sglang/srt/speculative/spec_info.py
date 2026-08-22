@@ -34,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
     dispatch uniformly without isinstance checks.
     """
 
+    DECOUPLED_VERIFY = auto()
     DFLASH = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -124,6 +125,9 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_decoupled_verify(self) -> bool:
+        return self == SpeculativeAlgorithm.DECOUPLED_VERIFY
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
@@ -142,10 +146,13 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
-        """Whether the draft phase writes KV chains. NGRAM does not (its tree
-        lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        """Whether this engine owns a local draft KV chain.
+
+        NGRAM has no draft model, and a decoupled verifier consumes snapshots
+        produced by a remote drafter. Neither should reserve or dereference a
+        local draft KV pool.
+        """
+        return not (self.is_ngram() or self.is_decoupled_verify())
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
@@ -259,6 +266,13 @@ class SpeculativeAlgorithm(Enum):
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
+
+        if self.is_decoupled_verify():
+            from sglang.srt.speculative.decoupled_verify_worker import (
+                DecoupledVerifyWorker,
+            )
+
+            return DecoupledVerifyWorker
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -395,7 +409,11 @@ def create_dummy_verify_input(
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
     spec_info = None
-    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+    if (
+        spec_algorithm.is_eagle()
+        or spec_algorithm.is_standalone()
+        or spec_algorithm.is_decoupled_verify()
+    ):
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:
@@ -412,7 +430,11 @@ def create_dummy_verify_input(
                 spec_steps=server_args.speculative_num_steps,
                 topk=server_args.speculative_eagle_topk,
                 draft_token_num=server_args.speculative_num_draft_tokens,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if spec_algorithm.is_decoupled_verify()
+                    else CaptureHiddenMode.FULL
+                ),
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )

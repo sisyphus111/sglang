@@ -37,6 +37,23 @@ class _RecordingDelayer:
 
 
 class TestPrefillAdder(CustomTestCase):
+    def test_reused_chunked_slot_does_not_consume_new_slot_budget(self):
+        adder = self.create_adder(self.create_running_batch())
+        reused = SimpleNamespace(req_pool_idx=7)
+        new_reqs = [SimpleNamespace(req_pool_idx=None) for _ in range(7)]
+
+        adder._append_can_run(reused)
+        for req in new_reqs[:6]:
+            adder._append_can_run(req)
+
+        self.assertEqual(len(adder.can_run_list), 7)
+        self.assertEqual(adder.num_new_req_slots, 6)
+        self.assertFalse(adder.reached_req_pool_capacity(7))
+
+        adder._append_can_run(new_reqs[6])
+        self.assertEqual(adder.num_new_req_slots, 7)
+        self.assertTrue(adder.reached_req_pool_capacity(7))
+
     def setUp(self):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()

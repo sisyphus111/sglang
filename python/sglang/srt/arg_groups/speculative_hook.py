@@ -129,6 +129,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
             algo.validate_server_args(server_args)
 
+    _handle_decoupled_spec(server_args)
+
     if server_args.speculative_skip_dp_mlp_sync:
         assert server_args.speculative_algorithm == "EAGLE", (
             "--speculative-skip-dp-mlp-sync is only supported with "
@@ -142,6 +144,150 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if algo is not None:
         algo.handle_server_args(server_args)
+
+
+def _handle_decoupled_spec(server_args: ServerArgs) -> None:
+    """Validate the phase-one 1:1 decoupled verifier/drafter contract.
+
+    The verifier is a builtin speculative algorithm because it participates in
+    the standard V2 verify/overlap hierarchy. The drafter remains a plain
+    decode engine and is selected only by its role; its scheduler integration
+    owns rollback and transport without pretending there is a colocated draft
+    worker.
+    """
+
+    role = getattr(server_args, "decoupled_spec_role", "null")
+    algorithm = getattr(server_args, "speculative_algorithm", None)
+
+    if role == "null":
+        if algorithm == "DECOUPLED_VERIFY":
+            raise ValueError(
+                "--speculative-algorithm DECOUPLED_VERIFY requires "
+                "--decoupled-spec-role verifier."
+            )
+        return
+    if role not in ("verifier", "drafter"):
+        raise ValueError(f"Unsupported decoupled speculative role: {role!r}.")
+
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
+        raise ValueError(
+            "Active decoupled speculative decoding requires the native C++ "
+            "data plane. Set SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND=1 for both "
+            "verifier and drafter; the Python implementation is retained only "
+            "as a CPU semantic reference."
+        )
+
+    if role == "verifier":
+        if algorithm != "DECOUPLED_VERIFY":
+            raise ValueError(
+                "The decoupled verifier requires "
+                "--speculative-algorithm DECOUPLED_VERIFY."
+            )
+    else:
+        if algorithm is not None:
+            raise ValueError(
+                "The decoupled drafter is a plain decode engine and requires "
+                "--speculative-algorithm to be unset."
+            )
+        if not server_args.disable_overlap_schedule:
+            raise ValueError(
+                "The phase-one decoupled drafter requires "
+                "--disable-overlap-schedule."
+            )
+        if server_args.tp_size != 1:
+            raise ValueError(
+                "The phase-one decoupled drafter requires tp_size == 1, "
+                f"got {server_args.tp_size}."
+            )
+        if server_args.page_size != 1:
+            raise ValueError(
+                "The phase-one decoupled drafter requires page_size == 1 for "
+                "token-granular KV rollback."
+            )
+        if getattr(server_args, "enable_linear_replayssm", False):
+            raise ValueError(
+                "The phase-one decoupled drafter requires ReplaySSM disabled "
+                "because dense checkpoints do not copy its pending ring."
+            )
+    if server_args.dp_size != 1:
+        raise ValueError(
+            f"The phase-one decoupled {role} requires dp_size == 1, "
+            f"got {server_args.dp_size}."
+        )
+    if server_args.pp_size != 1:
+        raise ValueError(
+            f"The phase-one decoupled {role} requires pp_size == 1, "
+            f"got {server_args.pp_size}."
+        )
+
+    bind_endpoint = server_args.decoupled_spec_bind_endpoint
+    connect_endpoints = server_args.decoupled_spec_connect_endpoints
+    rank = server_args.decoupled_spec_rank
+    if bind_endpoint is None or connect_endpoints is None or rank is None:
+        raise ValueError(
+            "--decoupled-spec-bind-endpoint, "
+            "--decoupled-spec-connect-endpoints, and "
+            "--decoupled-spec-rank are required for decoupled speculative decoding."
+        )
+    if not isinstance(connect_endpoints, (list, tuple)) or len(connect_endpoints) != 1:
+        raise ValueError(
+            "Phase-one decoupled speculation supports exactly one peer endpoint, "
+            f"got {connect_endpoints!r}."
+        )
+    if int(rank) != 0:
+        raise ValueError(
+            "Phase-one 1:1 decoupled speculation requires "
+            f"--decoupled-spec-rank 0, got {rank}."
+        )
+
+    topk = server_args.speculative_eagle_topk
+    if topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(topk) != 1:
+        raise ValueError(
+            "Decoupled speculation currently requires "
+            f"--speculative-eagle-topk 1, got {topk}."
+        )
+
+    num_steps = server_args.speculative_num_steps
+    if num_steps is None or int(num_steps) <= 0:
+        raise ValueError(
+            "Decoupled speculation requires a positive "
+            "--speculative-num-steps (the linear draft count K)."
+        )
+    num_steps = int(num_steps)
+    server_args.speculative_num_steps = num_steps
+
+    if role == "drafter":
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = 1
+        checkpoint_slots_per_request = 2 * num_steps + 1
+        required_mamba_slots = int(server_args.max_running_requests) * (
+            checkpoint_slots_per_request + 1
+        )
+        if server_args.max_mamba_cache_size is None:
+            server_args.max_mamba_cache_size = required_mamba_slots
+        elif int(server_args.max_mamba_cache_size) < required_mamba_slots:
+            raise ValueError(
+                "The decoupled drafter Mamba pool cannot hold its active and "
+                "rollback checkpoint slots: "
+                f"max_mamba_cache_size={server_args.max_mamba_cache_size} "
+                f"required={required_mamba_slots}."
+            )
+
+    expected_num_verify_tokens = num_steps + 1
+    num_verify_tokens = server_args.speculative_num_draft_tokens
+    if num_verify_tokens is None:
+        server_args.speculative_num_draft_tokens = expected_num_verify_tokens
+    elif int(num_verify_tokens) != expected_num_verify_tokens:
+        raise ValueError(
+            "For topk=1 decoupled speculation, "
+            "--speculative-num-draft-tokens must equal "
+            "--speculative-num-steps + 1; "
+            f"got {num_verify_tokens} and {num_steps}."
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:

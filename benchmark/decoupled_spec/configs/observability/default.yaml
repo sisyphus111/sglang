@@ -1,0 +1,10 @@
+schema_version: 1
+interval_s: 1.0
+request_timeout_s: 0.8
+targets:
+  verifier:
+    base_url: http://127.0.0.1:30000
+  drafter:
+    base_url: http://127.0.0.1:30001
+loads:
+  include: [core, spec, queues]

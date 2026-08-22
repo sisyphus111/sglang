@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -26,7 +26,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")
 
 
-class TestSchedulerPauseGeneration(unittest.TestCase):
+class TestSchedulerPauseGeneration(CustomTestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
@@ -60,6 +60,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.hisparse_coordinator = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
+        scheduler.decoupled_spec_manager = None
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -390,6 +391,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         self.assertEqual(event_log, ["drain", "requeue-released"])
         self.assertEqual(len(scheduler.result_queue), 0)
+
+    def test_retract_requeues_requests_added_by_decoupled_manager_hook(self):
+        scheduler = self._new_scheduler()
+        running_req = self._make_req("running")
+        sleeping_req = self._make_req("sleeping")
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[running_req], with_tensors=True
+        )
+        scheduler.decoupled_spec_manager = MagicMock()
+        scheduler.decoupled_spec_manager.prepare_pause_retract.return_value = [
+            running_req,
+            sleeping_req,
+        ]
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler.decoupled_spec_manager.prepare_pause_retract.assert_called_once_with(
+            [running_req]
+        )
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [running_req, sleeping_req]
+        )
+        self.assertTrue(all(entry["is_retracted"] for entry in requeue_log))
+        self.assertEqual(running_req.retraction_count, 1)
+        self.assertEqual(sleeping_req.retraction_count, 1)
 
     def test_retract_empty_running_batch_requeues_nothing(self):
         """retract with empty running_batch must not release or requeue any request."""

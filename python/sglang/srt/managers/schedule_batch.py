@@ -1081,8 +1081,14 @@ class Req(ReqDllmMixin):
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
 
-        # Per-request count of accepted draft tokens (excludes the bonus token).
+        # Per-request count of correct draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
+
+        # Per-request count of draft tokens actually presented to the verifier.
+        self.spec_num_proposed_drafts = 0
+
+        # Histogram index = number of drafts actually presented in one verify row.
+        self.spec_proposed_drafts_histogram: List[int] = []
 
         self.spec_num_block_accept_tokens = 0
 
@@ -1200,6 +1206,15 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def update_spec_proposed_drafts_histogram(self, num_proposed_drafts: int):
+        """Update the histogram of actual drafts presented per verify row."""
+        if len(self.spec_proposed_drafts_histogram) <= num_proposed_drafts:
+            self.spec_proposed_drafts_histogram.extend(
+                [0]
+                * (num_proposed_drafts - len(self.spec_proposed_drafts_histogram) + 1)
+            )
+        self.spec_proposed_drafts_histogram[num_proposed_drafts] += 1
 
     def update_spec_cap_lens_histogram(self, cap_len: int):
         cap_len = int(cap_len)
@@ -2051,6 +2066,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
+
+    # One-forward GPU-tail selection results. The authoritative rolling tail
+    # remains owned by the verifier data plane, outside ScheduleBatch.
+    decoupled_launch_mirror_ids: Optional[List[str]] = None
+    decoupled_rebase_valid: Optional[torch.Tensor] = None
+    decoupled_selected_draft_lens: Optional[torch.Tensor] = None
+    decoupled_pre_verify_output_lens: Optional[torch.Tensor] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -3184,6 +3206,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            decoupled_launch_mirror_ids=(
+                None
+                if self.decoupled_launch_mirror_ids is None
+                else list(self.decoupled_launch_mirror_ids)
+            ),
+            decoupled_rebase_valid=self.decoupled_rebase_valid,
+            decoupled_selected_draft_lens=self.decoupled_selected_draft_lens,
+            decoupled_pre_verify_output_lens=self.decoupled_pre_verify_output_lens,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

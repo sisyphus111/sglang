@@ -295,7 +295,9 @@ class _GenerationStreamAccumulator:
     audio_tokens: list = field(default_factory=list)
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
+    spec_num_proposed_drafts: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_proposed_drafts_histogram: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
     spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
@@ -360,6 +362,12 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_logprobs = []
 
     def accept(self, *, req: Req) -> None:
+        # Drafter mirrors are scheduler-internal requests with no
+        # TokenizerManager state. Their tokens leave through the decoupled data
+        # plane, so do not build or send generic HTTP/detokenizer output.
+        if getattr(req, "decoupled_draft_generation", None) is not None:
+            return
+
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -450,7 +458,11 @@ class _GenerationStreamAccumulator:
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
+            self.spec_num_proposed_drafts.append(req.spec_num_proposed_drafts)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_proposed_drafts_histogram.append(
+                req.spec_proposed_drafts_histogram
+            )
             self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
             self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
@@ -616,7 +628,9 @@ class _GenerationStreamAccumulator:
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
+            spec_num_proposed_drafts=self.spec_num_proposed_drafts,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_proposed_drafts_histogram=self.spec_proposed_drafts_histogram,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,

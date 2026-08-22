@@ -1,0 +1,6 @@
+interface:
+  display_name: "Operate Decoupled-Spec Servers"
+  short_description: "Operate verifier and drafter servers safely"
+  default_prompt: "Use $operate-decoupled-spec-servers to validate and launch the verifier and drafter as separate server processes."
+policy:
+  allow_implicit_invocation: true

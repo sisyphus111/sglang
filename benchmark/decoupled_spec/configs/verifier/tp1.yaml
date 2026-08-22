@@ -1,0 +1,22 @@
+schema_version: 1
+role: verifier
+runtime:
+  cuda_visible_devices: ["0"]
+  env:
+    SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
+server_args:
+  model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-27B
+  tp_size: 1
+  host: 127.0.0.1
+  port: 30000
+  enable_metrics: true
+  uvicorn_access_log_exclude_prefixes: [/metrics, /v1/loads, /health]
+  speculative_algorithm: DECOUPLED_VERIFY
+  speculative_num_steps: 3
+  speculative_eagle_topk: 1
+  speculative_num_draft_tokens: 4
+  disable_overlap_schedule: false
+  decoupled_spec_role: verifier
+  decoupled_spec_rank: 0
+  decoupled_spec_bind_endpoint: tcp://127.0.0.1:31000
+  decoupled_spec_connect_endpoints: [tcp://127.0.0.1:31001]

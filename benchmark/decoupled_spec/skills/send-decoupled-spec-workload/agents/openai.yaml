@@ -1,0 +1,6 @@
+interface:
+  display_name: "Send Decoupled-Spec Workload"
+  short_description: "Prepare and send one streaming benchmark batch"
+  default_prompt: "Use $send-decoupled-spec-workload to inspect a client config and submit one tokenized streaming batch."
+policy:
+  allow_implicit_invocation: true
