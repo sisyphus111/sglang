@@ -160,6 +160,25 @@ def validate_samples(
                         )
                     decode_windows[key] = window
         report["decode_metrics_window_count"] = len(decode_windows)
+        summary_decode_metrics = summary.get("decode_metrics")
+        summary_role_metrics = (
+            summary_decode_metrics.get(role)
+            if isinstance(summary_decode_metrics, dict)
+            else None
+        )
+        if decode_windows:
+            if not isinstance(summary_role_metrics, dict):
+                errors.append(f"{role}: collector summary lacks decode metrics")
+            elif int(summary_role_metrics.get("window_count", -1)) != len(
+                decode_windows
+            ):
+                errors.append(
+                    f"{role}: collector decode window count does not match samples: "
+                    f"summary={summary_role_metrics.get('window_count')!r}, "
+                    f"observed={len(decode_windows)}"
+                )
+            elif not isinstance(summary_role_metrics.get("scheduler_cycle_ms"), dict):
+                errors.append(f"{role}: collector summary lacks scheduler cycle stats")
         decode_window_gaps: dict[int, list[int]] = {}
         for dp_rank in sorted({key[0] for key in decode_windows}):
             ids = sorted(key[1] for key in decode_windows if key[0] == dp_rank)

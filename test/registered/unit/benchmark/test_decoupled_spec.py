@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,7 @@ from client import (
     run_batch,
 )
 from common.collector import collect as collect_observability
+from generate_report import generate_report
 from metrics import summarize, write_records
 from plot_observability import render_observability
 from plot_speculative import render_speculative
@@ -38,12 +40,65 @@ from config import load_yaml, validate_role_pair
 
 
 class TestDecoupledSpecBenchmark(CustomTestCase):
+    def test_report_keeps_verifier_and_drafter_cycle_stats_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            (run_dir / "client").mkdir()
+            (run_dir / "observability").mkdir()
+            (run_dir / "client" / "summary.json").write_text(
+                json.dumps({"batch_size": 8}), encoding="utf-8"
+            )
+            (run_dir / "observability" / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "decode_metrics": {
+                            "verifier": {
+                                "window_count": 3,
+                                "scheduler_cycle_ms": {
+                                    "mean": 10.0,
+                                    "p50": 9.5,
+                                    "p95": 11.0,
+                                },
+                                "mean_batch_size": 8.0,
+                                "mean_context_length": 1000.0,
+                                "valid_draft_length": 1.5,
+                                "accept_length": 2.0,
+                            },
+                            "drafter": {
+                                "window_count": 4,
+                                "scheduler_cycle_ms": {
+                                    "mean": 7.0,
+                                    "p50": 6.5,
+                                    "p95": 8.0,
+                                },
+                                "mean_batch_size": 8.0,
+                                "mean_context_length": 1010.0,
+                                "valid_draft_length": None,
+                                "accept_length": None,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            generate_report(run_dir)
+
+            report = (run_dir / "plots" / "run_report.md").read_text(encoding="utf-8")
+            self.assertIn("| verifier | 3 | 10.000 ms", report)
+            self.assertIn("| drafter | 4 | 7.000 ms", report)
+
     def test_collector_preserves_decode_metrics_http_payload(self):
         async def exercise():
+            window_end_times = {}
+
             async def metadata(_request):
                 return web.json_response({"model_path": "mock"})
 
-            async def loads(_request):
+            async def loads(request):
+                role = request.match_info["role"]
+                window_end_time = window_end_times.setdefault(role, time.time())
+                is_verifier = role == "verifier"
                 return web.json_response(
                     {
                         "loads": [
@@ -52,18 +107,26 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
                                 "decode_metrics_windows": [
                                     {
                                         "window_id": 9,
-                                        "end_time": 100.0,
+                                        "end_time": window_end_time,
                                         "num_decode_iters": 40,
-                                        "iter_latency_ms": 10.0,
+                                        "iter_latency_ms": (
+                                            10.0 if is_verifier else 7.0
+                                        ),
                                         "num_decode_rows": 320,
                                         "sum_context_lens": 3_200_000,
                                         "mean_batch_size": 8.0,
                                         "mean_context_length": 10_000.0,
-                                        "num_verify_rows": 320,
-                                        "num_accept_tokens": 640,
-                                        "num_proposed_drafts": 480,
-                                        "accept_length": 2.0,
-                                        "proposed_draft_length": 1.5,
+                                        "num_verify_rows": 320 if is_verifier else 0,
+                                        "num_accept_tokens": (
+                                            640 if is_verifier else 0
+                                        ),
+                                        "num_proposed_drafts": (
+                                            480 if is_verifier else 0
+                                        ),
+                                        "accept_length": (2.0 if is_verifier else None),
+                                        "proposed_draft_length": (
+                                            1.5 if is_verifier else None
+                                        ),
                                     }
                                 ],
                             }
@@ -72,9 +135,9 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
                 )
 
             app = web.Application()
-            app.router.add_get("/model_info", metadata)
-            app.router.add_get("/server_info", metadata)
-            app.router.add_get("/v1/loads", loads)
+            app.router.add_get("/{role}/model_info", metadata)
+            app.router.add_get("/{role}/server_info", metadata)
+            app.router.add_get("/{role}/v1/loads", loads)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -88,8 +151,12 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
                             "interval_s": 0.01,
                             "request_timeout_s": 0.5,
                             "targets": {
-                                "verifier": {"base_url": f"http://127.0.0.1:{port}"},
-                                "drafter": {"base_url": f"http://127.0.0.1:{port}"},
+                                "verifier": {
+                                    "base_url": f"http://127.0.0.1:{port}/verifier"
+                                },
+                                "drafter": {
+                                    "base_url": f"http://127.0.0.1:{port}/drafter"
+                                },
                             },
                             "loads": {"include": ["core", "spec", "queues"]},
                         },
@@ -107,13 +174,27 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
 
             self.assertGreaterEqual(summary["sample_ct"], 2)
             self.assertTrue(samples)
+            self.assertEqual(set(summary["decode_metrics"]), {"verifier", "drafter"})
+            for role in ("verifier", "drafter"):
+                metrics = summary["decode_metrics"][role]
+                self.assertEqual(metrics["window_count"], 1)
+                expected_cycle = 10.0 if role == "verifier" else 7.0
+                self.assertEqual(metrics["scheduler_cycle_ms"]["mean"], expected_cycle)
+                self.assertEqual(metrics["scheduler_cycle_ms"]["p50"], expected_cycle)
+                self.assertEqual(metrics["scheduler_cycle_ms"]["p95"], expected_cycle)
+                self.assertEqual(metrics["mean_batch_size"], 8.0)
+                self.assertEqual(metrics["mean_context_length"], 10_000.0)
             for sample in samples:
                 window = sample["payload"]["loads"][0]["decode_metrics_windows"][0]
                 self.assertEqual(window["window_id"], 9)
                 self.assertEqual(window["mean_batch_size"], 8.0)
                 self.assertEqual(window["mean_context_length"], 10_000.0)
-                self.assertEqual(window["proposed_draft_length"], 1.5)
-                self.assertEqual(window["accept_length"], 2.0)
+                if sample["role"] == "verifier":
+                    self.assertEqual(window["proposed_draft_length"], 1.5)
+                    self.assertEqual(window["accept_length"], 2.0)
+                else:
+                    self.assertIsNone(window["proposed_draft_length"])
+                    self.assertIsNone(window["accept_length"])
 
         asyncio.run(exercise())
 
@@ -226,6 +307,10 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
             manifest = render_observability(run_dir)
 
             self.assertEqual(manifest["decode_metrics_window_ct"], 3)
+            self.assertEqual(
+                manifest["decode_metrics_window_ct_by_role"],
+                {"drafter": 1, "verifier": 2},
+            )
             self.assertEqual(len(manifest["outputs"]), 4)
             self.assertTrue(
                 (observability_dir / "plots" / "decode_metrics.svg").is_file()

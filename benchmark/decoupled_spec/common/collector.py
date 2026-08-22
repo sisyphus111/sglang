@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import signal
 import sys
 import time
@@ -16,6 +17,108 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common.artifacts import update_status, write_json
+
+
+def _nearest_rank(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(quantile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def _update_decode_metric_windows(
+    record: dict[str, Any],
+    windows: dict[tuple[str, int, int], dict[str, Any]],
+    min_end_time: float,
+) -> None:
+    """Deduplicate one HTTP sample's bounded history without projecting it."""
+    if record.get("error") is not None:
+        return
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    role = str(record["role"])
+    for load in payload.get("loads", []):
+        if not isinstance(load, dict):
+            continue
+        dp_rank = int(load.get("dp_rank", 0))
+        for window in load.get("decode_metrics_windows") or []:
+            if not isinstance(window, dict) or not isinstance(
+                window.get("window_id"), int
+            ):
+                raise ValueError(
+                    f"{role}: invalid decode_metrics_windows entry: {window!r}"
+                )
+            if float(window["end_time"]) < min_end_time:
+                continue
+            key = (role, dp_rank, int(window["window_id"]))
+            previous = windows.get(key)
+            if previous is not None and previous != window:
+                raise ValueError(f"conflicting decode metrics window: {key}")
+            windows[key] = window
+
+
+def _summarize_decode_metric_windows(
+    windows: dict[tuple[str, int, int], dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    by_role: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for (role, dp_rank, _), window in windows.items():
+        by_role.setdefault(role, []).append((dp_rank, window))
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for role, entries in sorted(by_role.items()):
+        num_decode_iters = sum(int(window["num_decode_iters"]) for _, window in entries)
+        num_decode_rows = sum(int(window["num_decode_rows"]) for _, window in entries)
+        sum_context_lens = sum(int(window["sum_context_lens"]) for _, window in entries)
+        num_verify_rows = sum(int(window["num_verify_rows"]) for _, window in entries)
+        num_accept_tokens = sum(
+            int(window["num_accept_tokens"]) for _, window in entries
+        )
+        num_proposed_drafts = sum(
+            int(window["num_proposed_drafts"]) for _, window in entries
+        )
+        cycle_values = [float(window["iter_latency_ms"]) for _, window in entries]
+        weighted_cycle_ms = (
+            sum(
+                float(window["iter_latency_ms"]) * int(window["num_decode_iters"])
+                for _, window in entries
+            )
+            / num_decode_iters
+            if num_decode_iters > 0
+            else None
+        )
+        summaries[role] = {
+            "window_count": len(entries),
+            "dp_ranks": sorted({dp_rank for dp_rank, _ in entries}),
+            "first_window_end_time": min(
+                float(window["end_time"]) for _, window in entries
+            ),
+            "last_window_end_time": max(
+                float(window["end_time"]) for _, window in entries
+            ),
+            "num_decode_iters": num_decode_iters,
+            "scheduler_cycle_ms": {
+                "mean": weighted_cycle_ms,
+                "min": min(cycle_values),
+                "p50": _nearest_rank(cycle_values, 0.50),
+                "p95": _nearest_rank(cycle_values, 0.95),
+                "max": max(cycle_values),
+            },
+            "mean_batch_size": (
+                num_decode_rows / num_decode_iters if num_decode_iters > 0 else None
+            ),
+            "mean_context_length": (
+                sum_context_lens / num_decode_rows if num_decode_rows > 0 else None
+            ),
+            "valid_draft_length": (
+                num_proposed_drafts / num_verify_rows if num_verify_rows > 0 else None
+            ),
+            "accept_length": (
+                num_accept_tokens / num_verify_rows if num_verify_rows > 0 else None
+            ),
+        }
+    return summaries
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -123,6 +226,7 @@ async def collect(
     started_wall_time = time.time()
     started_ns = time.monotonic_ns()
     sample_ct = error_ct = 0
+    decode_metric_windows: dict[tuple[str, int, int], dict[str, Any]] = {}
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for role, target in config["targets"].items():
             base_url = target["base_url"]
@@ -156,6 +260,9 @@ async def collect(
                 for record in records:
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
                     error_ct += int(record["error"] is not None)
+                    _update_decode_metric_windows(
+                        record, decode_metric_windows, started_wall_time
+                    )
                 stream.flush()
                 sample_ct += 1
                 deadline += interval_s
@@ -173,6 +280,7 @@ async def collect(
         "sample_ct": sample_ct,
         "target_ct": len(config["targets"]),
         "error_ct": error_ct,
+        "decode_metrics": _summarize_decode_metric_windows(decode_metric_windows),
     }
     write_json(output_dir / "summary.json", summary)
     return summary
@@ -205,6 +313,10 @@ def main() -> None:
             "completed",
             sample_ct=summary["sample_ct"],
             error_ct=summary["error_ct"],
+            decode_metric_window_counts={
+                role: metrics["window_count"]
+                for role, metrics in summary["decode_metrics"].items()
+            },
         )
     except BaseException as exc:
         update_status(run_dir, "observability", "failed", error=repr(exc))

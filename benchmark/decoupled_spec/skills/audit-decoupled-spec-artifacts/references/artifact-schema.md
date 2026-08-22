@@ -38,6 +38,10 @@ number of JSONL records = sample_ct * target_ct
 observed unsuccessful records = error_ct
 ```
 
+When decode windows are present, `observability/summary.json.decode_metrics`
+must reproduce the unique per-role window counts from `samples.jsonl`. Verifier
+and drafter scheduler-cycle statistics remain separate.
+
 Both roles require successful samples at or before formal start and at or after
 formal finish. Runs at least one sampling interval long also require a
 successful sample inside the formal window.

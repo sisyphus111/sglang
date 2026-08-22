@@ -505,6 +505,8 @@ Speculative decoding 一轮可能接受多个 token，同一 SSE event 也可能
 
 窗口带单调 `window_id` 和 `end_time`。Collector 只保存 HTTP 原始响应；`plot_observability.py` 离线去重窗口并绘制共享时间轴的 scheduler cycle、mean batch size、mean context length、valid draft length 和 accept length。该链路不解析 server log，也不增加 GPU 同步。
 
+Collector 的 `observability/summary.json` 会分别汇总 verifier 和 drafter，给出各自的窗口数、scheduler cycle mean/min/p50/p95/max、mean batch size 和 mean context length；verifier 还包含 valid draft length 与 accept length。重复出现在多个 HTTP sample 中的 bounded-history 窗口只统计一次。
+
 ## 6. 输出产物目录
 
 一轮完整实验的产物结构如下：

@@ -46,6 +46,12 @@ must deduplicate it by `(role, dp_rank, window_id)` and reject conflicting copie
 `proposed_draft_length` is the valid draft length actually presented to each
 verify request-row; it excludes the bonus token.
 
+`observability/summary.json.decode_metrics` aggregates these unique windows by
+role. `verifier.scheduler_cycle_ms` and `drafter.scheduler_cycle_ms` are separate
+distributions with mean/min/p50/p95/max fields. Their means are weighted by each
+window's `num_decode_iters`; batch/context/spec ratios are recomputed from raw
+window numerators and denominators rather than averaging ratios.
+
 Field availability depends on the server's enabled metrics and requested
 `loads.include` groups. Preserve the complete payload rather than projecting it
 to only these fields.

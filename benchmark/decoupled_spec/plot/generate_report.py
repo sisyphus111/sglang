@@ -45,6 +45,7 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         run_path / "roles" / "verifier" / "resolved_config.json",
         run_path / "roles" / "drafter" / "resolved_config.json",
         run_path / "client" / "resolved_config.json",
+        run_path / "observability" / "summary.json",
         run_path / "plots" / "request_latency_manifest.json",
         run_path / "plots" / "request_speculative_manifest.json",
         run_path / "observability" / "plots" / "plot_manifest.json",
@@ -54,10 +55,39 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
     verifier = _optional_json(run_path / "roles" / "verifier" / "resolved_config.json")
     drafter = _optional_json(run_path / "roles" / "drafter" / "resolved_config.json")
     client = _optional_json(run_path / "client" / "resolved_config.json")
+    observability = _optional_json(run_path / "observability" / "summary.json")
     verifier_args = verifier.get("server_args", {})
     drafter_args = drafter.get("server_args", {})
     dataset = client.get("dataset", {})
     generation = client.get("generation", {})
+    decode_metric_lines: list[str] = []
+    decode_metrics = observability.get("decode_metrics")
+    if isinstance(decode_metrics, dict) and decode_metrics:
+        decode_metric_lines = [
+            "### Decode-window telemetry",
+            "",
+            "| Role | Windows | Cycle mean | p50 | p95 | Mean BS | Mean context | Valid draft len | Accept len |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for role in ("verifier", "drafter"):
+            metrics = decode_metrics.get(role)
+            if not isinstance(metrics, dict):
+                continue
+            decode_metric_lines.append(
+                "| {role} | {windows} | {mean} ms | {p50} ms | {p95} ms | "
+                "{mean_bs} | {mean_context} | {valid_draft} | {accept} |".format(
+                    role=role,
+                    windows=metrics.get("window_count", 0),
+                    mean=_format(_nested(metrics, "scheduler_cycle_ms", "mean")),
+                    p50=_format(_nested(metrics, "scheduler_cycle_ms", "p50")),
+                    p95=_format(_nested(metrics, "scheduler_cycle_ms", "p95")),
+                    mean_bs=_format(metrics.get("mean_batch_size")),
+                    mean_context=_format(metrics.get("mean_context_length")),
+                    valid_draft=_format(metrics.get("valid_draft_length")),
+                    accept=_format(metrics.get("accept_length")),
+                )
+            )
+        decode_metric_lines.append("")
     figures = [
         path
         for path in (
@@ -111,6 +141,7 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         "| Accept length | "
         f"{_format(summary.get('spec_accept_length'))} tokens/verify |",
         "",
+        *decode_metric_lines,
         "### Latency distribution",
         "",
         "| Metric | Mean | p50 | p95 | p99 | Unit |",

@@ -32,6 +32,11 @@ Read [references/timing-boundaries.md](references/timing-boundaries.md), then:
 The collector may query `/model_info`, `/server_info`, and `/v1/loads`; it must
 not call `/generate`.
 
+Require `observability/summary.json.decode_metrics` to report verifier and
+drafter independently. For each role, preserve the unique window count and
+scheduler-cycle mean/min/p50/p95/max; do not merge the two roles into one cycle
+distribution.
+
 ## Interpret
 
 Read [references/loads-schema.md](references/loads-schema.md) when interpreting
@@ -47,6 +52,6 @@ trace with a narrower timing boundary.
 
 Return the sampling interval, formal-window duration, per-role successful/error
 sample counts, coverage before/inside/after the formal window, maximum sample
-gap, number of unique decode windows, and plot paths. Surface missing coverage
-or a missing decode-metrics plot as an observability failure even when the
-client request itself succeeded.
+gap, per-role unique decode-window counts and scheduler-cycle statistics, and
+plot paths. Surface missing coverage or a missing decode-metrics plot as an
+observability failure even when the client request itself succeeded.

@@ -307,6 +307,10 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
         outputs=outputs,
     )
     manifest["decode_metrics_window_ct"] = len(decode_metric_rows)
+    manifest["decode_metrics_window_ct_by_role"] = {
+        role: sum(row["role"] == role for row in decode_metric_rows)
+        for role in sorted({row["role"] for row in decode_metric_rows})
+    }
     manifest_path = output_dir / "plot_manifest.json"
     write_json(manifest_path, manifest)
     manifest["manifest_path"] = str(manifest_path)
