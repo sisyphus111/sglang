@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ def load_json(path: str | Path) -> dict[str, Any]:
 
 
 def load_csv(path: str | Path) -> list[dict[str, str]]:
+    # Long generations can put more than Python's 128 KiB default in one text
+    # field. The benchmark owns these local artifacts, so accept platform-size
+    # fields rather than truncating or dropping response provenance.
+    csv.field_size_limit(sys.maxsize)
     with Path(path).open(encoding="utf-8", newline="") as stream:
         return list(csv.DictReader(stream))
 

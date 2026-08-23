@@ -1,6 +1,6 @@
 interface:
   display_name: "Observe Decoupled-Spec Run"
   short_description: "Collect and validate service-level run telemetry"
-  default_prompt: "Use $observe-decoupled-spec-run to monitor both roles across the formal client request window."
+  default_prompt: "Use $observe-decoupled-spec-run to monitor every verifier and drafter engine from a ready server manifest."
 policy:
   allow_implicit_invocation: true

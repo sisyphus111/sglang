@@ -18,6 +18,8 @@ from common.artifacts import write_json
 from plot_utils import COLORS, build_manifest, save_figure, style_axis
 
 ROLE_COLORS = {"verifier": COLORS[0], "drafter": COLORS[1]}
+ROLE_COLOR_INDICES = {"verifier": (0, 2, 4), "drafter": (1, 3, 5)}
+TARGET_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
 
 
 def _load_samples(path: Path) -> list[dict[str, Any]]:
@@ -28,12 +30,18 @@ def _load_samples(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _spec_metric(item: dict[str, Any], name: str) -> Any:
+    speculative = item.get("speculative")
+    return speculative.get(name) if isinstance(speculative, dict) else None
+
+
 def _extract_decode_metric_rows(
     samples: list[dict[str, Any]], origin: float
 ) -> list[dict[str, Any]]:
-    """Deduplicate the bounded engine-side window history by role/rank/id."""
+    """Deduplicate bounded engine windows by HTTP target, DP rank, and ID."""
     rows: dict[tuple[str, int, int], dict[str, Any]] = {}
     for sample in samples:
+        target_id = str(sample.get("target_id", sample["role"]))
         for load in sample.get("payload", {}).get("loads", []):
             dp_rank = int(load.get("dp_rank", 0))
             for window in load.get("decode_metrics_windows") or []:
@@ -43,42 +51,73 @@ def _extract_decode_metric_rows(
                 if end_time < origin:
                     continue
                 row = {
+                    "target_id": target_id,
                     "role": sample["role"],
+                    "rank": int(sample.get("rank", 0)),
                     "dp_rank": dp_rank,
                     "time_s": end_time - origin,
                     **window,
                 }
-                key = (sample["role"], dp_rank, int(window["window_id"]))
+                key = (target_id, dp_rank, int(window["window_id"]))
                 previous = rows.get(key)
                 if previous is not None and previous != row:
                     raise ValueError(f"conflicting decode metrics window: {key}")
                 rows[key] = row
     return sorted(
         rows.values(),
-        key=lambda row: (row["time_s"], row["role"], row["dp_rank"]),
+        key=lambda row: (row["time_s"], row["target_id"], row["dp_rank"]),
     )
 
 
 def render_observability(run_dir: str | Path) -> dict[str, Any]:
     run_path = Path(run_dir).expanduser().resolve()
     samples_path = run_path / "observability" / "samples.jsonl"
+    all_samples = _load_samples(samples_path)
     samples = [
         sample
-        for sample in _load_samples(samples_path)
+        for sample in all_samples
         if sample.get("error") is None and sample.get("payload", {}).get("loads")
     ]
     if not samples:
         raise ValueError("no successful /v1/loads samples to plot")
     origin = min(sample["collected_wall_time"] for sample in samples)
     series: dict[str, list[dict[str, Any]]] = {}
-    for sample in samples:
-        load = sample["payload"]["loads"][0]
-        series.setdefault(sample["role"], []).append(
+    target_roles: dict[str, str] = {}
+    target_ranks: dict[str, int] = {}
+    for sample in all_samples:
+        target_id = str(sample.get("target_id", sample["role"]))
+        role = str(sample["role"])
+        rank = int(sample.get("rank", 0))
+        previous_role = target_roles.setdefault(target_id, role)
+        if previous_role != role:
+            raise ValueError(f"conflicting roles for target {target_id}")
+        previous_rank = target_ranks.setdefault(target_id, rank)
+        if previous_rank != rank:
+            raise ValueError(f"conflicting ranks for target {target_id}")
+        payload = sample.get("payload")
+        loads = payload.get("loads") if isinstance(payload, dict) else None
+        load = loads[0] if isinstance(loads, list) and loads else {}
+        series.setdefault(target_id, []).append(
             {
                 "time_s": sample["collected_wall_time"] - origin,
+                "role": role,
+                "rank": rank,
                 **load,
             }
         )
+    target_colors = {
+        target_id: COLORS[
+            ROLE_COLOR_INDICES[target_roles[target_id]][
+                target_ranks[target_id]
+                % len(ROLE_COLOR_INDICES[target_roles[target_id]])
+            ]
+        ]
+        for target_id in series
+    }
+    target_markers = {
+        target_id: TARGET_MARKERS[target_ranks[target_id] % len(TARGET_MARKERS)]
+        for target_id in series
+    }
 
     formal_path = run_path / "client" / "formal_window.json"
     formal_window = (
@@ -90,73 +129,85 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
 
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 6.4), sharex=True)
     ax_requests, ax_throughput, ax_usage, ax_spec = axes.flat
-    for role in ("verifier", "drafter"):
-        values = sorted(series.get(role, []), key=lambda item: item["time_s"])
-        if not values:
-            continue
+    for target_id, target_values in sorted(series.items()):
+        values = sorted(target_values, key=lambda item: item["time_s"])
+        role = target_roles[target_id]
         times = [item["time_s"] for item in values]
-        color = ROLE_COLORS[role]
+        color = target_colors[target_id]
+        marker = target_markers[target_id]
         ax_requests.plot(
             times,
-            [item.get("num_running_reqs", 0) for item in values],
+            [item.get("num_running_reqs") for item in values],
             color=color,
-            label=f"{role} running",
+            marker=marker,
+            markersize=2.5,
+            label=f"{target_id} running",
         )
         ax_requests.plot(
             times,
-            [item.get("num_waiting_reqs", 0) for item in values],
+            [item.get("num_waiting_reqs") for item in values],
             color=color,
             linestyle="--",
+            marker=marker,
+            markersize=2.5,
             alpha=0.7,
-            label=f"{role} waiting",
+            label=f"{target_id} waiting",
         )
         ax_throughput.plot(
             times,
-            [item.get("gen_throughput", 0) for item in values],
+            [item.get("gen_throughput") for item in values],
             color=color,
-            label=role,
+            marker=marker,
+            markersize=2.5,
+            label=target_id,
         )
         ax_usage.plot(
             times,
-            [item.get("token_usage", 0) for item in values],
+            [item.get("token_usage") for item in values],
             color=color,
-            label=role,
+            marker=marker,
+            markersize=2.5,
+            label=target_id,
         )
         if role == "verifier":
-            spec_values = [item for item in values if item.get("speculative")]
             ax_spec.plot(
-                [item["time_s"] for item in spec_values],
-                [item["speculative"].get("accept_length") for item in spec_values],
-                color=COLORS[2],
-                label="accept length",
+                times,
+                [_spec_metric(item, "accept_length") for item in values],
+                color=color,
+                marker=marker,
+                markersize=2.5,
+                label=f"{target_id} accept length",
             )
             ax_spec.plot(
-                [item["time_s"] for item in spec_values],
-                [item["speculative"].get("accept_rate") for item in spec_values],
-                color=COLORS[3],
-                label="accept rate",
+                times,
+                [_spec_metric(item, "accept_rate") for item in values],
+                color=color,
+                linestyle="--",
+                marker=marker,
+                markersize=2.5,
+                label=f"{target_id} accept rate",
             )
             ax_spec.plot(
-                [item["time_s"] for item in spec_values],
-                [
-                    item["speculative"].get("proposed_draft_length")
-                    for item in spec_values
-                ],
-                color=COLORS[4],
-                label="proposed draft length",
+                times,
+                [_spec_metric(item, "proposed_draft_length") for item in values],
+                color=color,
+                linestyle=":",
+                marker=marker,
+                markersize=2.5,
+                label=f"{target_id} proposed draft length",
             )
             ax_spec.plot(
-                [item["time_s"] for item in spec_values],
-                [
-                    item["speculative"].get("draft_occupancy_rate")
-                    for item in spec_values
-                ],
-                color=COLORS[5],
-                label="draft occupancy",
+                times,
+                [_spec_metric(item, "draft_occupancy_rate") for item in values],
+                color=color,
+                linestyle="-.",
+                marker=marker,
+                markersize=2.5,
+                label=f"{target_id} draft occupancy",
             )
 
     for axis, title, ylabel in (
-        (ax_requests, "Scheduler requests", "requests"),
+        (ax_requests, "Running batch size and queue", "requests"),
         (ax_throughput, "Generation throughput", "tokens/s"),
         (ax_usage, "KV token usage", "fraction"),
         (ax_spec, "Speculative decoding", "value"),
@@ -177,6 +228,7 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
                 alpha=0.10,
                 linewidth=0,
             )
+    ax_requests.set_ylim(bottom=0)
     output_dir = run_path / "observability" / "plots"
     outputs = list(
         save_figure(
@@ -189,19 +241,23 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
     if decode_metric_rows:
         decode_fig, decode_axes = plt.subplots(5, 1, figsize=(10.5, 11.8), sharex=True)
         ax_iter, ax_batch, ax_context, ax_valid_draft, ax_accept = decode_axes
-        grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
         for row in decode_metric_rows:
-            grouped.setdefault((row["role"], row["dp_rank"]), []).append(row)
+            grouped.setdefault(
+                (row["target_id"], row["role"], row["dp_rank"]), []
+            ).append(row)
 
-        for (role, dp_rank), values in sorted(grouped.items()):
+        for (target_id, role, dp_rank), values in sorted(grouped.items()):
             values.sort(key=lambda item: item["time_s"])
-            label = role if dp_rank == 0 else f"{role} dp{dp_rank}"
+            label = target_id if dp_rank == 0 else f"{target_id} dp{dp_rank}"
+            color = target_colors.get(target_id, ROLE_COLORS.get(role, COLORS[2]))
+            marker = target_markers.get(target_id, "o")
             ax_iter.plot(
                 [item["time_s"] for item in values],
                 [item["iter_latency_ms"] for item in values],
-                color=ROLE_COLORS.get(role, COLORS[2]),
+                color=color,
                 linewidth=1.0,
-                marker="o",
+                marker=marker,
                 markersize=2.5,
                 alpha=0.8,
                 label=label,
@@ -209,9 +265,9 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
             ax_batch.plot(
                 [item["time_s"] for item in values],
                 [item["mean_batch_size"] for item in values],
-                color=ROLE_COLORS.get(role, COLORS[2]),
+                color=color,
                 linewidth=1.0,
-                marker="o",
+                marker=marker,
                 markersize=2.5,
                 alpha=0.8,
                 label=label,
@@ -219,9 +275,9 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
             ax_context.plot(
                 [item["time_s"] for item in values],
                 [item["mean_context_length"] for item in values],
-                color=ROLE_COLORS.get(role, COLORS[2]),
+                color=color,
                 linewidth=1.0,
-                marker="o",
+                marker=marker,
                 markersize=2.5,
                 alpha=0.8,
                 label=label,
@@ -237,27 +293,35 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
             ax_valid_draft.plot(
                 [item["time_s"] for item in spec_values],
                 [item["proposed_draft_length"] for item in spec_values],
-                color=COLORS[2],
+                color=color,
                 linewidth=1.0,
-                marker="o",
+                marker=marker,
                 markersize=2.5,
                 alpha=0.8,
-                label="verifier",
+                label=label,
             )
             ax_accept.plot(
                 [item["time_s"] for item in spec_values],
                 [item["accept_length"] for item in spec_values],
-                color=COLORS[3],
+                color=color,
+                linestyle="--",
                 linewidth=1.0,
-                marker="o",
+                marker=marker,
                 markersize=2.5,
                 alpha=0.8,
-                label="verifier",
+                label=label,
             )
 
-        ax_accept.axhline(1.0, color="#777777", linewidth=0.8, linestyle="--")
+        has_spec_metrics = any(
+            row["role"] == "verifier"
+            and row.get("proposed_draft_length") is not None
+            and row.get("accept_length") is not None
+            for row in decode_metric_rows
+        )
+        if has_spec_metrics:
+            ax_accept.axhline(1.0, color="#777777", linewidth=0.8, linestyle="--")
         for axis, title, ylabel in (
-            (ax_iter, "Scheduler cycle", "iteration latency (ms)"),
+            (ax_iter, "Iteration latency", "iteration latency (ms)"),
             (ax_batch, "Mean batch size", "requests / iteration"),
             (ax_context, "Mean context length", "tokens / request"),
             (
@@ -285,10 +349,11 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
                     alpha=0.10,
                     linewidth=0,
                 )
+        ax_iter.set_ylim(bottom=0)
         ax_batch.set_ylim(bottom=0)
         ax_context.set_ylim(bottom=0)
         ax_valid_draft.set_ylim(bottom=0)
-        ax_accept.set_ylim(bottom=1)
+        ax_accept.set_ylim(bottom=1 if has_spec_metrics else 0)
         outputs.extend(
             save_figure(
                 decode_fig,
@@ -311,6 +376,20 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
         role: sum(row["role"] == role for row in decode_metric_rows)
         for role in sorted({row["role"] for row in decode_metric_rows})
     }
+    manifest["decode_metrics_window_ct_by_target"] = {
+        target_id: sum(row["target_id"] == target_id for row in decode_metric_rows)
+        for target_id in sorted({row["target_id"] for row in decode_metric_rows})
+    }
+    manifest["target_ct"] = len(series)
+    manifest["target_ct_by_role"] = {
+        role: sum(target_role == role for target_role in target_roles.values())
+        for role in sorted(set(target_roles.values()))
+    }
+    manifest["sample_ct_by_target"] = {
+        target_id: len(values) for target_id, values in sorted(series.items())
+    }
+    manifest["missing_sample_plot_policy"] = "gap"
+    manifest["zero_based_axes"] = ["running_batch_size", "iteration_latency"]
     manifest_path = output_dir / "plot_manifest.json"
     write_json(manifest_path, manifest)
     manifest["manifest_path"] = str(manifest_path)

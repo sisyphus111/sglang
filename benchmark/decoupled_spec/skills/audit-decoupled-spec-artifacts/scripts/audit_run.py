@@ -10,12 +10,14 @@ import importlib.util
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 _CHECKSUM_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
+_QUEUE_RE = re.compile(r"#queue-req:\s*(\d+)")
 
 
 def _sha256(path: Path) -> str:
@@ -60,6 +62,10 @@ def _read_jsonl(path: Path, errors: list[str]) -> list[dict[str, Any]]:
 
 def _read_csv(path: Path, errors: list[str]) -> list[dict[str, str]]:
     try:
+        # Long generations can put more than Python's 128 KiB default in one
+        # generated-text field. These are owned local artifacts, so preserve
+        # the full provenance instead of rejecting an otherwise valid run.
+        csv.field_size_limit(sys.maxsize)
         with path.open(encoding="utf-8", newline="") as stream:
             return list(csv.DictReader(stream))
     except OSError as exc:
@@ -120,13 +126,23 @@ def _has_decode_metrics_windows(run_dir: Path) -> bool:
     return False
 
 
+def _unified_server_engines(run_dir: Path) -> list[dict[str, Any]] | None:
+    path = run_dir / "server" / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    engines = manifest.get("engines") if isinstance(manifest, dict) else None
+    if not isinstance(engines, list):
+        return []
+    return [engine for engine in engines if isinstance(engine, dict)]
+
+
 def _check_required_files(run_dir: Path, errors: list[str]) -> None:
     required = [
         "provenance/run_start.json",
-        "roles/verifier/resolved_config.json",
-        "roles/drafter/resolved_config.json",
-        "roles/verifier/status.json",
-        "roles/drafter/status.json",
         "roles/client/status.json",
         "roles/observability/status.json",
         "client/resolved_config.json",
@@ -139,10 +155,6 @@ def _check_required_files(run_dir: Path, errors: list[str]) -> None:
         "client/request_metrics.csv",
         "client/summary.json",
         "observability/resolved_config.json",
-        "observability/startup/verifier/model_info.json",
-        "observability/startup/verifier/server_info.json",
-        "observability/startup/drafter/model_info.json",
-        "observability/startup/drafter/server_info.json",
         "observability/samples.jsonl",
         "observability/summary.json",
         "plots/request_latency.svg",
@@ -155,6 +167,47 @@ def _check_required_files(run_dir: Path, errors: list[str]) -> None:
         "observability/plots/overview.png",
         "observability/plots/plot_manifest.json",
     ]
+    engines = _unified_server_engines(run_dir)
+    if engines is None:
+        required.extend(
+            (
+                "roles/verifier/resolved_config.json",
+                "roles/drafter/resolved_config.json",
+                "roles/verifier/status.json",
+                "roles/drafter/status.json",
+                "observability/startup/verifier/model_info.json",
+                "observability/startup/verifier/server_info.json",
+                "observability/startup/drafter/model_info.json",
+                "observability/startup/drafter/server_info.json",
+            )
+        )
+    else:
+        required.extend(
+            (
+                "server/manifest.json",
+                "server/resolved_config.json",
+                "roles/server/status.json",
+            )
+        )
+        if not engines:
+            errors.append("unified server manifest has no engine entries")
+        for engine in engines:
+            engine_id = engine.get("engine_id")
+            if not isinstance(engine_id, str) or not engine_id:
+                errors.append(f"invalid unified server engine identity: {engine!r}")
+                continue
+            for field in ("resolved_config_path", "status_path", "log_path"):
+                relative = engine.get(field)
+                if not isinstance(relative, str) or not relative:
+                    errors.append(f"{engine_id}: manifest lacks {field}")
+                else:
+                    required.append(relative)
+            required.extend(
+                (
+                    f"observability/startup/{engine_id}/model_info.json",
+                    f"observability/startup/{engine_id}/server_info.json",
+                )
+            )
     if _has_decode_metrics_windows(run_dir):
         required.extend(
             (
@@ -163,15 +216,151 @@ def _check_required_files(run_dir: Path, errors: list[str]) -> None:
             )
         )
     for relative in required:
-        if not (run_dir / relative).is_file():
-            errors.append(f"missing required file: {run_dir / relative}")
+        candidate = run_dir / relative
+        if Path(relative).is_absolute() or not _is_within(candidate, run_dir):
+            errors.append(f"required artifact path escapes RUN_DIR: {relative!r}")
+        elif not candidate.is_file():
+            errors.append(f"missing required file: {candidate}")
+
+
+def _check_unified_consumer_identity(
+    run_dir: Path, errors: list[str]
+) -> dict[str, Any]:
+    manifest_path = run_dir / "server" / "manifest.json"
+    if not manifest_path.is_file():
+        return {"mode": "legacy"}
+    manifest = _read_json(manifest_path, errors)
+    client = _read_json(run_dir / "client" / "resolved_config.json", errors)
+    collector = _read_json(run_dir / "observability" / "resolved_config.json", errors)
+    if not all(isinstance(value, dict) for value in (manifest, client, collector)):
+        return {"mode": "unified"}
+    if manifest.get("schema_version") != 1:
+        errors.append(
+            "unified server manifest schema_version must be 1, got "
+            f"{manifest.get('schema_version')!r}"
+        )
+    raw_engines = manifest.get("engines")
+    if not isinstance(raw_engines, list) or not raw_engines:
+        errors.append("unified server manifest must contain non-empty engines")
+        return {"mode": "unified", "engine_count": 0}
+
+    engines = {}
+    role_ranks = set()
+    for index, engine in enumerate(raw_engines):
+        if not isinstance(engine, dict):
+            errors.append(f"server manifest engines[{index}] must be a JSON object")
+            continue
+        engine_id = engine.get("engine_id")
+        role = engine.get("role")
+        rank = engine.get("rank")
+        http_url = engine.get("http_url")
+        if not isinstance(engine_id, str) or not engine_id:
+            errors.append(f"server manifest engines[{index}] has invalid engine_id")
+            continue
+        if engine_id in engines:
+            errors.append(f"duplicate server manifest engine_id: {engine_id}")
+            continue
+        if role not in {"verifier", "drafter"} or type(rank) is not int or rank < 0:
+            errors.append(f"{engine_id}: invalid server manifest role/rank")
+            continue
+        if (role, rank) in role_ranks:
+            errors.append(f"duplicate server manifest role/rank: {role}/{rank}")
+        if not isinstance(http_url, str) or not http_url:
+            errors.append(f"{engine_id}: invalid server manifest http_url")
+            continue
+        role_ranks.add((role, rank))
+        engines[engine_id] = {
+            "target_id": engine_id,
+            "role": role,
+            "rank": rank,
+            "base_url": http_url.rstrip("/"),
+        }
+
+    topology = manifest.get("topology")
+    if isinstance(topology, dict):
+        for role, count_field in (
+            ("verifier", "num_verifiers"),
+            ("drafter", "num_drafters"),
+        ):
+            actual = sum(engine["role"] == role for engine in engines.values())
+            if topology.get(count_field) != actual:
+                errors.append(
+                    f"server manifest topology {count_field} mismatch: "
+                    f"recorded={topology.get(count_field)!r}, actual={actual}"
+                )
+    else:
+        errors.append("unified server manifest lacks topology")
+
+    selected = client.get("server")
+    if not isinstance(selected, dict):
+        errors.append("unified client config lacks selected server identity")
+    else:
+        target_id = selected.get("target_id")
+        expected = engines.get(target_id)
+        observed = {
+            "target_id": target_id,
+            "role": selected.get("role"),
+            "rank": selected.get("rank"),
+            "base_url": (
+                selected.get("base_url", "").rstrip("/")
+                if isinstance(selected.get("base_url"), str)
+                else selected.get("base_url")
+            ),
+        }
+        if expected is None or expected["role"] != "verifier":
+            errors.append(
+                f"client selected target is not a manifest verifier: {target_id!r}"
+            )
+        elif observed != expected:
+            errors.append(
+                "client selected verifier identity disagrees with server manifest: "
+                f"observed={observed!r}, expected={expected!r}"
+            )
+
+    raw_targets = collector.get("targets")
+    collector_targets = {}
+    if not isinstance(raw_targets, dict):
+        errors.append("unified observability config lacks target mapping")
+    else:
+        for target_id, target in raw_targets.items():
+            if not isinstance(target_id, str) or not isinstance(target, dict):
+                errors.append(f"invalid observability target: {target_id!r}")
+                continue
+            base_url = target.get("base_url")
+            collector_targets[target_id] = {
+                "target_id": target.get("target_id", target_id),
+                "role": target.get("role"),
+                "rank": target.get("rank"),
+                "base_url": (
+                    base_url.rstrip("/") if isinstance(base_url, str) else base_url
+                ),
+            }
+    if collector_targets != engines:
+        errors.append(
+            "observability targets disagree with server manifest: "
+            f"observed={collector_targets!r}, expected={engines!r}"
+        )
+    return {
+        "mode": "unified",
+        "engine_count": len(engines),
+        "client_target_id": (
+            selected.get("target_id") if isinstance(selected, dict) else None
+        ),
+        "collector_target_count": len(collector_targets),
+    }
 
 
 def _check_statuses(
     run_dir: Path, errors: list[str], warnings: list[str]
 ) -> dict[str, Any]:
     reports: dict[str, Any] = {}
-    for role in ("verifier", "drafter", "client", "observability"):
+    engines = _unified_server_engines(run_dir)
+    local_roles = ["client", "observability"]
+    if engines is None:
+        local_roles = ["verifier", "drafter", *local_roles]
+    else:
+        local_roles = ["server", *local_roles]
+    for role in local_roles:
         status = _read_json(run_dir / "roles" / role / "status.json", errors)
         if not isinstance(status, dict):
             continue
@@ -185,21 +374,123 @@ def _check_statuses(
             errors.append(f"{role} status must be 'completed', got {state!r}")
         if role in {"client", "observability"} and alive:
             errors.append(f"{role} process PID {pid} is still alive")
-        if role in {"verifier", "drafter"}:
+        if role in {"verifier", "drafter", "server"}:
             if alive:
                 errors.append(f"{role} process PID {pid} is still alive")
-            if state not in {"exited", "http_ready"}:
+            allowed_states = (
+                {"exited", "http_ready"} if role != "server" else {"exited"}
+            )
+            if state not in allowed_states:
                 errors.append(
-                    f"{role} final state must be 'exited' or stale 'http_ready', got {state!r}"
+                    f"{role} final state must be one of {sorted(allowed_states)}, "
+                    f"got {state!r}"
                 )
             if state == "http_ready" and not alive:
                 warnings.append(
                     f"{role} process is dead but status remains 'http_ready'; inspect its log"
                 )
-    for role in ("verifier", "drafter"):
-        log_path = run_dir / "logs" / f"{role}.log"
-        if not log_path.is_file():
-            warnings.append(f"missing captured server log: {log_path}")
+    if engines is None:
+        for role in ("verifier", "drafter"):
+            log_path = run_dir / "logs" / f"{role}.log"
+            if not log_path.is_file():
+                warnings.append(f"missing captured server log: {log_path}")
+    else:
+        manifest = _read_json(run_dir / "server" / "manifest.json", errors)
+        if isinstance(manifest, dict):
+            if manifest.get("state") == "failed":
+                errors.append(
+                    f"unified server manifest failed: {manifest.get('error')!r}"
+                )
+            elif manifest.get("state") != "stopped":
+                errors.append(
+                    "unified server manifest final state must be 'stopped', got "
+                    f"{manifest.get('state')!r}"
+                )
+        engine_reports = {}
+        for engine in engines:
+            engine_id = str(engine.get("engine_id", ""))
+            status_path = engine.get("status_path")
+            if not engine_id or not isinstance(status_path, str):
+                continue
+            status = _read_json(run_dir / status_path, errors)
+            state = status.get("state") if isinstance(status, dict) else None
+            engine_reports[engine_id] = {
+                "state": state,
+                "remote_pid": status.get("pid") if isinstance(status, dict) else None,
+            }
+            if state != "exited":
+                errors.append(
+                    f"{engine_id} final state must be 'exited', got {state!r}"
+                )
+        reports["engines"] = engine_reports
+    return reports
+
+
+def _check_zero_waiting_queues(
+    run_dir: Path,
+    errors: list[str],
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    if warnings is None:
+        warnings = []
+    reports = {}
+    engines = _unified_server_engines(run_dir)
+    log_entries = (
+        [(role, run_dir / "logs" / f"{role}.log") for role in ("verifier", "drafter")]
+        if engines is None
+        else [
+            (
+                str(engine.get("engine_id")),
+                run_dir / str(engine.get("log_path")),
+            )
+            for engine in engines
+        ]
+    )
+    for role, path in log_entries:
+        if not path.is_file():
+            message = f"{role}: queue validation requires captured log {path}"
+            if engines is None:
+                warnings.append(message)
+            else:
+                errors.append(message)
+            reports[role] = {"queue_sample_count": 0, "max_waiting_reqs": None}
+            continue
+        queue_samples = []
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(),
+            start=1,
+        ):
+            match = _QUEUE_RE.search(line)
+            if match is None:
+                continue
+            waiting = int(match.group(1))
+            queue_samples.append((line_number, waiting, line))
+        if not queue_samples:
+            errors.append(f"{role}: role log contains no queue telemetry")
+            reports[role] = {"queue_sample_count": 0, "max_waiting_reqs": None}
+            continue
+        max_waiting = max(waiting for _, waiting, _ in queue_samples)
+        offending = [sample for sample in queue_samples if sample[1] > 0]
+        reports[role] = {
+            "queue_sample_count": len(queue_samples),
+            "max_waiting_reqs": max_waiting,
+            "positive_queue_sample_count": len(offending),
+            "first_positive_queue_sample": (
+                {
+                    "line_number": offending[0][0],
+                    "num_waiting_reqs": offending[0][1],
+                    "line": offending[0][2],
+                }
+                if offending
+                else None
+            ),
+        }
+        if offending:
+            errors.append(
+                f"{role}: role log observed waiting requests: "
+                f"max={max_waiting} sample_count={len(offending)} "
+                f"first_line={offending[0][0]}"
+            )
     return reports
 
 
@@ -500,7 +791,9 @@ def audit_run(run_dir: Path, phase: str) -> dict[str, Any]:
 
     _check_required_files(run_dir, errors)
     checks = {
+        "server_consumer_identity": _check_unified_consumer_identity(run_dir, errors),
         "statuses": _check_statuses(run_dir, errors, warnings),
+        "zero_waiting_queues": _check_zero_waiting_queues(run_dir, errors, warnings),
         "client": _check_client(run_dir, errors),
         "observability": _check_observability(run_dir, errors, warnings),
         "derived_artifacts": _check_derived_manifests(run_dir, errors, warnings),

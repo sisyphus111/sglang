@@ -37,11 +37,19 @@ class DecoupledVerifyManager:
         self.scheduler = scheduler
         self.config = config
         self.src_verifier_rank = int(config.rank)
-        self.dst_drafter_rank = 0
+        self._drafter_ranks = [int(peer.rank) for peer in config.peers]
+        self._drafter_quotas = {
+            int(peer.rank): int(peer.quota) for peer in config.peers
+        }
+        self._drafter_current_weights = {
+            drafter_rank: 0 for drafter_rank in self._drafter_ranks
+        }
+        self._total_drafter_quota = sum(self._drafter_quotas.values())
         self.is_entry_rank = scheduler.ps.tp_rank == 0
         self.num_draft_tokens = int(scheduler.server_args.speculative_num_steps)
         self._open_mirror_by_req: dict[str, str] = {}
         self._open_lifecycle_by_req: dict[str, tuple[Req, int]] = {}
+        self._open_drafter_rank_by_req: dict[str, int] = {}
         self._next_request_epoch = 1
         self.rebase_row_ct = 0
         self.rebase_hit_ct = 0
@@ -101,11 +109,26 @@ class DecoupledVerifyManager:
         if batch is None or batch.forward_mode.is_idle():
             return
         allow_open = batch.forward_mode.is_extend()
+        pending_opens: dict[int, list[tuple[DraftSync, int, int]]] = {}
         batch.decoupled_launch_mirror_ids = [
-            self._ensure_open_request(req, allow_open=allow_open) for req in batch.reqs
+            self._ensure_open_request(
+                req,
+                allow_open=allow_open,
+                pending_opens=pending_opens,
+            )
+            for req in batch.reqs
         ]
+        if self.data_plane is not None:
+            for dst_drafter_rank in sorted(pending_opens):
+                self.data_plane.open_requests(pending_opens[dst_drafter_rank])
 
-    def _ensure_open_request(self, req: Req, *, allow_open: bool) -> str:
+    def _ensure_open_request(
+        self,
+        req: Req,
+        *,
+        allow_open: bool,
+        pending_opens: dict[int, list[tuple[DraftSync, int, int]]],
+    ) -> str:
         mirror_request_id = self._mirror_for_lifecycle(req)
         if mirror_request_id is not None:
             return mirror_request_id
@@ -120,6 +143,7 @@ class DecoupledVerifyManager:
         if previous is not None:
             self._close_request(req, previous, reason="reseated")
 
+        dst_drafter_rank = self._select_drafter_rank()
         request_epoch = self._next_request_epoch
         self._next_request_epoch += 1
         mirror_request_id = build_draft_mirror_request_id(req.rid, request_epoch)
@@ -129,28 +153,56 @@ class DecoupledVerifyManager:
                     "Decoupled verifier request has no GPU request-pool seat: "
                     f"request_id={req.rid}"
                 )
-            self.data_plane.open_request(
-                DraftSync(
-                    request_id=mirror_request_id,
-                    src_verifier_rank=self.src_verifier_rank,
-                    dst_drafter_rank=self.dst_drafter_rank,
-                    prompt_token_ids=[int(token) for token in req.origin_input_ids],
-                    committed_outputs=[int(token) for token in req.output_ids],
-                ),
-                gpu_seat=int(req.req_pool_idx),
-                request_epoch=request_epoch,
+            pending_opens.setdefault(dst_drafter_rank, []).append(
+                (
+                    DraftSync(
+                        request_id=mirror_request_id,
+                        src_verifier_rank=self.src_verifier_rank,
+                        dst_drafter_rank=dst_drafter_rank,
+                        prompt_token_ids=[int(token) for token in req.origin_input_ids],
+                        committed_outputs=[int(token) for token in req.output_ids],
+                    ),
+                    int(req.req_pool_idx),
+                    request_epoch,
+                )
             )
         self._open_mirror_by_req[req.rid] = mirror_request_id
         self._open_lifecycle_by_req[req.rid] = (
             req,
             int(req.retraction_count),
         )
+        self._open_drafter_rank_by_req[req.rid] = dst_drafter_rank
         return mirror_request_id
+
+    def _select_drafter_rank(self) -> int:
+        """Choose one peer with integer smooth weighted round robin."""
+
+        if not self._drafter_ranks or self._total_drafter_quota <= 0:
+            raise RuntimeError("Decoupled verifier has no configured drafter peers.")
+        for drafter_rank in self._drafter_ranks:
+            self._drafter_current_weights[drafter_rank] += self._drafter_quotas[
+                drafter_rank
+            ]
+        drafter_rank = min(
+            self._drafter_ranks,
+            key=lambda rank: (
+                -self._drafter_current_weights[rank],
+                (rank - self.src_verifier_rank) % self._total_drafter_quota,
+                rank,
+            ),
+        )
+        self._drafter_current_weights[drafter_rank] -= self._total_drafter_quota
+        return drafter_rank
 
     def _mirror_for_lifecycle(self, req: Req) -> str | None:
         mirror_request_id = self._open_mirror_by_req.get(req.rid)
         lifecycle = self._open_lifecycle_by_req.get(req.rid)
-        if (mirror_request_id is None) != (lifecycle is None):
+        drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
+        if not (
+            (mirror_request_id is not None)
+            == (lifecycle is not None)
+            == (drafter_rank is not None)
+        ):
             raise RuntimeError(
                 "Decoupled verifier draft-mirror lifecycle maps are inconsistent: "
                 f"request_id={req.rid}"
@@ -205,7 +257,7 @@ class DecoupledVerifyManager:
         )
         host_pre_output_lens = batch.decoupled_pre_output_lens
         mirror_request_ids = batch.decoupled_result_mirror_ids
-        control_batch = DraftControlBatch(dst_drafter_rank=self.dst_drafter_rank)
+        control_batches: dict[int, DraftControlBatch] = {}
         finished_lifecycles: list[tuple[str, str]] = []
         for row_index, (req, mirror_request_id) in enumerate(
             zip(batch.reqs, mirror_request_ids)
@@ -221,15 +273,25 @@ class DecoupledVerifyManager:
             # still owns the request may commit a delayed overlap result.
             if self._open_mirror_by_req.get(req.rid) != mirror_request_id:
                 continue
+            dst_drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
+            if dst_drafter_rank is None:
+                raise RuntimeError(
+                    "Decoupled verifier live mirror has no drafter route: "
+                    f"request_id={req.rid} mirror_request_id={mirror_request_id}"
+                )
             if getattr(req, "is_retracted", False):
                 continue
             if req.finished():
                 if self.is_entry_rank:
+                    control_batch = control_batches.setdefault(
+                        dst_drafter_rank,
+                        DraftControlBatch(dst_drafter_rank=dst_drafter_rank),
+                    )
                     control_batch.close_messages.append(
                         DraftClose(
                             request_id=mirror_request_id,
                             src_verifier_rank=self.src_verifier_rank,
-                            dst_drafter_rank=self.dst_drafter_rank,
+                            dst_drafter_rank=dst_drafter_rank,
                             reason="finished",
                         )
                     )
@@ -239,28 +301,36 @@ class DecoupledVerifyManager:
                 continue
             if len(req.output_ids) <= pre_output_len:
                 continue
+            control_batch = control_batches.setdefault(
+                dst_drafter_rank,
+                DraftControlBatch(dst_drafter_rank=dst_drafter_rank),
+            )
             control_batch.verify_commit_messages.append(
                 VerifyCommit(
                     request_id=mirror_request_id,
                     src_verifier_rank=self.src_verifier_rank,
-                    dst_drafter_rank=self.dst_drafter_rank,
+                    dst_drafter_rank=dst_drafter_rank,
                     pre_verify_committed_len=pre_output_len,
                     committed_tokens=[
                         int(token) for token in req.output_ids[pre_output_len:]
                     ],
                 )
             )
-        if self.data_plane is not None and (
-            control_batch.verify_commit_messages or control_batch.close_messages
-        ):
-            self.data_plane.submit_control_batch(control_batch)
+        if self.data_plane is not None:
+            for dst_drafter_rank in sorted(control_batches):
+                self.data_plane.submit_control_batch(control_batches[dst_drafter_rank])
         for request_id, mirror_request_id in finished_lifecycles:
             self._forget_open_request(request_id, mirror_request_id)
 
     def abort_request(self, req: Req, reason: str = "abort") -> None:
         mirror_request_id = self._open_mirror_by_req.get(req.rid)
         lifecycle = self._open_lifecycle_by_req.get(req.rid)
-        if (mirror_request_id is None) != (lifecycle is None):
+        drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
+        if not (
+            (mirror_request_id is not None)
+            == (lifecycle is not None)
+            == (drafter_rank is not None)
+        ):
             raise RuntimeError(
                 "Decoupled verifier draft-mirror lifecycle maps are inconsistent: "
                 f"request_id={req.rid}"
@@ -304,12 +374,18 @@ class DecoupledVerifyManager:
         *,
         reason: str,
     ) -> None:
+        dst_drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
+        if dst_drafter_rank is None:
+            raise RuntimeError(
+                "Decoupled verifier live mirror has no drafter route: "
+                f"request_id={req.rid} mirror_request_id={mirror_request_id}"
+            )
         if self.data_plane is not None:
             self.data_plane.close_request(
                 DraftClose(
                     request_id=mirror_request_id,
                     src_verifier_rank=self.src_verifier_rank,
-                    dst_drafter_rank=self.dst_drafter_rank,
+                    dst_drafter_rank=dst_drafter_rank,
                     reason=reason,
                 )
             )
@@ -323,3 +399,4 @@ class DecoupledVerifyManager:
         if self._open_mirror_by_req.get(request_id) == mirror_request_id:
             self._open_mirror_by_req.pop(request_id, None)
             self._open_lifecycle_by_req.pop(request_id, None)
+            self._open_drafter_rank_by_req.pop(request_id, None)

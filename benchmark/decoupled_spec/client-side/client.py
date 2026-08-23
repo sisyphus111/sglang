@@ -34,6 +34,8 @@ DATASET_FORMATS = (
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
     """Expose common benchmark axes as typed YAML overrides."""
     parser.add_argument("--base-url")
+    parser.add_argument("--server-manifest")
+    parser.add_argument("--verifier-rank", type=int)
     parser.add_argument("--target-tokenizer-path")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--dataset-format", choices=DATASET_FORMATS)
@@ -65,6 +67,13 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
 
 def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     """Apply only explicitly supplied CLI values to the loaded YAML."""
+    server_manifest = getattr(args, "server_manifest", None)
+    verifier_rank = getattr(args, "verifier_rank", None)
+    if server_manifest is not None and args.base_url is not None:
+        raise ValueError("--server-manifest conflicts with --base-url")
+    if verifier_rank is not None and server_manifest is None:
+        raise ValueError("--verifier-rank requires --server-manifest")
+
     mappings = (
         ("base_url", "server", "base_url"),
         ("target_tokenizer_path", "target_tokenizer", "model_path"),
@@ -91,6 +100,75 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> Non
         if not isinstance(section, dict):
             raise ValueError(f"{section_name} must be a mapping")
         section[field_name] = value
+
+    if server_manifest is not None:
+        manifest_path = Path(server_manifest).expanduser().resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("server manifest must contain a JSON object")
+        if int(manifest.get("schema_version", 0)) != 1:
+            raise ValueError("server manifest schema_version must be 1")
+        if manifest.get("state") != "ready":
+            raise ValueError(
+                f"server manifest is not ready: state={manifest.get('state')!r}"
+            )
+        engines = manifest.get("engines")
+        if not isinstance(engines, list) or not engines:
+            raise ValueError("ready server manifest must contain non-empty engines")
+
+        verifier_engines = [
+            engine
+            for engine in engines
+            if isinstance(engine, dict) and engine.get("role") == "verifier"
+        ]
+        if verifier_rank is None:
+            if len(verifier_engines) != 1:
+                raise ValueError(
+                    "--verifier-rank is required when the server manifest contains "
+                    f"{len(verifier_engines)} verifiers"
+                )
+            rank = verifier_engines[0].get("rank")
+        else:
+            rank = verifier_rank
+        if type(rank) is not int:
+            raise ValueError("selected verifier rank must be an integer")
+        if rank < 0:
+            raise ValueError("--verifier-rank must be non-negative")
+        matching = [
+            engine
+            for engine in engines
+            if isinstance(engine, dict)
+            and engine.get("role") == "verifier"
+            and type(engine.get("rank")) is int
+            and engine.get("rank") == rank
+        ]
+        if len(matching) != 1:
+            raise ValueError(
+                f"server manifest must contain exactly one verifier rank {rank}; "
+                f"found {len(matching)}"
+            )
+        verifier = matching[0]
+        target_id = verifier.get("engine_id")
+        base_url = verifier.get("http_url")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError("selected verifier engine_id must be a non-empty string")
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("selected verifier http_url must be a non-empty string")
+        server = config.setdefault("server", {})
+        if not isinstance(server, dict):
+            raise ValueError("server must be a mapping")
+        server.update(
+            {
+                "base_url": base_url.rstrip("/"),
+                "target_id": target_id,
+                "role": "verifier",
+                "rank": rank,
+            }
+        )
+        config["server_manifest"] = {
+            "path": str(manifest_path),
+            "state": "ready",
+        }
 
 
 def validate_config(config: dict[str, Any]) -> None:

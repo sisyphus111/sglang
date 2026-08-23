@@ -767,6 +767,42 @@ class TestPortArgs(unittest.TestCase):
         self.assertEqual(
             port_args.decoupled_spec_ipc_config.connect_endpoints, ("ipc:///tmp/d",)
         )
+        self.assertEqual(
+            [
+                (peer.rank, peer.endpoint, peer.quota)
+                for peer in port_args.decoupled_spec_ipc_config.peers
+            ],
+            [(0, "ipc:///tmp/d", 1)],
+        )
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_builds_sparse_ranked_decoupled_spec_peers(self, mock_temp_file):
+        mock_temp_file.return_value.name = "temp_file"
+
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.decoupled_spec_role = "verifier"
+        server_args.decoupled_spec_bind_endpoint = "tcp://verifier:30000"
+        server_args.decoupled_spec_peer_configs = [
+            {"rank": 3, "endpoint": "tcp://drafter-a:31003", "quota": 2},
+            {"rank": 9, "endpoint": "tcp://drafter-b:31009", "quota": 1},
+        ]
+        server_args.decoupled_spec_rank = 5
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.decoupled_spec_ipc_config.rank, 5)
+        self.assertEqual(
+            [
+                (peer.rank, peer.endpoint, peer.quota)
+                for peer in port_args.decoupled_spec_ipc_config.peers
+            ],
+            [
+                (3, "tcp://drafter-a:31003", 2),
+                (9, "tcp://drafter-b:31009", 1),
+            ],
+        )
 
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_no_decoupled_config_when_role_null(self, mock_temp_file):
@@ -1144,6 +1180,29 @@ class TestDecoupledSpecArgs(CustomTestCase):
         self.assertEqual(server_args.decoupled_spec_connect_endpoints, ["ipc:///tmp/d"])
         self.assertEqual(server_args.decoupled_spec_rank, 0)
         self.assertEqual(server_args.spec_trace_dir, "/tmp/tr")
+
+    def test_ranked_decoupled_spec_peer_configs_cli_round_trip(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--decoupled-spec-role",
+                "verifier",
+                "--decoupled-spec-bind-endpoint",
+                "tcp://verifier:30000",
+                "--decoupled-spec-peer-configs",
+                '[{"rank":3,"endpoint":"tcp://drafter:31003","quota":2}]',
+                "--decoupled-spec-rank",
+                "5",
+            ]
+        )
+
+        self.assertEqual(server_args.decoupled_spec_rank, 5)
+        self.assertEqual(
+            server_args.decoupled_spec_peer_configs,
+            [{"rank": 3, "endpoint": "tcp://drafter:31003", "quota": 2}],
+        )
+        self.assertIsNone(server_args.decoupled_spec_connect_endpoints)
 
     def test_decoupled_spec_role_rejects_invalid_choice(self):
         with self.assertRaises(SystemExit):

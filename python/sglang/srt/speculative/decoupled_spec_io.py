@@ -1,8 +1,37 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+import msgspec
+
+_MAX_TRANSPORT_RANK = 2**31 - 1
+
+
+class DecoupledSpecPeerConfig(msgspec.Struct, frozen=True):
+    """One explicitly ranked transport peer and its routing quota."""
+
+    rank: int
+    endpoint: str
+    quota: int
+
+
+def _validate_transport_rank(rank: Any, *, field_name: str) -> int:
+    if isinstance(rank, bool) or not isinstance(rank, int):
+        raise ValueError(f"{field_name} must be an integer, got {rank!r}.")
+    if rank < 0 or rank > _MAX_TRANSPORT_RANK:
+        raise ValueError(
+            f"{field_name} must be in [0, {_MAX_TRANSPORT_RANK}], got {rank}."
+        )
+    return rank
+
+
+def _validate_endpoint(endpoint: Any, *, field_name: str) -> str:
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValueError(f"{field_name} must be a non-empty string, got {endpoint!r}.")
+    return endpoint
 
 
 class DraftMeshMessageType(str, Enum):
@@ -382,3 +411,153 @@ class DecoupledSpecIpcConfig:
     bind_endpoint: str
     connect_endpoints: tuple[str, ...]
     rank: int
+    peers: tuple[DecoupledSpecPeerConfig, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        rank = _validate_transport_rank(
+            self.rank, field_name="Decoupled-spec local rank"
+        )
+        bind_endpoint = _validate_endpoint(
+            self.bind_endpoint, field_name="Decoupled-spec bind endpoint"
+        )
+        connect_endpoints = tuple(self.connect_endpoints)
+        peers = tuple(self.peers)
+        if peers:
+            if any(not isinstance(peer, DecoupledSpecPeerConfig) for peer in peers):
+                raise ValueError(
+                    "Decoupled-spec peers must contain DecoupledSpecPeerConfig values."
+                )
+            peer_endpoints = tuple(peer.endpoint for peer in peers)
+            if connect_endpoints and connect_endpoints != peer_endpoints:
+                raise ValueError(
+                    "Decoupled-spec connect_endpoints and ranked peers disagree: "
+                    f"connect_endpoints={connect_endpoints!r} "
+                    f"peer_endpoints={peer_endpoints!r}"
+                )
+        else:
+            peers = tuple(
+                DecoupledSpecPeerConfig(
+                    rank=peer_rank,
+                    endpoint=_validate_endpoint(
+                        endpoint,
+                        field_name="Decoupled-spec peer endpoint",
+                    ),
+                    quota=1,
+                )
+                for peer_rank, endpoint in enumerate(connect_endpoints)
+            )
+
+        if not peers:
+            raise ValueError("Decoupled-spec peer configs must be non-empty.")
+
+        peer_ranks = []
+        peer_endpoints = []
+        normalized_peers = []
+        for peer in peers:
+            peer_rank = _validate_transport_rank(
+                peer.rank, field_name="Decoupled-spec peer rank"
+            )
+            endpoint = _validate_endpoint(
+                peer.endpoint, field_name="Decoupled-spec peer endpoint"
+            )
+            if isinstance(peer.quota, bool) or not isinstance(peer.quota, int):
+                raise ValueError(
+                    "Decoupled-spec peer quota must be an integer, "
+                    f"got {peer.quota!r}."
+                )
+            if peer.quota <= 0:
+                raise ValueError(
+                    "Decoupled-spec peer quota must be positive, " f"got {peer.quota}."
+                )
+            peer_ranks.append(peer_rank)
+            peer_endpoints.append(endpoint)
+            normalized_peers.append(
+                DecoupledSpecPeerConfig(
+                    rank=peer_rank,
+                    endpoint=endpoint,
+                    quota=int(peer.quota),
+                )
+            )
+
+        if len(set(peer_ranks)) != len(peer_ranks):
+            raise ValueError(
+                f"Decoupled-spec peer ranks must be unique, got {peer_ranks}."
+            )
+        if len(set(peer_endpoints)) != len(peer_endpoints):
+            raise ValueError(
+                "Decoupled-spec peer endpoints must be unique, "
+                f"got {peer_endpoints}."
+            )
+        if bind_endpoint in peer_endpoints:
+            raise ValueError(
+                "Decoupled-spec bind endpoint must differ from every peer endpoint."
+            )
+
+        object.__setattr__(self, "rank", rank)
+        object.__setattr__(self, "bind_endpoint", bind_endpoint)
+        object.__setattr__(self, "peers", tuple(normalized_peers))
+        object.__setattr__(self, "connect_endpoints", tuple(peer_endpoints))
+
+    @classmethod
+    def from_raw(
+        cls,
+        *,
+        bind_endpoint: Any,
+        rank: Any,
+        peer_configs: Sequence[Mapping[str, Any]] | None,
+        connect_endpoints: Sequence[str] | None,
+    ) -> DecoupledSpecIpcConfig:
+        """Build ranked peers, accepting the legacy ordered endpoint list."""
+
+        if peer_configs is not None and connect_endpoints is not None:
+            raise ValueError(
+                "Specify only one of --decoupled-spec-peer-configs and "
+                "--decoupled-spec-connect-endpoints."
+            )
+
+        peers = []
+        if peer_configs is not None:
+            if not isinstance(peer_configs, (list, tuple)) or not peer_configs:
+                raise ValueError(
+                    "--decoupled-spec-peer-configs must be a non-empty JSON list."
+                )
+            required_keys = {"rank", "endpoint", "quota"}
+            for index, raw_peer in enumerate(peer_configs):
+                if not isinstance(raw_peer, Mapping):
+                    raise ValueError(
+                        "Each --decoupled-spec-peer-configs item must be an "
+                        f"object, got item {index}: {raw_peer!r}."
+                    )
+                actual_keys = set(raw_peer)
+                if actual_keys != required_keys:
+                    raise ValueError(
+                        "Each --decoupled-spec-peer-configs item must contain "
+                        f"exactly {sorted(required_keys)}, got item {index} keys "
+                        f"{sorted(actual_keys)}."
+                    )
+                peers.append(
+                    DecoupledSpecPeerConfig(
+                        rank=raw_peer["rank"],
+                        endpoint=raw_peer["endpoint"],
+                        quota=raw_peer["quota"],
+                    )
+                )
+            legacy_endpoints: tuple[str, ...] = ()
+        else:
+            if (
+                not isinstance(connect_endpoints, (list, tuple))
+                or not connect_endpoints
+            ):
+                raise ValueError(
+                    "Decoupled speculation requires a non-empty "
+                    "--decoupled-spec-peer-configs or legacy "
+                    "--decoupled-spec-connect-endpoints value."
+                )
+            legacy_endpoints = tuple(connect_endpoints)
+
+        return cls(
+            bind_endpoint=bind_endpoint,
+            connect_endpoints=legacy_endpoints,
+            rank=rank,
+            peers=tuple(peers),
+        )

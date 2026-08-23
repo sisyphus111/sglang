@@ -63,6 +63,100 @@ def wait_for_roles(
     started = time.monotonic()
     last: dict[str, Any] = {}
     while True:
+        manifest_path = run_dir / "server" / "manifest.json"
+        manifest = _read_json(manifest_path)
+        if manifest_path.exists() and manifest is None:
+            raise RuntimeError(f"cannot read unified server manifest: {manifest_path}")
+        if manifest is not None:
+            if manifest.get("schema_version") != 1:
+                raise RuntimeError(
+                    "unified server manifest schema_version must be 1, got "
+                    f"{manifest.get('schema_version')!r}"
+                )
+            state = manifest.get("state")
+            if state in {"failed", "stopping", "stopped"}:
+                raise RuntimeError(
+                    f"unified server fleet entered terminal state {state!r}: "
+                    f"{manifest}"
+                )
+            engines = manifest.get("engines")
+            if state == "ready" and isinstance(engines, list) and engines:
+                ready = True
+                targets = {}
+                seen_roles = set()
+                seen_role_ranks = set()
+                for engine in engines:
+                    if not isinstance(engine, dict):
+                        raise RuntimeError(
+                            f"invalid unified server engine entry: {engine!r}"
+                        )
+                    engine_id = str(engine.get("engine_id", ""))
+                    role = str(engine.get("role", ""))
+                    rank = engine.get("rank")
+                    if role not in {"verifier", "drafter"}:
+                        raise RuntimeError(
+                            f"invalid unified server engine role: {engine!r}"
+                        )
+                    if type(rank) is not int or rank < 0:
+                        raise RuntimeError(
+                            f"invalid unified server engine rank: {engine!r}"
+                        )
+                    if engine_id in targets or (role, rank) in seen_role_ranks:
+                        raise RuntimeError(
+                            "duplicate unified server engine identity: "
+                            f"engine_id={engine_id!r} role={role} rank={rank}"
+                        )
+                    seen_role_ranks.add((role, rank))
+                    seen_roles.add(role)
+                    base_url = engine.get("http_url")
+                    record = {
+                        "role": role,
+                        "rank": rank,
+                        "base_url": base_url,
+                    }
+                    if not engine_id or not isinstance(base_url, str):
+                        ready = False
+                        record["health_error"] = "manifest identity/http_url missing"
+                    elif check_http:
+                        healthy, error = _http_ready(base_url, role, http_timeout_s)
+                        record["http_ready"] = healthy
+                        record["health_error"] = error
+                        ready = ready and healthy
+                    targets[engine_id] = record
+                topology = manifest.get("topology")
+                if not isinstance(topology, dict):
+                    raise RuntimeError("unified server manifest lacks topology")
+                for role, count_field in (
+                    ("verifier", "num_verifiers"),
+                    ("drafter", "num_drafters"),
+                ):
+                    actual = sum(target["role"] == role for target in targets.values())
+                    if topology.get(count_field) != actual:
+                        raise RuntimeError(
+                            f"unified server topology {count_field} mismatch: "
+                            f"recorded={topology.get(count_field)!r}, actual={actual}"
+                        )
+                if not targets or not set(roles).issubset(seen_roles):
+                    ready = False
+                last = targets
+                if ready:
+                    return {
+                        "ready": True,
+                        "run_dir": str(run_dir),
+                        "manifest_path": str(manifest_path),
+                        "elapsed_s": time.monotonic() - started,
+                        "engines": targets,
+                    }
+            else:
+                last = {"server_manifest": {"state": state}}
+            if time.monotonic() - started >= timeout_s:
+                raise TimeoutError(
+                    "unified server fleet did not become ready within "
+                    f"{timeout_s}s; last={last}"
+                )
+            time.sleep(poll_interval_s)
+            continue
+
         ready = True
         last = {}
         for role in roles:

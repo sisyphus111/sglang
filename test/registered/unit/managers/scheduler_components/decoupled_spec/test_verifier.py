@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.decoupled_spec_io import (  # noqa: E402
     DecoupledSpecIpcConfig,
+    DecoupledSpecPeerConfig,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -103,6 +104,33 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         self.data_plane.reset_mock()
 
+    def _replace_manager(self, *, verifier_rank: int, weighted_drafter_ranks):
+        self.manager.close()
+        self.data_plane.reset_mock()
+        self.data_plane_factory.reset_mock()
+        self.config = DecoupledSpecIpcConfig(
+            bind_endpoint="tcp://verifier:30000",
+            connect_endpoints=(),
+            rank=verifier_rank,
+            peers=tuple(
+                DecoupledSpecPeerConfig(
+                    rank=drafter_rank,
+                    endpoint=f"tcp://drafter-{drafter_rank}:31{drafter_rank:03d}",
+                    quota=quota,
+                )
+                for drafter_rank, quota in weighted_drafter_ranks
+            ),
+        )
+        self.manager = DecoupledVerifyManager(self.scheduler, self.config)
+        self.data_plane.reset_mock()
+
+    def _open_rows(self):
+        return [
+            row
+            for call in self.data_plane.open_requests.call_args_list
+            for row in call.args[0]
+        ]
+
     def test_decode_reuses_only_an_open_lifecycle_identity(self):
         req_a = _Req("req-a", retraction_count=0)
         req_b = _Req("req-b", retraction_count=2)
@@ -118,6 +146,125 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         self.data_plane.assert_not_called()
 
+    def test_sparse_weighted_routing_is_sticky_for_each_lifecycle(self):
+        self._replace_manager(
+            verifier_rank=5,
+            weighted_drafter_ranks=((3, 2), (9, 1)),
+        )
+        reqs = [_Req(f"req-{index}", req_pool_idx=index) for index in range(6)]
+
+        self.manager.prepare_batch(_batch(reqs, ForwardMode.EXTEND))
+
+        assigned_ranks = [
+            self.manager._open_drafter_rank_by_req[req.rid] for req in reqs
+        ]
+        self.assertEqual(assigned_ranks, [3, 9, 3, 3, 9, 3])
+        open_batches = [
+            call.args[0] for call in self.data_plane.open_requests.call_args_list
+        ]
+        self.assertEqual(
+            [[row[0].dst_drafter_rank for row in rows] for rows in open_batches],
+            [[3, 3, 3, 3], [9, 9]],
+        )
+
+        self.data_plane.reset_mock()
+        self.manager.prepare_batch(_batch(reqs, ForwardMode.DECODE))
+        self.data_plane.open_requests.assert_not_called()
+        self.assertEqual(
+            [self.manager._open_drafter_rank_by_req[req.rid] for req in reqs],
+            assigned_ranks,
+        )
+
+    def test_one_result_batch_is_grouped_by_sparse_destination_rank(self):
+        self._replace_manager(
+            verifier_rank=5,
+            weighted_drafter_ranks=((3, 1), (9, 1)),
+        )
+        req_a = _Req("req-a", output_tokens=(30,), req_pool_idx=0)
+        req_b = _Req("req-b", output_tokens=(40,), req_pool_idx=1)
+        req_c = _Req("req-c", output_tokens=(50,), req_pool_idx=2)
+        self.manager.prepare_batch(_batch([req_a, req_b, req_c], ForwardMode.EXTEND))
+        self.assertEqual(
+            [
+                self.manager._open_drafter_rank_by_req[req.rid]
+                for req in (req_a, req_b, req_c)
+            ],
+            [3, 9, 3],
+        )
+        self.data_plane.reset_mock()
+
+        result = SimpleNamespace(
+            decoupled_rebase_valid=None,
+            decoupled_selected_draft_lens=None,
+        )
+        decode_batch = _batch([req_a, req_b, req_c], ForwardMode.DECODE)
+        self.manager.prepare_batch(decode_batch)
+        self.manager.before_process_batch_result(decode_batch, result)
+        req_a.output_ids.append(31)
+        req_b._finished = True
+        req_c.output_ids.append(51)
+
+        self.manager.after_process_batch_result(decode_batch, result)
+
+        control_batches = [
+            call.args[0] for call in self.data_plane.submit_control_batch.call_args_list
+        ]
+        self.assertEqual([batch.dst_drafter_rank for batch in control_batches], [3, 9])
+        self.assertEqual(
+            [
+                message.request_id
+                for message in control_batches[0].verify_commit_messages
+            ],
+            ["req-a::draft-epoch::1", "req-c::draft-epoch::3"],
+        )
+        self.assertEqual(
+            [message.request_id for message in control_batches[1].close_messages],
+            ["req-b::draft-epoch::2"],
+        )
+
+    def test_delayed_result_cannot_cross_a_retracted_request_route(self):
+        self._replace_manager(
+            verifier_rank=5,
+            weighted_drafter_ranks=((3, 1), (9, 1)),
+        )
+        req = _Req("req", output_tokens=(30,))
+        self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
+        self.assertEqual(self.manager._open_drafter_rank_by_req[req.rid], 3)
+        result = SimpleNamespace(
+            decoupled_rebase_valid=None,
+            decoupled_selected_draft_lens=None,
+        )
+        old_batch = _batch([req], ForwardMode.DECODE)
+        self.manager.prepare_batch(old_batch)
+        self.manager.before_process_batch_result(old_batch, result)
+
+        req.retraction_count = 1
+        req.is_retracted = True
+        self.manager.retract_request(req)
+        old_close = self.data_plane.close_request.call_args.args[0]
+        self.assertEqual(old_close.dst_drafter_rank, 3)
+        req.is_retracted = False
+        self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
+        new_open = self._open_rows()[-1][0]
+        self.assertEqual(new_open.request_id, "req::draft-epoch::2")
+        self.assertEqual(new_open.dst_drafter_rank, 9)
+
+        self.data_plane.reset_mock()
+        self.manager.after_process_batch_result(old_batch, result)
+        self.data_plane.submit_control_batch.assert_not_called()
+
+        new_batch = _batch([req], ForwardMode.DECODE)
+        self.manager.prepare_batch(new_batch)
+        self.manager.before_process_batch_result(new_batch, result)
+        req.output_ids.append(31)
+        self.manager.after_process_batch_result(new_batch, result)
+        new_commit_batch = self.data_plane.submit_control_batch.call_args.args[0]
+        self.assertEqual(new_commit_batch.dst_drafter_rank, 9)
+        self.assertEqual(
+            new_commit_batch.verify_commit_messages[0].request_id,
+            "req::draft-epoch::2",
+        )
+
     def test_decode_without_an_open_lifecycle_fails_fast(self):
         with self.assertRaisesRegex(RuntimeError, "no open draft mirror"):
             self.manager.prepare_batch(_batch([_Req("req")], ForwardMode.DECODE))
@@ -127,20 +274,18 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
 
-        sync = self.data_plane.open_request.call_args.args[0]
+        sync, gpu_seat, request_epoch = self._open_rows()[0]
         self.assertEqual(sync.request_id, "req::draft-epoch::1")
         self.assertEqual(sync.prompt_token_ids, [1, 2, 3])
-        self.assertEqual(self.data_plane.open_request.call_args.kwargs["gpu_seat"], 5)
-        self.assertEqual(
-            self.data_plane.open_request.call_args.kwargs["request_epoch"], 1
-        )
+        self.assertEqual(gpu_seat, 5)
+        self.assertEqual(request_epoch, 1)
 
     def test_extend_accepts_last_physical_request_pool_seat(self):
         req = _Req("req", req_pool_idx=16)
 
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
 
-        self.assertEqual(self.data_plane.open_request.call_args.kwargs["gpu_seat"], 16)
+        self.assertEqual(self._open_rows()[0][1], 16)
 
     def test_same_req_and_retraction_lifecycle_keeps_one_wire_identity(self):
         req = _Req("req", req_pool_idx=5)
@@ -158,7 +303,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
             second_batch.decoupled_launch_mirror_ids,
             first_batch.decoupled_launch_mirror_ids,
         )
-        self.data_plane.open_request.assert_called_once()
+        self.data_plane.open_requests.assert_called_once()
 
     def test_schedule_batch_copy_freezes_launch_mirror_ids(self):
         launch_ids = ["req::draft-epoch::1"]
@@ -261,16 +406,14 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
         self.assertEqual(
             [call[0] for call in self.data_plane.method_calls],
-            ["close_request", "open_request"],
+            ["close_request", "open_requests"],
         )
         close = self.data_plane.close_request.call_args.args[0]
-        sync = self.data_plane.open_request.call_args.args[0]
+        sync, _, request_epoch = self._open_rows()[0]
         self.assertEqual(close.request_id, "req::draft-epoch::1")
         self.assertEqual(close.reason, "reseated")
         self.assertEqual(sync.request_id, "req::draft-epoch::2")
-        self.assertEqual(
-            self.data_plane.open_request.call_args.kwargs["request_epoch"], 2
-        )
+        self.assertEqual(request_epoch, 2)
 
     def test_finished_same_rid_reopens_with_a_new_wire_epoch(self):
         old_req = _Req("req", output_tokens=(30,))
@@ -309,11 +452,9 @@ class TestDecoupledVerifyManager(CustomTestCase):
             new_batch.decoupled_launch_mirror_ids,
             ["req::draft-epoch::2"],
         )
-        sync = self.data_plane.open_request.call_args.args[0]
+        sync, _, request_epoch = self._open_rows()[0]
         self.assertEqual(sync.request_id, "req::draft-epoch::2")
-        self.assertEqual(
-            self.data_plane.open_request.call_args.kwargs["request_epoch"], 2
-        )
+        self.assertEqual(request_epoch, 2)
 
         # An abort for the completed Req object must not close the replacement.
         self.data_plane.reset_mock()
@@ -448,6 +589,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         self.assertEqual(self.manager._open_mirror_by_req, {})
         self.assertEqual(self.manager._open_lifecycle_by_req, {})
+        self.assertEqual(self.manager._open_drafter_rank_by_req, {})
 
     def test_abort_after_retraction_closes_the_still_owned_old_epoch(self):
         req = _Req("req")

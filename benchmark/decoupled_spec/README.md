@@ -2,12 +2,11 @@
 
 ## 1. 目录介绍
 
-`benchmark/decoupled_spec/` 提供一套面向 decoupled speculation 的可配置、可观测、可追溯 benchmark。一次实验由四个独立组件协作完成：
+`benchmark/decoupled_spec/` 提供一套面向 decoupled speculation 的可配置、可观测、可追溯 benchmark。一次实验由一个 Ray server fleet 和三个独立消费者协作完成：
 
 | 组件 | 入口 | 主要职责 |
 | --- | --- | --- |
-| Verifier server | `server-side/verifier_server.py` | 启动 target model HTTP server，接收 client batch，执行 draft verification，并向 drafter 返回 verify 结果 |
-| Drafter server | `server-side/drafter_server.py` | 启动普通 decode draft model HTTP server，接收 verify 结果并生成 K-step、F=1 的线性 draft chain |
+| Server fleet | `server-side/server.py` | 连接 Ray 集群，联合放置所有 verifier/drafter，自动分配端口，启动两侧 HTTP engine，并输出 ready manifest |
 | Client | `client-side/client.py` | 解析 dataset，加载 target tokenizer，应用 chat template，在本地 tokenize，并通过一次 streaming `/generate` 请求提交整个 batch |
 | Observability collector | `common/collector.py` | 周期性采集 verifier 和 drafter 的服务状态，保存原始时间序列 |
 | Plot scripts | `plot/*.py` | 分别从稳定的 client/observability 产物生成 latency、speculative、overview 图和单轮报告 |
@@ -35,7 +34,7 @@
 3. Verifier 与 drafter 通过 decoupled-spec data plane 循环交换 draft tokens 和 verify results。
 4. Verifier 通过 streaming SSE 返回 batch 结果；每个 event 使用 `index` 标明所属请求。
 5. Client 按 `index` 分流 event，计算每条请求的 TTFT、TPOT、E2E latency 和 speculative decoding 指标。
-6. Observability collector 同期采集两个 server 的 `/v1/loads`，形成服务状态时间序列。
+6. Observability collector 从 ready manifest 展开所有 engine，同期采集每个 `/v1/loads`，形成按 `engine_id` 隔离的时间序列。
 
 这里的 `batch.size` 表示单次 `/generate` 请求包含的样本数。例如 `batch.size=4` 会产生一个包含 4 组 `input_ids` 的 HTTP 请求。
 
@@ -45,6 +44,9 @@
 benchmark/decoupled_spec/
 ├── server-side/
 │   ├── config.py
+│   ├── orchestrator.py
+│   ├── role_server.py
+│   ├── server.py
 │   ├── verifier_server.py
 │   └── drafter_server.py
 ├── client-side/
@@ -67,6 +69,7 @@ benchmark/decoupled_spec/
 │   │   └── tp1.yaml
 │   ├── drafter/
 │   │   └── tp1.yaml
+│   ├── server/
 │   ├── client/
 │   │   ├── gsm8k.yaml
 │   │   └── synthetic.yaml
@@ -85,11 +88,14 @@ benchmark/decoupled_spec/
 
 ### 2.1 `server-side/`
 
-- `verifier_server.py`：解析 verifier YAML，设置该进程的 GPU 和环境变量，构造 SGLang `ServerArgs`，启动 verifier HTTP server，并记录进程状态。
-- `drafter_server.py`：以相同方式启动 drafter HTTP server，并记录 drafter 的最终配置与状态。
-- `config.py`：统一完成 YAML 读取、明确命名的 CLI 参数覆盖、`ServerArgs` 字段校验以及 verifier/drafter 配对校验。
+- `server.py`：唯一的用户侧 server 入口；连接已有 Ray 集群并管理整个 fleet 生命周期。
+- `orchestrator.py`：联合 placement group、节点本地 socket lease、稀疏 quota graph、Ray actor、ready manifest 与清理逻辑。
+- `role_server.py`：actor 内部启动单个 verifier/drafter HTTP 子进程，不作为手工入口。
+- `verifier_server.py` / `drafter_server.py`：保留给单角色调试；正式 benchmark 使用统一 launcher。
 
-配对校验会检查 role-specific algorithm、K/F/verify-window、Python/C++ data-plane backend、bind/connect endpoint 和 GPU 分配，使两个 role 在进入模型加载前就具有一致的通信配置。
+统一校验会检查 role-specific algorithm、K/F/verify-window 和 Python/C++
+data-plane backend。Placement 完成后，launcher 再根据实际节点生成 bind endpoint、
+sparse quota peers 与 GPU 分配；runtime 在启动 transport 前校验完整 ranked topology。
 
 ### 2.2 `client-side/`
 
@@ -101,7 +107,7 @@ Client 加载的是 target tokenizer。Verifier 收到预先生成的 `List[List
 
 ### 2.3 `common/`
 
-- `collector.py`：启动时保存 `/model_info` 和 `/server_info`，运行期间按固定周期并行采集两个 server 的 `/v1/loads`。它只负责原始数据采集和 summary，不在退出路径中触发绘图。
+- `collector.py`：从 `server/manifest.json` 展开所有 verifier/drafter，保存每个 engine 的 `/model_info`、`/server_info` 与周期性 `/v1/loads`。它只负责原始数据采集和 summary，不在退出路径中触发绘图。
 - `artifacts.py`：初始化、记录和封存一次实验，维护 provenance、组件状态、run manifest 与 checksum。
 
 Collector 默认每 1 秒采样一次。该时间序列适合观察整个正式请求窗口内的负载、队列和吞吐变化；CUDA stream、IPC 和单轮 verify 的微秒级分析可以再与 Nsys/NVTX trace 对齐。
@@ -128,14 +134,14 @@ Collector 默认每 1 秒采样一次。该时间序列适合观察整个正式�
 
 ### 2.6 `configs/` 与 `skills/`
 
-`configs/` 按 verifier、drafter、client 和 observability 四类组件保存 YAML。每个进程启动时都会保存应用命令行覆盖后的 resolved config。
+`configs/server/` 保存统一 Ray fleet YAML；client 和 observability 仍使用独立 YAML。旧 verifier/drafter YAML 仅用于单角色调试和历史结果复核。
 
 `skills/` 保存六个面向不同任务的 Agent skill：
 
 | Skill | 职责 |
 | --- | --- |
-| `run-decoupled-spec-benchmark` | 编排一轮完整 benchmark 的生命周期，不引入一键运行脚本 |
-| `operate-decoupled-spec-servers` | 校验拓扑，独立启动、检查和停止 verifier/drafter |
+| `run-decoupled-spec-benchmark` | 编排统一 Ray server、client、collector、绘图和审计的完整生命周期 |
+| `operate-decoupled-spec-servers` | 校验并操作统一 Ray fleet、ready manifest 和清理 |
 | `send-decoupled-spec-workload` | 检查 dataset/tokenizer/chat template，并提交一个 streaming batch |
 | `observe-decoupled-spec-run` | 采集并验收 verifier/drafter 的 service-level 时间序列 |
 | `analyze-decoupled-spec-results` | 基于一个已有 run 的稳定产物生成图和报告 |
@@ -145,42 +151,48 @@ Collector 默认每 1 秒采样一次。该时间序列适合观察整个正式�
 
 ## 3. 配置说明
 
-### 3.1 Verifier 与 drafter
+### 3.1 统一 Ray server fleet
 
-默认配置对应以下单机拓扑：
-
-| Role | Model | TP | GPU | HTTP | Decoupled endpoint |
-| --- | --- | ---: | --- | --- | --- |
-| Verifier | Qwen3.5-27B | 1 | `0` | `127.0.0.1:30000` | bind `tcp://127.0.0.1:31000` |
-| Drafter | Qwen3.5-0.8B | 1 | `1` | `127.0.0.1:30001` | bind `tcp://127.0.0.1:31001` |
-
-每个 role 配置包含两类字段：
+一个 YAML 同时定义 verifier/drafter 模板和副本数：
 
 ```yaml
 schema_version: 1
-role: verifier
-runtime:
-  cuda_visible_devices: ["0"]
-  env:
-    SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
-server_args:
-  model_path: /path/to/target-model
-  tp_size: 1
-  host: 127.0.0.1
-  port: 30000
-  enable_metrics: true
-  speculative_algorithm: DECOUPLED_VERIFY
-  speculative_num_steps: 3
-  speculative_eagle_topk: 1
-  speculative_num_draft_tokens: 4
-  decoupled_spec_role: verifier
-  decoupled_spec_rank: 0
-  decoupled_spec_bind_endpoint: tcp://127.0.0.1:31000
-  decoupled_spec_connect_endpoints: [tcp://127.0.0.1:31001]
+ray:
+  address: auto
+  namespace: decoupled-spec-benchmark
+verifier:
+  replicas: 2
+  runtime:
+    env: {SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"}
+  server_args:
+    model_path: /path/to/target-model
+    tp_size: 4
+    speculative_algorithm: DECOUPLED_VERIFY
+    speculative_num_steps: 3
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 4
+drafter:
+  replicas: 3
+  runtime:
+    env: {SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"}
+  server_args:
+    model_path: /path/to/draft-model
+    tp_size: 1
+    speculative_algorithm: null
+    disable_overlap_schedule: true
+    page_size: 1
+    speculative_num_steps: 3
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 4
 ```
 
-- `runtime` 控制进程级 GPU 可见性和环境变量。
-- `server_args` 在字段校验后直接构造当前 checkout 的 SGLang `ServerArgs`。
+- `runtime` 只传环境变量；Ray 决定 GPU，配置不得写
+  `CUDA_VISIBLE_DEVICES`。
+- `host`、HTTP/NCCL/transport port、role/rank 和 peer config 全由 launcher
+  在实际节点上分配。
+- Launcher 迁移 v0.5.14-dev 的最小 quota graph。每个 verifier 只连接有
+  quota edge 的 drafter，并用 lifecycle-sticky SWRR 路由；不是 full mesh。
+- 一个 TP replica 当前必须放入单个 Ray 节点；多个 replica 可以分布到多机。
 - `enable_metrics: true` 为 `/v1/loads` observability 数据提供 server metrics。
 - Verifier 使用 `DECOUPLED_VERIFY`；drafter 是普通 decode engine，
   `speculative_algorithm` 必须为 `null`，并显式禁用 overlap schedule。
@@ -188,7 +200,8 @@ server_args:
   `speculative_num_draft_tokens` 必须为 4。
 - Drafter 使用 `skip_server_warmup: true`，因为它只处理 decoupled control
   traffic，不接收通用 startup warmup 发送的 user `/generate` 请求。
-- 两端的 bind endpoint 会分别出现在对端的 connect endpoint 列表中。
+- Ready 后的所有 HTTP/transport 地址、Ray node 和 GPU allocation 都写入
+  `server/manifest.json` 并打印到 stdout。
 - Active decoupled runtime 强制两端同时设置
   `runtime.env.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND=1`；role validation 会拒绝
   Python data plane，pair validator 也会拒绝两端 backend 混配。Python 实现只保留为
@@ -196,12 +209,12 @@ server_args:
 
 ### 3.2 Client 与 dataset
 
-Client 配置同时定义 verifier 地址、target tokenizer、batch、dataset、chat template 和 generation 参数：
+Client 配置定义 target tokenizer、batch、dataset、chat template 和
+generation 参数；运行时用 `--server-manifest --verifier-rank` 选择 verifier：
 
 ```yaml
 schema_version: 1
-server:
-  base_url: http://127.0.0.1:30000
+server: {}
 target_tokenizer:
   model_path: /path/to/target-model
 batch:
@@ -245,16 +258,12 @@ Chat template 有两种模式：
 schema_version: 1
 interval_s: 1.0
 request_timeout_s: 0.8
-targets:
-  verifier:
-    base_url: http://127.0.0.1:30000
-  drafter:
-    base_url: http://127.0.0.1:30001
+targets: {}  # --server-manifest 会展开所有 engine
 loads:
   include: [core, spec, queues]
 ```
 
-`interval_s` 控制采样周期，`loads.include` 控制 `/v1/loads` 返回的字段组。Collector 对 verifier 和 drafter 并行发起采样请求，并记录每次请求的时间、HTTP status、采集延迟和原始 payload。
+`interval_s` 控制采样周期，`loads.include` 控制 `/v1/loads` 返回的字段组。Collector 从 ready manifest 展开所有 engine，按 `target_id` 并行采样并保存原始 payload。
 
 ### 3.4 命令行覆盖
 
@@ -262,19 +271,16 @@ YAML 保存完整配置，常用实验变量通过明确命名的 CLI 参数覆�
 
 | 组件 | 可覆盖参数 |
 | --- | --- |
-| Verifier/drafter | `--model-path`、`--tp-size`、`--cuda-visible-devices`、`--host`、`--port` |
-| Client | `--base-url`、`--target-tokenizer-path`、`--batch-size`、dataset/chat-template/generation 相关参数 |
-| Observability | `--verifier-url`、`--drafter-url`、`--interval-s`、`--request-timeout-s`、`--loads-include` |
+| Server fleet | `--ray-address`、`--ray-namespace`；模型/TP/副本数保存在统一 YAML |
+| Client | `--server-manifest`、`--verifier-rank`、`--target-tokenizer-path`、`--batch-size`、dataset/chat-template/generation 相关参数 |
+| Observability | `--server-manifest`、`--interval-s`、`--request-timeout-s`、`--loads-include` |
 
 例如：
 
 ```bash
-# Verifier TP4，并分配 4 张 GPU
---tp-size 4 \
---cuda-visible-devices 0 1 2 3
-
-# Drafter 使用另一张 GPU
---cuda-visible-devices 4
+# 连接指定 Ray 集群/namespace
+--ray-address auto \
+--ray-namespace my-dspec-run
 
 # Client 使用 BS4 和 1024-token 输出
 --batch-size 4 \
@@ -286,44 +292,34 @@ YAML 保存完整配置，常用实验变量通过明确命名的 CLI 参数覆�
 
 Boolean 参数同时提供正反形式，例如 `--ignore-eos` / `--no-ignore-eos` 和 `--enable-thinking` / `--no-enable-thinking`。
 
-Speculative K、F、verify window、data-plane backend 和 bind/connect endpoints 继续作为 verifier/drafter 成对 YAML 配置，由 pair validator 一次检查两端的一致性。
+Speculative K、F、verify window、模型和副本数保存在统一 server YAML；端口、rank、quota peer configs 与 GPU allocation 不接受手工覆盖。
 
 v0.5.17 的 Qwen3.5-27B TP4 / Qwen3.5-0.8B TP1、K3/F1、DAPO row0
 正式 overlap/non-overlap 配置与原子命令见
 [`configs/formal_v0517_qwen35.md`](configs/formal_v0517_qwen35.md)。
 
 BS8/16/32/64 × output 1K/4K/16K/32K、thinking + verifier ReplaySSM 的
-32-case 扩展 campaign 见 [`matrix/README.md`](matrix/README.md)。该 campaign
-仍复用本目录的四个独立 role；matrix 层只负责确定性 case contract、可恢复 ledger
-和 sealed-only 汇总，不提供 combined launcher。当前 GPU matrix 被
-`draft_inbox_segment_bs8_correctness` 硬前置 gate 阻挡，不能在迁移并完成真实 BS8
-probe 之前宣称 ready 或开始实验。
+32-case 扩展 campaign 见 [`matrix/README.md`](matrix/README.md)。其已有 case
+contract、ledger 和 sealed-only 汇总仍可读取；新实验的 server 生命周期以统一
+Ray launcher 和 ready manifest 为准。历史 campaign 的 gate 与状态仍以各自保存的
+ledger 为准，不会被新 launcher 隐式改写。
 
 ## 4. 运行方式
 
 下面给出一轮完整运行。所有命令均从 SGLang 仓库根目录执行，`PYTHONPATH=python` 确保使用当前 checkout 的源码。
 
-Agent 执行完整实验时使用 `$run-decoupled-spec-benchmark`。如果只需要处理某一个阶段，可以直接使用对应的 server、workload、observability、analysis 或 artifact-audit skill。总控 skill 只负责协调下列独立命令和进程，不会调用隐藏的一键 runner。
+Agent 执行完整实验时使用 `$run-decoupled-spec-benchmark`。Server fleet 由
+一个显式 Ray launcher 管理；client、collector 和离线分析仍是独立命令。
 
 ### 4.1 校验配置
 
-先校验 verifier 与 drafter 的配置配对关系：
+先校验统一 server fleet 配置；`--check` 不连接 Ray：
 
 ```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/config.py validate \
-  --verifier-config benchmark/decoupled_spec/configs/verifier/tp1.yaml \
-  --drafter-config benchmark/decoupled_spec/configs/drafter/tp1.yaml
-```
-
-当 server 使用 CLI 覆盖部署参数时，pair validator 接受带 role 前缀的同名参数。例如 verifier TP4：
-
-```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/config.py validate \
-  --verifier-config benchmark/decoupled_spec/configs/verifier/tp1.yaml \
-  --drafter-config benchmark/decoupled_spec/configs/drafter/tp1.yaml \
-  --verifier-tp-size 4 \
-  --verifier-cuda-visible-devices 0 1 2 3 \
-  --drafter-cuda-visible-devices 4
+PYTHONPATH=python python benchmark/decoupled_spec/server-side/server.py \
+  --config benchmark/decoupled_spec/configs/server/qwen35_27b_tp4_0_8b_tp1_k3_overlap_cpp_replayssm_bs64.yaml \
+  --run-dir /tmp/check-only \
+  --check
 ```
 
 检查 client YAML 的解析结果：
@@ -346,46 +342,36 @@ echo "$RUN_DIR"
 
 后续四个组件使用同一个 `RUN_DIR`，这样所有输入、状态和结果会自然归入同一轮实验。
 
-### 4.3 启动 verifier server
+### 4.3 启动统一 server fleet
 
 在一个长期进程会话中运行：
 
 ```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/verifier_server.py \
-  --config benchmark/decoupled_spec/configs/verifier/tp1.yaml \
+PYTHONPATH=python python benchmark/decoupled_spec/server-side/server.py \
+  --config benchmark/decoupled_spec/configs/server/qwen35_27b_tp4_0_8b_tp1_k3_overlap_cpp_replayssm_bs64.yaml \
   --run-dir "$RUN_DIR"
 ```
 
-### 4.4 启动 drafter server
-
-在另一个长期进程会话中运行：
+Launcher 会打印所有 verifier/drafter 的 IP、HTTP port、transport endpoint、
+Ray node、GPU 和远端实际 `sglang_path`，并写入 ready manifest。Launcher 通过 Ray
+`py_modules` 分发当前 checkout 的 server package 与 SGLang Python package，因此不
+依赖多机共享仓库路径，也不会静默回退到节点上的旧安装。用统一 readiness gate
+检查全部 engine：
 
 ```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/drafter_server.py \
-  --config benchmark/decoupled_spec/configs/drafter/tp1.yaml \
+python benchmark/decoupled_spec/skills/operate-decoupled-spec-servers/scripts/wait_for_roles.py \
   --run-dir "$RUN_DIR"
 ```
 
-Agent 或进程管理器分别持有两个 server 会话，可以独立查看日志、检查状态和采集 profiler trace。
-
-两个 server 的 `status.json` 均进入 `http_ready` 后，即可开始正式采集：
-
-```bash
-cat "$RUN_DIR/roles/verifier/status.json"
-cat "$RUN_DIR/roles/drafter/status.json"
-
-curl -fsS http://127.0.0.1:30000/health
-curl -fsS http://127.0.0.1:30001/model_info
-```
-
-### 4.5 启动 observability collector
+### 4.4 启动 observability collector
 
 在正式 client 请求前启动 collector：
 
 ```bash
 PYTHONPATH=python python benchmark/decoupled_spec/common/collector.py \
   --config benchmark/decoupled_spec/configs/observability/default.yaml \
-  --run-dir "$RUN_DIR"
+  --run-dir "$RUN_DIR" \
+  --server-manifest "$RUN_DIR/server/manifest.json"
 ```
 
 也可以使用 `--duration-s` 让 collector 在固定时间后结束，例如：
@@ -394,10 +380,11 @@ PYTHONPATH=python python benchmark/decoupled_spec/common/collector.py \
 PYTHONPATH=python python benchmark/decoupled_spec/common/collector.py \
   --config benchmark/decoupled_spec/configs/observability/default.yaml \
   --run-dir "$RUN_DIR" \
+  --server-manifest "$RUN_DIR/server/manifest.json" \
   --duration-s 120
 ```
 
-### 4.6 发送一个正式 batch
+### 4.5 发送一个正式 batch
 
 GSM8K 配置：
 
@@ -405,6 +392,8 @@ GSM8K 配置：
 PYTHONPATH=python python benchmark/decoupled_spec/client-side/client.py \
   --config benchmark/decoupled_spec/configs/client/gsm8k.yaml \
   --run-dir "$RUN_DIR" \
+  --server-manifest "$RUN_DIR/server/manifest.json" \
+  --verifier-rank 0 \
   --batch-size 1 \
   --output-len 1024
 ```
@@ -414,14 +403,18 @@ PYTHONPATH=python python benchmark/decoupled_spec/client-side/client.py \
 ```bash
 PYTHONPATH=python python benchmark/decoupled_spec/client-side/client.py \
   --config benchmark/decoupled_spec/configs/client/synthetic.yaml \
-  --run-dir "$RUN_DIR"
+  --run-dir "$RUN_DIR" \
+  --server-manifest "$RUN_DIR/server/manifest.json" \
+  --verifier-rank 0
 ```
 
 Client 会在标准输出打印 batch summary，同时把完整记录写入 `$RUN_DIR/client/`。
 
-### 4.7 结束采集并生成单次运行报告
+### 4.6 结束采集并生成单次运行报告
 
-Client 完成后，保留至少一轮 trailing sample，再向 collector 发送 SIGINT 或 SIGTERM。Collector 只在原始采集结束后写入 summary 和最终状态。随后由 Agent 结束两个 server 进程，并按顺序显式生成本轮的派生产物：
+Client 完成后，保留至少一轮 trailing sample，再结束 collector。随后向统一
+launcher 发送 SIGTERM，等待它回收 actor/placement group/port lease 并把所有远端
+config/status/log 收回 `RUN_DIR`，再按顺序生成派生产物：
 
 ```bash
 PYTHONPATH=python python benchmark/decoupled_spec/plot/plot_latency.py \
@@ -439,9 +432,14 @@ PYTHONPATH=python python benchmark/decoupled_spec/plot/generate_report.py \
 
 四个脚本职责独立，分别写入自己的 source manifest。某一类派生产物失败时，可以只定位和重跑对应脚本，不会重新发送 benchmark 流量。
 
-### 4.8 验收并封存本轮实验
+### 4.7 验收并封存本轮实验
 
 先执行 pre-seal audit。该检查会核对组件状态、batch cardinality、formal window、observability coverage 和绘图 source hash，并把报告写入本轮产物：
+
+性能实验还有一个硬前提：verifier 和 drafter 都必须完整并行处理请求。collector
+baseline 及 formal-window samples 必须满足 `num_waiting_reqs == 0`，两端 role log
+也不能出现正数 `#queue-req`。任何排队都将本轮标记为 invalid/incomplete；不能把
+它解释为正常的低吞吐，也不能封存后纳入性能对比。
 
 ```bash
 python benchmark/decoupled_spec/skills/audit-decoupled-spec-artifacts/scripts/audit_run.py \
@@ -503,9 +501,9 @@ Speculative decoding 一轮可能接受多个 token，同一 SSE event 也可能
 - `proposed_draft_length`：实际送入 verifier 的 draft 数除以 verify request-row 数，即图中的 valid draft length；
 - `accept_length`：接受的 draft 与 bonus token 总数除以 verify request-row 数。
 
-窗口带单调 `window_id` 和 `end_time`。Collector 只保存 HTTP 原始响应；`plot_observability.py` 离线去重窗口并绘制共享时间轴的 scheduler cycle、mean batch size、mean context length、valid draft length 和 accept length。该链路不解析 server log，也不增加 GPU 同步。
+窗口带单调 `window_id` 和 `end_time`。Collector 只保存 HTTP 原始响应；`plot_observability.py` 离线去重窗口并绘制共享时间轴的 iteration latency、mean batch size、mean context length、valid draft length 和 accept length。该链路不解析 server log，也不增加 GPU 同步。
 
-Collector 的 `observability/summary.json` 会分别汇总 verifier 和 drafter，给出各自的窗口数、scheduler cycle mean/min/p50/p95/max、mean batch size 和 mean context length；verifier 还包含 valid draft length 与 accept length。重复出现在多个 HTTP sample 中的 bounded-history 窗口只统计一次。
+Collector 的 `observability/summary.json` 会按 engine 和 role 两层汇总，给出各自的窗口数、iteration latency mean/min/p50/p95/max、mean batch size 和 mean context length；verifier 还包含 valid draft length 与 accept length。重复出现在多个 HTTP sample 中的 bounded-history 窗口只统计一次，采样失败在图上保留为断点而不是补零或跨点连线。
 
 ## 6. 输出产物目录
 
@@ -516,14 +514,17 @@ $RUN_DIR/
 ├── provenance/
 │   └── run_start.json
 ├── logs/
-│   ├── verifier.log
-│   └── drafter.log
+│   └── server/
+│       ├── verifier-0.log
+│       └── drafter-0.log
+├── server/
+│   ├── resolved_config.json
+│   ├── manifest.json
+│   └── engines/<engine_id>/
+│       ├── resolved_config.json
+│       └── status.json
 ├── roles/
-│   ├── verifier/
-│   │   ├── resolved_config.json
-│   │   └── status.json
-│   ├── drafter/
-│   │   ├── resolved_config.json
+│   ├── server/
 │   │   └── status.json
 │   ├── client/
 │   │   └── status.json
@@ -542,10 +543,10 @@ $RUN_DIR/
 ├── observability/
 │   ├── resolved_config.json
 │   ├── startup/
-│   │   ├── verifier/
+│   │   ├── verifier-0/
 │   │   │   ├── model_info.json
 │   │   │   └── server_info.json
-│   │   └── drafter/
+│   │   └── drafter-0/
 │   │       ├── model_info.json
 │   │       └── server_info.json
 │   ├── samples.jsonl
@@ -574,7 +575,9 @@ $RUN_DIR/
 ### 6.1 实验身份与实际配置
 
 - `provenance/run_start.json`：保存实验名称、启动时间、命令行、Python 路径、平台、Git commit、branch 和初始工作区状态。
-- `roles/*/resolved_config.json`：保存 verifier 和 drafter 实际使用的 role 配置。
+- `server/resolved_config.json`：统一 fleet 配置快照。
+- `server/manifest.json`：quota graph 和所有 engine 的 node/GPU/HTTP/transport/产物路径。
+- `server/engines/<engine_id>/resolved_config.json`：launcher 注入 rank、端口与 peer quota 后的实际配置。
 - `client/resolved_config.json`、`observability/resolved_config.json`：保存 client 和 collector 应用明确 CLI 覆盖后的最终配置。
 - `roles/*/status.json`：保存各组件的当前状态、PID、更新时间以及完成或失败信息。
 
@@ -594,9 +597,9 @@ $RUN_DIR/
 
 ### 6.4 Observability 时间序列
 
-- `startup/<role>/model_info.json`、`server_info.json`：保存 collector 启动时的服务快照与采集元信息。
-- `samples.jsonl`：逐采样、逐 role 保存 `/v1/loads` 原始 payload、采集时间、HTTP status 和采集延迟。
-- `summary.json`：保存采样周期、样本数、目标数和错误数。
+- `startup/<target_id>/model_info.json`、`server_info.json`：保存每个 engine 的启动快照。
+- `samples.jsonl`：逐采样、逐 `target_id` 保存 `/v1/loads` 原始 payload、采集时间、HTTP status 和采集延迟。
+- `summary.json`：保存采样周期、目标数、错误数，以及 per-engine/per-role decode metrics。
 - `observability/plots/overview.svg`、`overview.png`：从 `samples.jsonl` 派生的可视化。
 - `observability/plots/plot_manifest.json`：记录 overview 的输入文件、SHA-256 和输出路径。
 
@@ -618,7 +621,7 @@ PYTHONPATH=python python benchmark/decoupled_spec/plot/plot_observability.py \
 
 ### 6.6 封存结果
 
-- `logs/verifier.log`、`logs/drafter.log`：Agent 独立启动两个 server 时保存的 stdout/stderr，用于解释启动失败和最终退出状态。
+- `logs/server/<engine_id>.log`：Ray actor 在停止时回传给 driver 的每个 HTTP engine 完整日志。
 - `audit/pre_seal.json`：封存前对状态、请求 cardinality、observability coverage 和 plot provenance 的机器可读验收结果。
 - `run_manifest.json`：集中收录本轮所有 JSON 产物，便于一次性检查配置、状态与结果。
 - `SHA256SUMS`：记录每个产物文件的 SHA-256，可用于传输后或长期保存后的完整性验证。

@@ -224,23 +224,28 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
 
     bind_endpoint = server_args.decoupled_spec_bind_endpoint
     connect_endpoints = server_args.decoupled_spec_connect_endpoints
+    peer_configs = getattr(server_args, "decoupled_spec_peer_configs", None)
     rank = server_args.decoupled_spec_rank
-    if bind_endpoint is None or connect_endpoints is None or rank is None:
+    if (
+        bind_endpoint is None
+        or rank is None
+        or (connect_endpoints is None and peer_configs is None)
+    ):
         raise ValueError(
             "--decoupled-spec-bind-endpoint, "
-            "--decoupled-spec-connect-endpoints, and "
-            "--decoupled-spec-rank are required for decoupled speculative decoding."
+            "--decoupled-spec-rank, and a peer topology are required for "
+            "decoupled speculative decoding."
         )
-    if not isinstance(connect_endpoints, (list, tuple)) or len(connect_endpoints) != 1:
-        raise ValueError(
-            "Phase-one decoupled speculation supports exactly one peer endpoint, "
-            f"got {connect_endpoints!r}."
-        )
-    if int(rank) != 0:
-        raise ValueError(
-            "Phase-one 1:1 decoupled speculation requires "
-            f"--decoupled-spec-rank 0, got {rank}."
-        )
+    from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
+
+    # Validate the complete sparse topology during argument resolution, before
+    # any scheduler subprocess or transport thread is started.
+    DecoupledSpecIpcConfig.from_raw(
+        bind_endpoint=bind_endpoint,
+        rank=rank,
+        peer_configs=peer_configs,
+        connect_endpoints=connect_endpoints,
+    )
 
     topk = server_args.speculative_eagle_topk
     if topk is None:

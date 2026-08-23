@@ -2200,8 +2200,17 @@ class ServerArgs:
     decoupled_spec_connect_endpoints: A[
         Optional[List[str]],
         Arg(
-            help="Peer inbound (bind) endpoints to connect to, ordered by peer "
-            "rank, for decoupled speculative decoding.",
+            help="Legacy peer inbound endpoints ordered by contiguous peer rank. "
+            "Use --decoupled-spec-peer-configs for sparse or weighted routing.",
+            type_parser=json_list_type,
+        ),
+        NS("disagg"),
+    ] = None
+    decoupled_spec_peer_configs: A[
+        Optional[List[Dict[str, Any]]],
+        Arg(
+            help="JSON list of ranked decoupled-spec peer objects. Each object "
+            "must contain rank, endpoint, and a positive integer quota.",
             type_parser=json_list_type,
         ),
         NS("disagg"),
@@ -9442,18 +9451,18 @@ class PortArgs:
         if server_args.decoupled_spec_role != "null":
             if (
                 server_args.decoupled_spec_bind_endpoint is None
-                or server_args.decoupled_spec_connect_endpoints is None
                 or server_args.decoupled_spec_rank is None
             ):
                 raise ValueError(
                     "--decoupled-spec-bind-endpoint, "
-                    "--decoupled-spec-connect-endpoints, and "
-                    "--decoupled-spec-rank are required for decoupled speculative decoding."
+                    "--decoupled-spec-rank, and a peer topology are required "
+                    "for decoupled speculative decoding."
                 )
-            decoupled_spec_ipc_config = DecoupledSpecIpcConfig(
+            decoupled_spec_ipc_config = DecoupledSpecIpcConfig.from_raw(
                 bind_endpoint=server_args.decoupled_spec_bind_endpoint,
-                connect_endpoints=tuple(server_args.decoupled_spec_connect_endpoints),
-                rank=int(server_args.decoupled_spec_rank),
+                rank=server_args.decoupled_spec_rank,
+                peer_configs=server_args.decoupled_spec_peer_configs,
+                connect_endpoints=server_args.decoupled_spec_connect_endpoints,
             )
 
         if not server_args.enable_dp_attention:

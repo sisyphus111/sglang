@@ -12,30 +12,53 @@ leaving the benchmark traffic path unchanged.
 
 Read [references/timing-boundaries.md](references/timing-boundaries.md), then:
 
-1. Validate the observability config with
-   `benchmark/decoupled_spec/common/collector.py --check`.
-2. Start the collector only after both servers are HTTP-ready and before the
-   formal client request.
-3. Require at least one successful `/v1/loads` sample from both verifier and
-   drafter before starting the client.
+1. Validate the observability config with `collector.py --check`, passing the
+   ready server manifest.
+2. Start the collector with `--server-manifest` only after every engine is
+   HTTP-ready and before the formal client request.
+3. Require at least one successful `/v1/loads` sample with
+   `num_waiting_reqs == 0` from every verifier and drafter engine.
 4. After the client finishes, retain at least one successful trailing sample
    from both roles, then terminate the collector gracefully.
 5. Require collector status `completed`, inspect its error count, and run
    `scripts/validate_samples.py`.
 6. Generate the derived overview explicitly with
    `benchmark/decoupled_spec/plot/plot_observability.py`.
-7. When `decode_metrics_windows` are present, require
-   `observability/plots/decode_metrics.{svg,png}` and inspect all five aligned
-   time series: scheduler cycle, mean batch size, mean context length, valid
-   draft length, and accept length.
+7. Require the derived observability plots to show:
+   - `iteration latency` from `decode_metrics_windows`, with separate verifier
+     and drafter lines;
+   - verifier `valid draft tail length` and `accept length` from the same decode
+     windows; and
+   - `running batch size over time` from each role's sampled
+     `num_running_reqs`.
+
+   Use ordinary linear y-axes starting at zero for iteration latency and
+   running batch size. Do not use a logarithmic axis. A derived iteration
+   latency view may remove clearly abnormal large values, but it must preserve
+   the raw windows and record the exclusion rule, count, window IDs, times, and
+   values in the plot manifest or report.
 
 The collector may query `/model_info`, `/server_info`, and `/v1/loads`; it must
 not call `/generate`.
 
-Require `observability/summary.json.decode_metrics` to report verifier and
-drafter independently. For each role, preserve the unique window count and
-scheduler-cycle mean/min/p50/p95/max; do not merge the two roles into one cycle
-distribution.
+Every successful formal-window sample must report `num_waiting_reqs == 0` for
+every manifest engine. A positive value means the requested batch was not
+served concurrently and invalidates the performance run. The artifact audit
+also scans role logs so a logged transient queue cannot be hidden by the
+collector's sampling interval.
+
+Require `observability/summary.json.decode_metrics_by_target` to report every
+`engine_id` independently, plus verifier/drafter aggregates under
+`decode_metrics`. Window identity is `(target_id, dp_rank, window_id)`; two
+replicas may legitimately reuse the same local window ID. The persisted
+compatibility key may remain
+`scheduler_cycle_ms`, but figures and human-facing reports must call the metric
+`iteration latency`.
+
+Treat sampled `num_running_reqs` as the server's running batch size at that
+collector instant. Plot verifier and drafter separately on one time axis. Do
+not substitute decode-window `mean_batch_size`, fill a missing HTTP sample with
+zero, or interpolate across a collection failure.
 
 ## Interpret
 
@@ -50,8 +73,10 @@ trace with a narrower timing boundary.
 
 ## Output Contract
 
-Return the sampling interval, formal-window duration, per-role successful/error
-sample counts, coverage before/inside/after the formal window, maximum sample
-gap, per-role unique decode-window counts and scheduler-cycle statistics, and
-plot paths. Surface missing coverage or a missing decode-metrics plot as an
+Return the sampling interval, formal-window duration, per-engine
+successful/error sample counts, coverage before/inside/after the formal window,
+maximum sample gap, maximum formal-window waiting requests, per-engine unique
+decode-window counts and iteration latency statistics, and paths for the running batch size,
+valid draft tail length, accept length, and iteration latency plots. Surface
+any nonzero waiting queue, missing coverage, or a missing required plot as an
 observability failure even when the client request itself succeeded.

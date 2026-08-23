@@ -13,6 +13,7 @@ from sglang.srt.speculative.decoupled_spec_data_plane import (
 )
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
+    DecoupledSpecPeerConfig,
     DraftClose,
     DraftSync,
     DraftTailStreamOutput,
@@ -352,6 +353,79 @@ class TestDraftTailBuffer(CustomTestCase):
 
 
 class TestPythonDecoupledSpecDataPlane(CustomTestCase):
+    def test_sparse_ranked_bidirectional_transport(self):
+        context = zmq.Context()
+        suffix = uuid.uuid4().hex
+        verifier_endpoint = f"inproc://decoupled-verifier-{suffix}"
+        drafter_endpoint = f"inproc://decoupled-drafter-{suffix}"
+        verifier = VerifierDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=verifier_endpoint,
+                connect_endpoints=(),
+                rank=5,
+                peers=(
+                    DecoupledSpecPeerConfig(rank=9, endpoint=drafter_endpoint, quota=1),
+                ),
+            ),
+            context=context,
+        )
+        drafter = DrafterDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=drafter_endpoint,
+                connect_endpoints=(),
+                rank=9,
+                peers=(
+                    DecoupledSpecPeerConfig(
+                        rank=5, endpoint=verifier_endpoint, quota=1
+                    ),
+                ),
+            ),
+            context=context,
+        )
+
+        try:
+            verifier.start()
+            drafter.start()
+            verifier.open_request(
+                DraftSync(
+                    request_id="sparse",
+                    src_verifier_rank=5,
+                    dst_drafter_rank=9,
+                    prompt_token_ids=[7, 8],
+                    committed_outputs=[],
+                )
+            )
+            open_batches = _wait_for_value(drafter.drain_controls)
+            self.assertEqual(open_batches[0].dst_drafter_rank, 9)
+            self.assertEqual(open_batches[0].sync_messages[0].src_verifier_rank, 5)
+
+            drafter.publish_tails(
+                DraftTailStreamOutputBatch(
+                    outputs=[
+                        DraftTailStreamOutput(
+                            src_drafter_rank=9,
+                            dst_verifier_rank=5,
+                            request_id="sparse",
+                            base_committed_len=0,
+                            new_token_pos=0,
+                            new_token=101,
+                        )
+                    ]
+                )
+            )
+            snapshot = _wait_for_value(
+                lambda: (
+                    current
+                    if (current := verifier.snapshot_one("sparse")).tail_tokens
+                    else None
+                )
+            )
+            self.assertEqual(snapshot.tail_tokens, (101,))
+        finally:
+            drafter.close()
+            verifier.close()
+            context.destroy(linger=0)
+
     def test_bidirectional_zmq_transport(self):
         context = zmq.Context()
         suffix = uuid.uuid4().hex

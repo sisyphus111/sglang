@@ -36,8 +36,7 @@ whole batch over its complete HTTP window.
 | `spec_num_proposed_drafts` | Sum of draft tokens actually presented to the verifier |
 | `spec_num_correct_drafts` | Sum of correct draft tokens |
 | `spec_accept_rate` | Correct drafts divided by proposed drafts |
-| `spec_draft_occupancy_rate` | Actual proposed drafts divided by `verify_ct * K` |
-| `spec_proposed_draft_length` | Actual proposed drafts divided by `verify_ct` |
+| `spec_proposed_draft_length` | Actual proposed drafts divided by `verify_ct`; report this as valid draft tail length |
 | `spec_accept_length` | Total completion tokens divided by verify count |
 
 Decoupled verification also reports the proposed-length histogram and per-position
@@ -48,6 +47,10 @@ These values describe speculative effectiveness, not the duration of an
 individual verify round. Null values mean the server response did not provide
 enough information; do not convert them to zero unless zero is actually
 recorded.
+
+Use valid draft tail length as the draft-supply quantity in plots and reports.
+It is an actual token count per verifier request-row and excludes the bonus
+token. Do not replace it with a K-normalized percentage.
 
 ## Attribution boundary
 

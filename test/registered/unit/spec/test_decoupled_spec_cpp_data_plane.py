@@ -13,6 +13,7 @@ from sglang.srt.speculative.cpp_decoupled_spec import (
     CppDrafterDecoupledSpecDataPlane,
     CppDraftTailBuffer,
     CppVerifierDecoupledSpecDataPlane,
+    _peer_rows,
 )
 from sglang.srt.speculative.decoupled_spec_data_plane import (
     DrafterDecoupledSpecDataPlane,
@@ -22,6 +23,7 @@ from sglang.srt.speculative.decoupled_spec_data_plane import (
 )
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
+    DecoupledSpecPeerConfig,
     DraftClose,
     DraftControlBatch,
     DraftSync,
@@ -34,6 +36,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+
+
+class TestRankedCppPeerRows(CustomTestCase):
+    def test_sparse_peer_ranks_are_not_reenumerated(self):
+        config = DecoupledSpecIpcConfig(
+            bind_endpoint="tcp://verifier:30005",
+            connect_endpoints=(),
+            rank=5,
+            peers=(
+                DecoupledSpecPeerConfig(
+                    rank=3, endpoint="tcp://drafter-a:31003", quota=2
+                ),
+                DecoupledSpecPeerConfig(
+                    rank=9, endpoint="tcp://drafter-b:31009", quota=1
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            _peer_rows(config),
+            [
+                (3, "tcp://drafter-a:31003"),
+                (9, "tcp://drafter-b:31009"),
+            ],
+        )
 
 
 def _sync(request_id: str = "req") -> DraftSync:
@@ -420,6 +447,247 @@ class TestCppDecoupledSpecDataPlane(CustomTestCase):
         )
         if errors:
             raise errors[0]
+
+    def test_cpp_one_verifier_routes_to_two_sparse_drafters(self):
+        verifier_endpoint = _tcp_endpoint()
+        drafter_endpoints = {3: _tcp_endpoint(), 9: _tcp_endpoint()}
+        verifier = CppVerifierDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=verifier_endpoint,
+                connect_endpoints=(),
+                rank=5,
+                peers=(
+                    DecoupledSpecPeerConfig(
+                        rank=3, endpoint=drafter_endpoints[3], quota=2
+                    ),
+                    DecoupledSpecPeerConfig(
+                        rank=9, endpoint=drafter_endpoints[9], quota=1
+                    ),
+                ),
+            ),
+            required_tail_len=0,
+        )
+        drafters = {
+            drafter_rank: CppDrafterDecoupledSpecDataPlane(
+                DecoupledSpecIpcConfig(
+                    bind_endpoint=drafter_endpoint,
+                    connect_endpoints=(),
+                    rank=drafter_rank,
+                    peers=(
+                        DecoupledSpecPeerConfig(
+                            rank=5, endpoint=verifier_endpoint, quota=1
+                        ),
+                    ),
+                )
+            )
+            for drafter_rank, drafter_endpoint in drafter_endpoints.items()
+        }
+        requests = {
+            3: ("to-drafter-3", 103),
+            9: ("to-drafter-9", 109),
+        }
+        try:
+            for drafter in drafters.values():
+                drafter.start()
+            verifier.start()
+            for drafter_rank, (request_id, _) in requests.items():
+                verifier.open_requests(
+                    [
+                        (
+                            DraftSync(
+                                request_id=request_id,
+                                src_verifier_rank=5,
+                                dst_drafter_rank=drafter_rank,
+                                prompt_token_ids=[7, 8],
+                                committed_outputs=[],
+                            ),
+                            None,
+                            None,
+                        )
+                    ]
+                )
+
+            for drafter_rank, drafter in drafters.items():
+                opened = _wait_for_value(drafter.drain_controls)
+                self.assertEqual(len(opened), 1)
+                self.assertEqual(opened[0].dst_drafter_rank, drafter_rank)
+                self.assertEqual(opened[0].sync_messages[0].src_verifier_rank, 5)
+                self.assertEqual(
+                    opened[0].sync_messages[0].request_id,
+                    requests[drafter_rank][0],
+                )
+
+            for drafter_rank, drafter in drafters.items():
+                request_id, token = requests[drafter_rank]
+                drafter.publish_tails(
+                    DraftTailStreamOutputBatch(
+                        outputs=[
+                            DraftTailStreamOutput(
+                                src_drafter_rank=drafter_rank,
+                                dst_verifier_rank=5,
+                                request_id=request_id,
+                                base_committed_len=0,
+                                new_token_pos=0,
+                                new_token=token,
+                            )
+                        ]
+                    )
+                )
+
+            for request_id, token in requests.values():
+                snapshot = _wait_for_value(
+                    lambda request_id=request_id: (
+                        current
+                        if (current := verifier.snapshot_one(request_id)).tail_tokens
+                        else None
+                    )
+                )
+                self.assertEqual(snapshot.tail_tokens, (token,))
+
+            for drafter_rank, (request_id, token) in requests.items():
+                verifier.commit(
+                    VerifyCommit(
+                        request_id=request_id,
+                        src_verifier_rank=5,
+                        dst_drafter_rank=drafter_rank,
+                        pre_verify_committed_len=0,
+                        committed_tokens=[token],
+                    )
+                )
+            for drafter_rank, drafter in drafters.items():
+                committed = _wait_for_value(drafter.drain_controls)
+                self.assertEqual(len(committed), 1)
+                commit = committed[0].verify_commit_messages[0]
+                self.assertEqual(commit.dst_drafter_rank, drafter_rank)
+                self.assertEqual(commit.request_id, requests[drafter_rank][0])
+        finally:
+            verifier.close()
+            for drafter in drafters.values():
+                drafter.close()
+
+    def test_cpp_two_sparse_verifiers_share_one_drafter(self):
+        drafter_endpoint = _tcp_endpoint()
+        verifier_endpoints = {5: _tcp_endpoint(), 11: _tcp_endpoint()}
+        verifiers = {
+            verifier_rank: CppVerifierDecoupledSpecDataPlane(
+                DecoupledSpecIpcConfig(
+                    bind_endpoint=verifier_endpoint,
+                    connect_endpoints=(),
+                    rank=verifier_rank,
+                    peers=(
+                        DecoupledSpecPeerConfig(
+                            rank=9, endpoint=drafter_endpoint, quota=1
+                        ),
+                    ),
+                ),
+                required_tail_len=0,
+            )
+            for verifier_rank, verifier_endpoint in verifier_endpoints.items()
+        }
+        drafter = CppDrafterDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=drafter_endpoint,
+                connect_endpoints=(),
+                rank=9,
+                peers=tuple(
+                    DecoupledSpecPeerConfig(
+                        rank=verifier_rank,
+                        endpoint=verifier_endpoint,
+                        quota=1,
+                    )
+                    for verifier_rank, verifier_endpoint in verifier_endpoints.items()
+                ),
+            )
+        )
+        try:
+            drafter.start()
+            for verifier in verifiers.values():
+                verifier.start()
+            for verifier_rank, verifier in verifiers.items():
+                verifier.open_request(
+                    DraftSync(
+                        request_id="shared-request-id",
+                        src_verifier_rank=verifier_rank,
+                        dst_drafter_rank=9,
+                        prompt_token_ids=[7, 8],
+                        committed_outputs=[],
+                    )
+                )
+
+            opened = []
+
+            def collect_opens():
+                opened.extend(drafter.drain_controls())
+                return opened if len(opened) == 2 else None
+
+            _wait_for_value(collect_opens)
+            self.assertEqual(
+                {
+                    (
+                        batch.sync_messages[0].src_verifier_rank,
+                        batch.sync_messages[0].request_id,
+                    )
+                    for batch in opened
+                },
+                {(5, "shared-request-id"), (11, "shared-request-id")},
+            )
+
+            drafter.publish_tails(
+                DraftTailStreamOutputBatch(
+                    outputs=[
+                        DraftTailStreamOutput(
+                            src_drafter_rank=9,
+                            dst_verifier_rank=verifier_rank,
+                            request_id="shared-request-id",
+                            base_committed_len=0,
+                            new_token_pos=0,
+                            new_token=100 + verifier_rank,
+                        )
+                        for verifier_rank in verifiers
+                    ]
+                )
+            )
+            for verifier_rank, verifier in verifiers.items():
+                snapshot = _wait_for_value(
+                    lambda verifier=verifier: (
+                        current
+                        if (
+                            current := verifier.snapshot_one("shared-request-id")
+                        ).tail_tokens
+                        else None
+                    )
+                )
+                self.assertEqual(snapshot.tail_tokens, (100 + verifier_rank,))
+                verifier.commit(
+                    VerifyCommit(
+                        request_id="shared-request-id",
+                        src_verifier_rank=verifier_rank,
+                        dst_drafter_rank=9,
+                        pre_verify_committed_len=0,
+                        committed_tokens=[100 + verifier_rank],
+                    )
+                )
+            committed = []
+
+            def collect_commits():
+                committed.extend(drafter.drain_controls())
+                return committed if len(committed) == 2 else None
+
+            _wait_for_value(collect_commits)
+            self.assertEqual(
+                {
+                    (
+                        batch.verify_commit_messages[0].src_verifier_rank,
+                        batch.verify_commit_messages[0].committed_tokens[0],
+                    )
+                    for batch in committed
+                },
+                {(5, 105), (11, 111)},
+            )
+        finally:
+            for verifier in verifiers.values():
+                verifier.close()
+            drafter.close()
 
     def test_cpp_no_peer_enqueue_close_is_interruptible(self):
         for direction in ("verifier_control", "drafter_tail"):

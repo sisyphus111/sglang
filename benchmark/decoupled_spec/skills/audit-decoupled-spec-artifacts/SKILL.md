@@ -18,8 +18,9 @@ python benchmark/decoupled_spec/skills/audit-decoupled-spec-artifacts/scripts/au
   --output <RUN_DIR>/audit/pre_seal.json
 ```
 
-Seal only when this exits zero. The audit checks required files, role states,
-live PIDs, batch cardinality, request IDs, formal-window validity,
+Seal only when this exits zero. The audit checks the server manifest,
+per-engine configs/status/logs, local component PIDs, batch cardinality,
+request IDs, formal-window validity,
 observability coverage, and plot source hashes.
 
 ## After Sealing
@@ -38,6 +39,12 @@ python benchmark/decoupled_spec/skills/audit-decoupled-spec-artifacts/scripts/au
 Sealed mode verifies `run_manifest.json`, every checksum entry, and the exact
 set of files covered by `SHA256SUMS`. It is read-only unless `--output` points
 outside `RUN_DIR`.
+
+Both phases require zero request queueing on every verifier and drafter. The
+observability validator checks every successful formal-window
+`num_waiting_reqs` sample, and the audit scans every engine log for any positive
+`#queue-req`. Any hit is a hard failure: do not seal, summarize, or compare that
+run as a valid performance point.
 
 ## Failure Policy
 

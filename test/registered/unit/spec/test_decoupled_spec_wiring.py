@@ -31,6 +31,7 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
             tp_size=1,
             decoupled_spec_bind_endpoint="ipc:///tmp/decoupled-local",
             decoupled_spec_connect_endpoints=["ipc:///tmp/decoupled-peer"],
+            decoupled_spec_peer_configs=None,
             decoupled_spec_rank=0,
             speculative_eagle_topk=None,
             speculative_num_steps=3,
@@ -128,20 +129,80 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
             ):
                 _handle_decoupled_spec(self._args(role))
 
-    def test_phase_one_topology_is_one_to_one(self):
+    def test_parallel_topology_guards_remain_fail_fast(self):
         cases = [
             ("dp", dict(dp_size=2), "dp_size == 1"),
             ("pp", dict(pp_size=2), "pp_size == 1"),
-            (
-                "peers",
-                dict(decoupled_spec_connect_endpoints=["ipc:///tmp/a", "ipc:///tmp/b"]),
-                "exactly one peer",
-            ),
-            ("rank", dict(decoupled_spec_rank=1), "requires --decoupled-spec-rank 0"),
         ]
         for name, overrides, error in cases:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
                 _handle_decoupled_spec(self._args("verifier", **overrides))
+
+    def test_sparse_ranked_peers_and_nonzero_local_rank_are_supported(self):
+        args = self._args(
+            "verifier",
+            decoupled_spec_rank=5,
+            decoupled_spec_connect_endpoints=None,
+            decoupled_spec_peer_configs=[
+                {"rank": 3, "endpoint": "tcp://host-a:31003", "quota": 2},
+                {"rank": 9, "endpoint": "tcp://host-b:31009", "quota": 1},
+            ],
+        )
+
+        _handle_decoupled_spec(args)
+
+    def test_legacy_endpoint_list_keeps_contiguous_rank_compatibility(self):
+        args = self._args(
+            "verifier",
+            decoupled_spec_rank=4,
+            decoupled_spec_connect_endpoints=[
+                "ipc:///tmp/decoupled-a",
+                "ipc:///tmp/decoupled-b",
+            ],
+        )
+
+        _handle_decoupled_spec(args)
+
+    def test_invalid_ranked_peer_configs_fail_before_runtime_start(self):
+        cases = [
+            ("empty", [], "non-empty JSON list"),
+            (
+                "duplicate-rank",
+                [
+                    {"rank": 3, "endpoint": "tcp://host-a:31003", "quota": 1},
+                    {"rank": 3, "endpoint": "tcp://host-b:31004", "quota": 1},
+                ],
+                "ranks must be unique",
+            ),
+            (
+                "zero-quota",
+                [{"rank": 3, "endpoint": "tcp://host-a:31003", "quota": 0}],
+                "quota must be positive",
+            ),
+        ]
+        for name, peer_configs, error in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                _handle_decoupled_spec(
+                    self._args(
+                        "verifier",
+                        decoupled_spec_connect_endpoints=None,
+                        decoupled_spec_peer_configs=peer_configs,
+                    )
+                )
+
+        with self.assertRaisesRegex(ValueError, "Specify only one"):
+            _handle_decoupled_spec(
+                self._args(
+                    "verifier",
+                    decoupled_spec_peer_configs=[
+                        {
+                            "rank": 3,
+                            "endpoint": "tcp://host-a:31003",
+                            "quota": 1,
+                        }
+                    ],
+                )
+            )
 
     def test_linear_k_relation_is_fail_fast(self):
         cases = [

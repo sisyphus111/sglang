@@ -1,6 +1,6 @@
 ---
 name: send-decoupled-spec-workload
-description: Prepare and submit one client-side tokenized, streaming batch to an already-running decoupled-spec verifier, then collect request-level results. Use for dataset, tokenizer, chat-template, batch, generation, or SSE-client work; it does not launch model servers.
+description: Prepare and submit one client-side tokenized, streaming batch to a selected verifier from a ready decoupled-spec server manifest, then collect request-level results. Use for dataset, tokenizer, chat-template, batch, generation, or SSE-client work; it does not launch model servers.
 ---
 
 # Send a Decoupled-Spec Workload
@@ -21,13 +21,15 @@ for prompt processing.
 3. Verify that `target_tokenizer.model_path` matches the target/verifier model
    family and that the resolved batch, prompt, output, template, and thinking
    settings match the requested case.
+4. Pass `--server-manifest <RUN_DIR>/server/manifest.json` and an explicit
+   `--verifier-rank`; record the selected verifier `engine_id` and HTTP URL.
 
 ## Submit the Formal Request
 
 Read [references/streaming-contract.md](references/streaming-contract.md).
 
-- Start only after both servers are ready and the collector has successful
-  baseline samples.
+- Start only after every manifest engine is ready and the collector has a
+  successful zero-waiting baseline sample for every engine.
 - Invoke `client-side/client.py` once with the same config, overrides, and
   shared `RUN_DIR`.
 - Require `batch.size` prepared requests and one streaming `/generate` call

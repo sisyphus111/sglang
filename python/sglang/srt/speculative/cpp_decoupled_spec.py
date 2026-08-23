@@ -578,6 +578,7 @@ class CppVerifierDecoupledSpecDataPlane:
         self._context = context
         external_context = 0 if context is None else int(context.underlying)
         self.config = config
+        self._peer_ranks = frozenset(int(peer.rank) for peer in config.peers)
         self.draft_tail_buffer = CppDraftTailBuffer(
             verifier_rank=int(config.rank),
             required_tail_len=required_tail_len,
@@ -654,24 +655,40 @@ class CppVerifierDecoupledSpecDataPlane:
         gpu_seat: int | None = None,
         request_epoch: int | None = None,
     ) -> None:
+        self.open_requests([(message, gpu_seat, request_epoch)])
+
+    def open_requests(
+        self,
+        requests: Sequence[tuple[DraftSync, int | None, int | None]],
+    ) -> None:
+        """Bind and publish one destination-homogeneous request-open batch."""
+
+        if not requests:
+            return
+        dst_drafter_rank = int(requests[0][0].dst_drafter_rank)
+        control_batch = DraftControlBatch(
+            dst_drafter_rank=dst_drafter_rank,
+            sync_messages=[message for message, _, _ in requests],
+        )
+        self._validate_peer_rank(dst_drafter_rank)
+        self.draft_tail_buffer._validate_control_batch(control_batch)
         if self.gpu_tail_buffer is not None:
-            if gpu_seat is None or request_epoch is None:
-                raise ValueError(
-                    "GPU draft-tail open requires gpu_seat and request_epoch"
+            for message, gpu_seat, request_epoch in requests:
+                if gpu_seat is None or request_epoch is None:
+                    raise ValueError(
+                        "GPU draft-tail open requires gpu_seat and request_epoch"
+                    )
+                self.gpu_tail_buffer.bind_request(
+                    str(message.request_id), int(gpu_seat), int(request_epoch)
                 )
-            self.gpu_tail_buffer.bind_request(
-                str(message.request_id), int(gpu_seat), int(request_epoch)
-            )
-        elif gpu_seat is not None or request_epoch is not None:
+        elif any(
+            gpu_seat is not None or request_epoch is not None
+            for _, gpu_seat, request_epoch in requests
+        ):
             raise ValueError(
                 "gpu_seat/request_epoch require an enabled GPU draft-tail buffer"
             )
-        self.submit_control_batch(
-            DraftControlBatch(
-                dst_drafter_rank=int(message.dst_drafter_rank),
-                sync_messages=[message],
-            )
-        )
+        self.submit_control_batch(control_batch)
 
     def commit(self, message: VerifyCommit) -> None:
         self.submit_control_batch(
@@ -744,11 +761,11 @@ class CppVerifierDecoupledSpecDataPlane:
             raise RuntimeError("Decoupled-spec transport is closed")
 
     def _validate_peer_rank(self, rank: int) -> None:
-        if rank < 0 or rank >= len(self.config.connect_endpoints):
+        if rank not in self._peer_ranks:
             raise RuntimeError(
                 "Missing decoupled-spec peer endpoint: "
                 f"peer_rank={rank} "
-                f"num_peers={len(self.config.connect_endpoints)}"
+                f"configured_peer_ranks={sorted(self._peer_ranks)}"
             )
 
 
@@ -764,6 +781,7 @@ class CppDrafterDecoupledSpecDataPlane:
         self._context = context
         external_context = 0 if context is None else int(context.underlying)
         self.config = config
+        self._peer_ranks = frozenset(int(peer.rank) for peer in config.peers)
         self._transport = _load_decoupled_spec_cpp_module().TokenSyncThread(
             int(config.rank),
             str(config.bind_endpoint),
@@ -882,25 +900,16 @@ class CppDrafterDecoupledSpecDataPlane:
             raise RuntimeError("Decoupled-spec transport is closed")
 
     def _validate_peer_rank(self, rank: int) -> None:
-        if rank < 0 or rank >= len(self.config.connect_endpoints):
+        if rank not in self._peer_ranks:
             raise RuntimeError(
                 "Missing decoupled-spec peer endpoint: "
                 f"peer_rank={rank} "
-                f"num_peers={len(self.config.connect_endpoints)}"
+                f"configured_peer_ranks={sorted(self._peer_ranks)}"
             )
 
 
 def _peer_rows(config: DecoupledSpecIpcConfig) -> list[tuple[int, str]]:
-    if len(config.connect_endpoints) != 1 or int(config.rank) != 0:
-        raise ValueError(
-            "Phase-one C++ decoupled spec requires the 1:1 rank-0 IPC "
-            f"topology, got rank={config.rank} "
-            f"connect_endpoints={config.connect_endpoints!r}"
-        )
-    return [
-        (peer_rank, str(endpoint))
-        for peer_rank, endpoint in enumerate(config.connect_endpoints)
-    ]
+    return [(int(peer.rank), str(peer.endpoint)) for peer in config.peers]
 
 
 __all__ = [

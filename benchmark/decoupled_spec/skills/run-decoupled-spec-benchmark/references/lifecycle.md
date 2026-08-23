@@ -7,12 +7,12 @@ launcher.
 
 | Stage | Entry condition | Required evidence before continuing |
 | --- | --- | --- |
-| `preflight` | Concrete four-config tuple is known | GPU/process/port checks and effective pair validation pass |
+| `preflight` | Unified server/client/collector tuple is known | Ray/GPU checks and unified config validation pass |
 | `initialized` | Output root is writable | Unique `RUN_DIR` and `provenance/run_start.json` exist |
-| `servers_ready` | Both independent server sessions are running | Both status files say `http_ready`; verifier `/health` and drafter `/model_info` succeed |
-| `collector_active` | Both servers are ready | Successful verifier and drafter baseline samples exist |
+| `servers_ready` | Unified launcher is running | `server/manifest.json` is ready and every verifier `/health` plus drafter `/model_info` succeeds |
+| `collector_active` | All manifest engines are ready | Every engine has a successful zero-waiting baseline sample |
 | `client_complete` | Collector is active | Client status is `completed` and all batch members have final responses |
-| `processes_stopped` | Formal window is complete | Collector summary exists; owned server and collector processes are no longer alive |
+| `processes_stopped` | Formal window is complete | Collector summary exists; launcher has collected remote artifacts and removed owned Ray resources |
 | `derived` | Raw run artifacts are stable | Four independent plot/report manifests and their declared outputs exist |
 | `pre_seal_audited` | All derived files exist | Artifact audit exits zero |
 | `sealed` | Pre-seal audit passes | `run_manifest.json` and `SHA256SUMS` exist |
@@ -38,6 +38,9 @@ must not substitute for saved configuration.
   broad process-name kills.
 - Capture the earliest relevant server/client/collector error and identify the
   stage that failed.
+- A positive verifier or drafter waiting queue is an invalid benchmark result,
+  not a low-performance result. Preserve the attempt unsealed and diagnose
+  admission before retrying.
 - A collector sampling error is not automatically a model-serving failure, but
   it prevents a fully observable successful run until its coverage is checked.
 

@@ -6,36 +6,29 @@ come from the active checkout.
 ## Validation
 
 ```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/config.py validate \
-  --verifier-config <verifier.yaml> \
-  --drafter-config <drafter.yaml> \
-  <role-prefixed effective overrides>
-
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/verifier_server.py \
-  --config <verifier.yaml> --run-dir <RUN_DIR> <verifier overrides> --check
-
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/drafter_server.py \
-  --config <drafter.yaml> --run-dir <RUN_DIR> <drafter overrides> --check
+PYTHONPATH=python python benchmark/decoupled_spec/server-side/server.py \
+  --config <server-fleet.yaml> --run-dir <RUN_DIR> --check
 ```
 
-## Independent launch
+## Unified Ray launch
 
-Create `RUN_DIR/logs/` and start each command in its own long-running session.
-Direct stdout/stderr to `logs/verifier.log` and `logs/drafter.log` while keeping
-the sessions independently controllable.
+Connect to an existing Ray cluster and keep this one driver command in a
+long-running session:
 
 ```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/verifier_server.py \
-  --config <verifier.yaml> --run-dir <RUN_DIR> <verifier overrides>
+PYTHONPATH=python python benchmark/decoupled_spec/server-side/server.py \
+  --config <server-fleet.yaml> --run-dir <RUN_DIR>
 ```
 
-```bash
-PYTHONPATH=python python benchmark/decoupled_spec/server-side/drafter_server.py \
-  --config <drafter.yaml> --run-dir <RUN_DIR> <drafter overrides>
-```
+The launcher jointly reserves all replicas with one placement group, allocates
+node-local HTTP/transport/NCCL ports, starts both roles, and writes
+`server/manifest.json`. Do not send formal traffic until that manifest is
+`ready`. The launcher currently requires each TP replica to fit on one Ray node;
+replicas may be distributed across many nodes.
 
-There is no combined server launcher and no required launch order. Do not send
-formal traffic until both roles are ready.
+After the collector starts, require a successful baseline sample with
+`num_waiting_reqs == 0` for both roles. Do not start measured traffic on top of
+leftover queued work.
 
 ## Readiness gate
 
@@ -45,19 +38,19 @@ python benchmark/decoupled_spec/skills/operate-decoupled-spec-servers/scripts/wa
   --timeout-s 600
 ```
 
-The helper derives each HTTP URL from the saved status or resolved config and
-requires both the file-state and a role-appropriate HTTP check: verifier uses
-`/health`, while drafter uses read-only `/model_info` because the decoupled
-drafter deliberately rejects generation-based health requests. A `failed` or
-premature `exited` state fails immediately.
+The helper reads every engine from the ready manifest and performs the
+role-appropriate HTTP check: verifier uses `/health`, while drafter uses
+read-only `/model_info`. A failed/stopped manifest fails immediately.
 
 ## Shutdown
 
 After the client and collector finish:
 
-1. Send graceful termination to the exact verifier and drafter sessions/PIDs.
-2. Wait for both processes to exit and inspect their final logs/status files.
-3. Escalate only the process that did not exit, and record the escalation.
+1. Send graceful termination to the unified launcher PID/session.
+2. Wait for it to stop every engine, collect remote logs/status/configs, kill
+   owned actors, remove its placement group, and disconnect from Ray.
+3. Inspect `server/manifest.json`, per-engine status, and log files.
 4. Confirm no owned child process remains before pre-seal audit.
 
-Do not use a repository-wide or command-pattern-wide `pkill`.
+Do not use a repository-wide `pkill`, and do not stop the externally owned Ray
+cluster.

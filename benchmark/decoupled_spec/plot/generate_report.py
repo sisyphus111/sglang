@@ -38,6 +38,20 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
     if not summary_path.is_file():
         raise FileNotFoundError(summary_path)
 
+    server_manifest_path = run_path / "server" / "manifest.json"
+    server_manifest = _optional_json(server_manifest_path)
+    engine_configs = []
+    for engine in server_manifest.get("engines", []):
+        if not isinstance(engine, dict):
+            continue
+        relative = engine.get("resolved_config_path")
+        if not isinstance(relative, str):
+            continue
+        config_path = run_path / relative
+        config = _optional_json(config_path)
+        if config:
+            engine_configs.append((engine, config_path, config))
+
     source_paths = [
         summary_path,
         run_path / "client" / "request_metrics.csv",
@@ -49,11 +63,28 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         run_path / "plots" / "request_latency_manifest.json",
         run_path / "plots" / "request_speculative_manifest.json",
         run_path / "observability" / "plots" / "plot_manifest.json",
+        server_manifest_path,
+        run_path / "server" / "resolved_config.json",
+        *[config_path for _, config_path, _ in engine_configs],
     ]
     summary = load_json(summary_path)
     provenance = _optional_json(run_path / "provenance" / "run_start.json")
-    verifier = _optional_json(run_path / "roles" / "verifier" / "resolved_config.json")
-    drafter = _optional_json(run_path / "roles" / "drafter" / "resolved_config.json")
+    verifier = next(
+        (
+            config
+            for engine, _, config in engine_configs
+            if engine.get("role") == "verifier"
+        ),
+        _optional_json(run_path / "roles" / "verifier" / "resolved_config.json"),
+    )
+    drafter = next(
+        (
+            config
+            for engine, _, config in engine_configs
+            if engine.get("role") == "drafter"
+        ),
+        _optional_json(run_path / "roles" / "drafter" / "resolved_config.json"),
+    )
     client = _optional_json(run_path / "client" / "resolved_config.json")
     observability = _optional_json(run_path / "observability" / "summary.json")
     verifier_args = verifier.get("server_args", {})
@@ -61,22 +92,30 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
     dataset = client.get("dataset", {})
     generation = client.get("generation", {})
     decode_metric_lines: list[str] = []
-    decode_metrics = observability.get("decode_metrics")
+    decode_metrics = observability.get("decode_metrics_by_target")
+    if not isinstance(decode_metrics, dict) or not decode_metrics:
+        decode_metrics = observability.get("decode_metrics")
     if isinstance(decode_metrics, dict) and decode_metrics:
         decode_metric_lines = [
             "### Decode-window telemetry",
             "",
-            "| Role | Windows | Cycle mean | p50 | p95 | Mean BS | Mean context | Valid draft len | Accept len |",
+            "| Engine | Windows | Iteration latency mean | p50 | p95 | Mean BS | Mean context | Valid draft len | Accept len |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
-        for role in ("verifier", "drafter"):
-            metrics = decode_metrics.get(role)
+        ordered_metrics = sorted(
+            decode_metrics.items(),
+            key=lambda item: (
+                str(item[1].get("role", item[0])) if isinstance(item[1], dict) else "",
+                int(item[1].get("rank", 0)) if isinstance(item[1], dict) else 0,
+            ),
+        )
+        for target_id, metrics in ordered_metrics:
             if not isinstance(metrics, dict):
                 continue
             decode_metric_lines.append(
                 "| {role} | {windows} | {mean} ms | {p50} ms | {p95} ms | "
                 "{mean_bs} | {mean_context} | {valid_draft} | {accept} |".format(
-                    role=role,
+                    role=target_id,
                     windows=metrics.get("window_count", 0),
                     mean=_format(_nested(metrics, "scheduler_cycle_ms", "mean")),
                     p50=_format(_nested(metrics, "scheduler_cycle_ms", "p50")),

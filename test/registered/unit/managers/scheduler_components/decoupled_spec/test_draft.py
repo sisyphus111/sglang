@@ -97,9 +97,16 @@ class TestDecoupledDraftManager(CustomTestCase):
             committed_outputs=[10],
         )
 
-    def _install_request(self, *, output_tokens, committed_len=1, request_id="req"):
+    def _install_request(
+        self,
+        *,
+        output_tokens,
+        committed_len=1,
+        request_id="req",
+        src_verifier_rank=0,
+    ):
         req = SimpleNamespace(
-            rid=f"draft:0:{request_id}",
+            rid=f"draft:{src_verifier_rank}:{request_id}",
             origin_input_ids=array("q", [1, 2, 3]),
             output_ids=array("q", output_tokens),
             req_pool_idx=1,
@@ -113,7 +120,7 @@ class TestDecoupledDraftManager(CustomTestCase):
             _refresh_fill_ids=MagicMock(),
         )
         key = DraftRequestGeneration(
-            src_verifier_rank=0,
+            src_verifier_rank=src_verifier_rank,
             request_id=request_id,
             generation=0,
         )
@@ -121,13 +128,28 @@ class TestDecoupledDraftManager(CustomTestCase):
         state = SimpleNamespace(
             key=key,
             req=req,
-            src_verifier_rank=0,
+            src_verifier_rank=src_verifier_rank,
             committed_len=committed_len,
             published_len=len(output_tokens),
             is_sleeping=False,
         )
-        self.manager._requests[(0, request_id)] = state
+        self.manager._requests[(src_verifier_rank, request_id)] = state
         return req, state
+
+    def test_published_tail_targets_the_true_sparse_verifier_rank(self):
+        req, _ = self._install_request(
+            output_tokens=[10],
+            src_verifier_rank=7,
+        )
+        batch = _DraftBatch([req])
+        self.manager.before_process_batch_result(batch, SimpleNamespace())
+        req.output_ids.append(11)
+
+        self.manager.after_process_batch_result(batch, SimpleNamespace())
+
+        output = self.data_plane.publish_tails.call_args.args[0].outputs[0]
+        self.assertEqual(output.src_drafter_rank, 0)
+        self.assertEqual(output.dst_verifier_rank, 7)
 
     def test_sync_materializes_internal_req_before_queueing(self):
         events = []

@@ -38,9 +38,14 @@ after the recorded wall time by approximately the collection latency.
 ## Resolution boundary
 
 With `interval_s=1`, the time series resolves service behavior over seconds.
+Each successful `/v1/loads` response contributes one instantaneous
+`num_running_reqs` point per role for the “Running batch size over time” plot.
+Do not reinterpret it as a decode-window average or fill a missed poll with
+zero.
+
 The engine's bounded `decode_metrics_windows` history preserves completed
 `decode_log_interval`-step windows even when several finish between two HTTP
-polls. It can show scheduler-cycle, mean-batch-size, mean-context-length,
-valid-draft-length, and accept-length trends at that fixed iteration
-granularity. It still cannot decompose a speculative round, CUDA callback, IPC
-copy, or event wait that lasts microseconds or milliseconds.
+polls. It can show iteration latency, valid draft tail length, and accept length
+trends at that fixed iteration granularity. It still cannot decompose a
+speculative round, CUDA callback, IPC copy, or event wait that lasts
+microseconds or milliseconds.

@@ -46,6 +46,9 @@ class _BackgroundZmqTransport:
         thread_name: str,
     ) -> None:
         self.config = config
+        self._peer_endpoints = {
+            int(peer.rank): str(peer.endpoint) for peer in config.peers
+        }
         self._owns_context = context is None
         self._context = context if context is not None else zmq.Context()
         self._closed = threading.Event()
@@ -61,7 +64,7 @@ class _BackgroundZmqTransport:
 
     @property
     def has_peers(self) -> bool:
-        return bool(self.config.connect_endpoints)
+        return bool(self._peer_endpoints)
 
     def start(self) -> None:
         if self._started:
@@ -120,12 +123,14 @@ class _BackgroundZmqTransport:
 
     def _peer_endpoint(self, rank: int) -> str:
         rank = int(rank)
-        if rank < 0 or rank >= len(self.config.connect_endpoints):
+        endpoint = self._peer_endpoints.get(rank)
+        if endpoint is None:
             raise RuntimeError(
                 "Missing decoupled-spec peer endpoint: "
-                f"peer_rank={rank} num_peers={len(self.config.connect_endpoints)}"
+                f"peer_rank={rank} "
+                f"configured_peer_ranks={sorted(self._peer_endpoints)}"
             )
-        return str(self.config.connect_endpoints[rank])
+        return endpoint
 
     @staticmethod
     def _new_socket(context: zmq.Context, socket_type: int) -> zmq.Socket:
@@ -161,7 +166,7 @@ class _VerifierTransport(_BackgroundZmqTransport):
         send_sockets: dict[int, zmq.Socket] = {}
         try:
             recv_socket.bind(str(self.config.bind_endpoint))
-            for rank, endpoint in enumerate(self.config.connect_endpoints):
+            for rank, endpoint in self._peer_endpoints.items():
                 socket = self._new_socket(self._context, zmq.PUSH)
                 socket.connect(str(endpoint))
                 send_sockets[rank] = socket
@@ -276,7 +281,7 @@ class _DrafterTransport(_BackgroundZmqTransport):
         send_sockets: dict[int, zmq.Socket] = {}
         try:
             recv_socket.bind(str(self.config.bind_endpoint))
-            for rank, endpoint in enumerate(self.config.connect_endpoints):
+            for rank, endpoint in self._peer_endpoints.items():
                 socket = self._new_socket(self._context, zmq.PUSH)
                 socket.connect(str(endpoint))
                 send_sockets[rank] = socket
