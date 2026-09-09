@@ -116,6 +116,17 @@ class TestUnifiedServerConfig(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "must not be DECOUPLED_VERIFY"):
                 load_config(path)
 
+    def test_coupled_config_accepts_ordinary_decode_target(self):
+        config_text = _minimal_coupled_config().replace(
+            "    speculative_algorithm: EAGLE\n", ""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.yaml"
+            path.write_text(config_text, encoding="utf-8")
+            config = load_config(path)
+
+        self.assertIsNone(config.target.server_args.get("speculative_algorithm"))
+
     def test_ray_actor_uses_distributable_package_identity(self):
         self.assertEqual(EngineActor.__module__, "decoupled_spec.server.orchestrator")
         self.assertTrue(

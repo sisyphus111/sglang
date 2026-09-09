@@ -172,10 +172,12 @@ def _validate_role(role: str, settings: RoleSettings) -> dict[str, Any]:
             )
     else:
         algorithm = args.get("speculative_algorithm")
+        if algorithm is None:
+            return args
         if not isinstance(algorithm, str) or not algorithm:
             raise ValueError(
-                "target.server_args.speculative_algorithm must select an ordinary "
-                "speculative decoding method"
+                "target.server_args.speculative_algorithm must be unset or select "
+                "an ordinary speculative decoding method"
             )
         if algorithm.upper() == "DECOUPLED_VERIFY":
             raise ValueError(
