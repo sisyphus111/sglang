@@ -135,6 +135,36 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
             )
         )
 
+    def test_validator_accepts_coupled_target_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            self._write_observability_fixture(run_dir)
+            samples_path = run_dir / "observer" / "samples.jsonl"
+            records = []
+            for line in samples_path.read_text().splitlines():
+                record = json.loads(line)
+                if record["role"] != "verifier":
+                    continue
+                record.update(
+                    {
+                        "target_id": "target-0",
+                        "role": "target",
+                        "base_url": "http://target",
+                    }
+                )
+                records.append(record)
+            samples_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            report = _VALIDATOR.validate_samples(
+                run_dir, ["target"], require_formal_window=True
+            )
+
+        self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(report["roles"]["target"]["success_count"], 3)
+
     def test_decode_windows_before_observer_start_are_not_recounted(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)

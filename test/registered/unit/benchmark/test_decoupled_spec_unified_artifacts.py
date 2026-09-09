@@ -153,6 +153,34 @@ class TestUnifiedServerObserverContracts(CustomTestCase):
             )
         )
 
+    def test_wait_gate_accepts_coupled_target_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            engine = _engines()[0]
+            engine.update({"engine_id": "target-0", "role": "target", "rank": 0})
+            _write_json(
+                run_dir / "server" / "manifest.json",
+                {
+                    "schema_version": 1,
+                    "state": "ready",
+                    "deployment": "coupled_spec",
+                    "topology": {"num_verifiers": 0, "num_drafters": 0},
+                    "engines": [engine],
+                },
+            )
+
+            report = _wait.wait_for_roles(
+                run_dir,
+                None,
+                timeout_s=1.0,
+                poll_interval_s=0.01,
+                check_http=False,
+                http_timeout_s=0.1,
+            )
+
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["engines"]["target-0"]["role"], "target")
+
     def test_zero_window_summary_keeps_every_engine(self):
         targets = [
             {

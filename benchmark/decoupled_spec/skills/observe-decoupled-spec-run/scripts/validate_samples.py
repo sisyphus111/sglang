@@ -435,7 +435,11 @@ def _observed_targets(
         target_id = record.get("target_id", role)
         rank = record.get("rank", 0)
         base_url = record.get("base_url")
-        if not isinstance(target_id, str) or role not in {"verifier", "drafter"}:
+        if not isinstance(target_id, str) or role not in {
+            "target",
+            "verifier",
+            "drafter",
+        }:
             errors.append(f"invalid observer target identity: {record!r}")
             continue
         if type(rank) is not int or rank < 0:
@@ -864,6 +868,16 @@ def _write_json(path: Path, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _default_roles(run_dir: Path) -> list[str]:
+    config_path = run_dir / "config.json"
+    if config_path.is_file():
+        config = _read_json(config_path)
+        server = config.get("server")
+        if isinstance(server, dict) and server.get("deployment") == "coupled_spec":
+            return ["target"]
+    return ["verifier", "drafter"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True)
@@ -871,7 +885,7 @@ def main() -> None:
         "--role",
         action="append",
         dest="roles",
-        choices=("verifier", "drafter"),
+        choices=("target", "verifier", "drafter"),
         help="Required role; repeat to override the default pair.",
     )
     parser.add_argument(
@@ -881,9 +895,10 @@ def main() -> None:
     )
     parser.add_argument("--output")
     args = parser.parse_args()
+    run_dir = Path(args.run_dir).expanduser().resolve()
     report = validate_samples(
-        Path(args.run_dir).expanduser().resolve(),
-        args.roles or ["verifier", "drafter"],
+        run_dir,
+        args.roles or _default_roles(run_dir),
         args.require_formal_window,
     )
     if args.output:

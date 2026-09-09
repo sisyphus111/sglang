@@ -52,7 +52,7 @@ def _http_ready(base_url: str, role: str, timeout_s: float) -> tuple[bool, str |
 
 def wait_for_roles(
     run_dir: Path,
-    roles: list[str],
+    roles: list[str] | None,
     timeout_s: float,
     poll_interval_s: float,
     check_http: bool,
@@ -81,6 +81,13 @@ def wait_for_roles(
                 )
             engines = manifest.get("engines")
             if state == "ready" and isinstance(engines, list) and engines:
+                required_roles = roles
+                if required_roles is None:
+                    required_roles = (
+                        ["target"]
+                        if manifest.get("deployment") == "coupled_spec"
+                        else ["verifier", "drafter"]
+                    )
                 ready = True
                 targets = {}
                 seen_roles = set()
@@ -94,7 +101,7 @@ def wait_for_roles(
                     engine_id = str(engine.get("engine_id", ""))
                     role = str(engine.get("role", ""))
                     rank = engine.get("rank")
-                    if role not in {"verifier", "drafter"}:
+                    if role not in {"target", "verifier", "drafter"}:
                         raise RuntimeError(
                             f"invalid unified server engine role: {engine!r}"
                         )
@@ -175,7 +182,7 @@ def wait_for_roles(
                             f"unified server topology {count_field} mismatch: "
                             f"recorded={topology.get(count_field)!r}, actual={actual}"
                         )
-                if not targets or not set(roles).issubset(seen_roles):
+                if not targets or not set(required_roles).issubset(seen_roles):
                     ready = False
                 last = targets
                 if ready:
@@ -198,7 +205,7 @@ def wait_for_roles(
 
         ready = True
         last = {}
-        for role in roles:
+        for role in roles or ["verifier", "drafter"]:
             status_path = run_dir / "server" / role / "status.json"
             status = _read_json(status_path)
             state = status.get("state") if status else None
@@ -245,7 +252,7 @@ def main() -> None:
     parser.add_argument(
         "--role",
         action="append",
-        choices=("verifier", "drafter"),
+        choices=("target", "verifier", "drafter"),
         dest="roles",
         help="Role to wait for; repeat to override the default pair.",
     )
@@ -260,7 +267,7 @@ def main() -> None:
     args = parser.parse_args()
     report = wait_for_roles(
         Path(args.runtime_dir).expanduser().resolve(),
-        args.roles or ["verifier", "drafter"],
+        args.roles,
         args.timeout_s,
         args.poll_interval_s,
         args.check_http,
