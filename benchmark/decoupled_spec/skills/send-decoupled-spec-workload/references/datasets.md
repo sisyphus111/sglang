@@ -8,13 +8,12 @@ the fixed `client/content.json` contract.
 | `gsm8k` | Parquet file or directory; when multiple files exist, a filename containing `test` is preferred, then the first sorted file is read | Defaults to `question` and `answer` |
 | `parquet`, `generic_parquet` | Parquet file or directory; the first sorted parquet file is read | Use configured `prompt_column` and optional `reference_column` |
 | `dapo_math_17k` | DAPO parquet file or directory; the first sorted parquet file is read | Reads the native `prompt` message list and defaults reference to `reward_model.ground_truth` |
-| `jsonl`, `generic_jsonl`, `codeforces_raw`, `sharegpt` | JSONL file or directory; the first sorted JSONL file is read | Use configured `prompt_column` and optional `reference_column` |
+| `jsonl`, `generic_jsonl`, `sharegpt` | JSONL file or directory; the first sorted JSONL file is read | Use configured `prompt_column` and optional `reference_column` |
+| `codeforces_raw` | Codeforces parquet or JSONL; the first sorted matching file is read and invalid problem rows are skipped | Builds a competitive-programming system/user prompt from the limits, title, statement, I/O format, notes, and examples; `code_language` defaults to `python` |
 | `synthetic_ids` | No dataset file; repeated token IDs are generated | Uses `prompt_len`, `token_id`, and generation output length |
 
-`codeforces_raw` and `sharegpt` currently select fields through the generic
-JSONL contract. They do not reconstruct Codeforces statements or ShareGPT
-conversation turns automatically. Set `prompt_column` to a field containing
-the exact text to benchmark.
+`sharegpt` currently selects fields through the generic JSONL contract. Set
+`prompt_column` to a field containing the exact text to benchmark.
 
 DAPO `prompt` is a list of `{role, content}` messages. In `tokenizer` mode the
 list is passed directly to the target tokenizer's chat template instead of

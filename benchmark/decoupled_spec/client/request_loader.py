@@ -24,6 +24,17 @@ class RequestSpec(msgspec.Struct, kw_only=True):
 
 
 def _read_rows(path: Path, fmt: str) -> list[dict[str, Any]]:
+    if fmt == "codeforces_raw":
+        parquet_files = (
+            [path]
+            if path.is_file() and path.suffix == ".parquet"
+            else sorted(path.rglob("*.parquet")) if path.is_dir() else []
+        )
+        if parquet_files:
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(parquet_files[0])
+            return [dict(row) for row in table.to_pylist()]
     if fmt in {"parquet", "generic_parquet", "gsm8k", "dapo_math_17k"}:
         import pyarrow.parquet as pq
 
@@ -45,6 +56,64 @@ def _read_rows(path: Path, fmt: str) -> list[dict[str, Any]]:
             if line.strip()
         ]
     raise ValueError(f"unsupported dataset format: {fmt}")
+
+
+def _codeforces_messages(row: dict[str, Any], code_language: str) -> list[dict[str, str]]:
+    required = (
+        "description",
+        "input_format",
+        "output_format",
+        "time_limit",
+        "memory_limit",
+    )
+    missing = [field for field in required if not str(row.get(field) or "").strip()]
+    if missing:
+        raise ValueError(f"Codeforces row is missing required fields: {missing}")
+    aliases = {
+        "python": "Python",
+        "python3": "Python",
+        "cpp": "C++",
+        "c++": "C++",
+    }
+    language = aliases.get(code_language.lower(), code_language)
+    sections = [
+        f"Write a correct and efficient {language} solution for the following "
+        "competitive programming problem.",
+        f"Time limit: {row['time_limit']} seconds\nMemory limit: {row['memory_limit']} MB",
+    ]
+    if row.get("title"):
+        sections.append(f"Title: {row['title']}")
+    sections.extend(
+        [
+            f"Problem description:\n{row['description']}",
+            f"Input format:\n{row['input_format']}",
+            f"Output format:\n{row['output_format']}",
+        ]
+    )
+    if row.get("note"):
+        sections.append(f"Notes:\n{row['note']}")
+    examples = []
+    for index, example in enumerate(row.get("examples") or [], start=1):
+        if isinstance(example, dict):
+            examples.append(
+                f"Example {index}\nInput:\n{example.get('input', '')}\nOutput:\n{example.get('output', '')}"
+            )
+    if examples:
+        sections.append("Examples:\n" + "\n\n".join(examples))
+    sections.append(
+        f"Return only the final {language} source code. Do not include explanations "
+        "or Markdown fences."
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert competitive programmer. Produce a correct, "
+                "efficient solution that respects the stated constraints."
+            ),
+        },
+        {"role": "user", "content": "\n\n".join(sections)},
+    ]
 
 
 def _nested_value(row: dict[str, Any], path: str) -> Any:
@@ -111,7 +180,8 @@ def load_requests(
             raise ValueError(
                 f"dataset contains {len(indexed_rows)} rows, fewer than batch.size={count}"
             )
-        indexed_rows = indexed_rows[:count]
+        if fmt != "codeforces_raw":
+            indexed_rows = indexed_rows[:count]
     chat_template = config.get("chat_template", {})
     generation = config.get("generation", {})
     output_len = int(generation.get("output_len", dataset.get("output_len", 128)))
@@ -123,7 +193,8 @@ def load_requests(
         "reward_model.ground_truth" if fmt == "dapo_math_17k" else "answer",
     )
     requests: list[RequestSpec] = []
-    for batch_row_index, (dataset_idx, row) in enumerate(indexed_rows):
+    for dataset_idx, row in indexed_rows:
+        batch_row_index = len(requests)
         if fmt == "synthetic_ids":
             raw = ""
             prompt_len = int(row.get("input_len", dataset.get("prompt_len", 128)))
@@ -135,7 +206,25 @@ def load_requests(
             prompt_value = _nested_value(row, str(prompt_column))
             if prompt_value is None:
                 prompt_value = row.get("text", "")
-            if fmt == "dapo_math_17k" and isinstance(prompt_value, list):
+            if fmt == "codeforces_raw":
+                try:
+                    messages = _codeforces_messages(
+                        row, str(dataset.get("code_language", "python"))
+                    )
+                except ValueError:
+                    continue
+                raw = messages[1]["content"]
+                mode = chat_template.get("mode", "none")
+                if mode == "tokenizer":
+                    rendered = _render_messages(messages, chat_template, tokenizer)
+                elif mode == "none":
+                    rendered = "\n\n".join(
+                        f"{message['role']}: {message['content']}"
+                        for message in messages
+                    )
+                else:
+                    raise ValueError(f"unsupported chat_template.mode: {mode}")
+            elif fmt == "dapo_math_17k" and isinstance(prompt_value, list):
                 messages = []
                 for message in prompt_value:
                     if not isinstance(message, dict):
@@ -185,5 +274,12 @@ def load_requests(
                 requested_output_len=output_len,
                 source=source,
             )
+        )
+        if len(requests) == count:
+            break
+    if len(requests) != count:
+        raise ValueError(
+            f"dataset contains only {len(requests)} valid requests, fewer than "
+            f"batch.size={count}"
         )
     return requests

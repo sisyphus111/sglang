@@ -47,7 +47,7 @@ from plot_observability import (
 )
 from plot_speculative import render_speculative
 from plot_utils import upper_iqr_outlier_threshold
-from client.request_loader import load_requests
+from client.request_loader import _codeforces_messages, load_requests
 from config import load_yaml, validate_role_pair
 from run_io import require_run_dir, update_run_config, update_status
 
@@ -115,6 +115,27 @@ def _tail_select(
 
 
 class TestDecoupledSpecBenchmark(CustomTestCase):
+    def test_codeforces_raw_builds_complete_programming_prompt(self):
+        messages = _codeforces_messages(
+            {
+                "title": "Add",
+                "description": "Add two integers.",
+                "input_format": "Two integers.",
+                "output_format": "Their sum.",
+                "time_limit": 1,
+                "memory_limit": 256,
+                "examples": [{"input": "1 2", "output": "3"}],
+            },
+            "python",
+        )
+
+        self.assertEqual(
+            [message["role"] for message in messages], ["system", "user"]
+        )
+        self.assertIn("Time limit: 1 seconds", messages[1]["content"])
+        self.assertIn("Input:\n1 2", messages[1]["content"])
+        self.assertTrue(messages[1]["content"].endswith("Markdown fences."))
+
     def test_ordinary_decode_uses_zeroed_speculative_metrics(self):
         requests = load_requests(
             {
