@@ -115,6 +115,38 @@ def _tail_select(
 
 
 class TestDecoupledSpecBenchmark(CustomTestCase):
+    def test_ordinary_decode_uses_zeroed_speculative_metrics(self):
+        requests = load_requests(
+            {
+                "batch": {"size": 1},
+                "dataset": {
+                    "format": "synthetic_ids",
+                    "prompt_len": 2,
+                    "output_len": 2,
+                },
+            }
+        )
+        request_rows, batch_result, _ = build_result_artifacts(
+            requests,
+            [
+                {
+                    "text": "answer",
+                    "output_ids": [10, 11],
+                    "meta_info": {"completion_tokens": 2},
+                }
+            ],
+            [{"e2e_latency_ms": 1000.0}],
+            verifier_rank=0,
+        )
+
+        row = request_rows[0]
+        self.assertEqual(row["spec_verify_ct"], 0)
+        self.assertEqual(row["valid_draft_len"], 0.0)
+        self.assertEqual(row["acc_len"], 1.0)
+        self.assertEqual(row["spec_num_proposed_drafts_by_position"], [])
+        self.assertEqual(batch_result["mean_valid_draft_len"], 0.0)
+        self.assertEqual(batch_result["acclen"], 1.0)
+
     def test_coupled_mtp_histogram_uses_common_position_contract(self):
         requests = load_requests(
             {

@@ -173,35 +173,57 @@ def build_result_artifacts(
                 f"input_ids={len(input_ids)} prompt_len={request.prompt_len}"
             )
 
-        spec_verify_ct = meta_info.get("spec_verify_ct")
+        raw_spec_verify_ct = meta_info.get("spec_verify_ct")
         valid_draft_len = meta_info.get("spec_proposed_draft_length")
         acc_len = meta_info.get("spec_accept_length")
-        if type(spec_verify_ct) is not int or spec_verify_ct <= 0:
+        if raw_spec_verify_ct is None:
+            speculative_fields = (
+                "spec_proposed_draft_length",
+                "spec_accept_length",
+                "spec_num_proposed_drafts_by_position",
+                "spec_num_correct_drafts_by_position",
+                "spec_accept_rate_by_position",
+                "spec_correct_drafts_histogram",
+            )
+            if any(meta_info.get(field) is not None for field in speculative_fields):
+                raise ValueError(
+                    f"batch row {request.batch_row_index} has speculative metrics "
+                    "without spec_verify_ct"
+                )
+            spec_verify_ct = 0
+            valid_draft_len = 0.0
+            acc_len = 1.0
+            proposed_by_position = []
+            correct_by_position = []
+            accept_rate_by_position = []
+        elif type(raw_spec_verify_ct) is not int or raw_spec_verify_ct <= 0:
             raise ValueError(
                 f"batch row {request.batch_row_index} has invalid spec_verify_ct"
             )
-        for name, value in (
-            ("valid_draft_len", valid_draft_len),
-            ("acc_len", acc_len),
-        ):
-            if (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
-                or not math.isfinite(float(value))
-                or value < 0
+        else:
+            spec_verify_ct = raw_spec_verify_ct
+            for name, value in (
+                ("valid_draft_len", valid_draft_len),
+                ("acc_len", acc_len),
             ):
-                raise ValueError(
-                    f"batch row {request.batch_row_index} has invalid {name}: {value!r}"
-                )
-        (
-            proposed_by_position,
-            correct_by_position,
-            accept_rate_by_position,
-        ) = _normalize_position_metrics(
-            meta_info,
-            spec_verify_ct=spec_verify_ct,
-            proposed_draft_length=valid_draft_len,
-        )
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or value < 0
+                ):
+                    raise ValueError(
+                        f"batch row {request.batch_row_index} has invalid {name}: {value!r}"
+                    )
+            (
+                proposed_by_position,
+                correct_by_position,
+                accept_rate_by_position,
+            ) = _normalize_position_metrics(
+                meta_info,
+                spec_verify_ct=spec_verify_ct,
+                proposed_draft_length=valid_draft_len,
+            )
         for name, values in (
             (
                 "spec_num_proposed_drafts_by_position",
@@ -266,18 +288,19 @@ def build_result_artifacts(
                     "per-position accept rate is inconsistent: "
                     f"batch_row_index={request.batch_row_index} position={position}"
                 )
-        expected_valid_draft_len = sum(proposed_by_position) / spec_verify_ct
-        if not math.isclose(
-            float(valid_draft_len), expected_valid_draft_len, rel_tol=1e-9
-        ):
-            raise ValueError(
-                f"batch row {request.batch_row_index} has inconsistent valid_draft_len"
-            )
-        expected_acc_len = completion_tokens / spec_verify_ct
-        if not math.isclose(float(acc_len), expected_acc_len, rel_tol=1e-9):
-            raise ValueError(
-                f"batch row {request.batch_row_index} has inconsistent acc_len"
-            )
+        if spec_verify_ct > 0:
+            expected_valid_draft_len = sum(proposed_by_position) / spec_verify_ct
+            if not math.isclose(
+                float(valid_draft_len), expected_valid_draft_len, rel_tol=1e-9
+            ):
+                raise ValueError(
+                    f"batch row {request.batch_row_index} has inconsistent valid_draft_len"
+                )
+            expected_acc_len = completion_tokens / spec_verify_ct
+            if not math.isclose(float(acc_len), expected_acc_len, rel_tol=1e-9):
+                raise ValueError(
+                    f"batch row {request.batch_row_index} has inconsistent acc_len"
+                )
 
         e2e_latency_ms = timing.get("e2e_latency_ms")
         if (

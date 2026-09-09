@@ -46,7 +46,7 @@ batch_row_index,dataset_idx,verifier_rank,prompt_len,resp_len,spec_verify_ct,val
 | `verifier_rank` | integer | Manifest verifier rank that served the complete batch; direct-URL mode means rank 0 |
 | `prompt_len` | integer | `len(input_ids)` |
 | `resp_len` | integer | `len(output_ids)` and verifier `completion_tokens` |
-| `spec_verify_ct` | integer | Request verify count; positive for a successful formal Decoupled-Spec result |
+| `spec_verify_ct` | integer | Request verify count; positive for speculative decoding and zero for ordinary decode |
 | `valid_draft_len` | number | Verifier `spec_proposed_draft_length`: actual proposed drafts per verify row, excluding the bonus token |
 | `acc_len` | number | Verifier `spec_accept_length`: output tokens per verify row, including the bonus token |
 | `e2e_latency_s` | number | Client-observed request E2E latency in seconds |
@@ -111,6 +111,10 @@ requests.valid_draft_len
   = sum(requests.spec_num_proposed_drafts_by_position) / spec_verify_ct
 requests.acc_len = content.output_len / spec_verify_ct
 ```
+
+The final two speculative formulas apply when `spec_verify_ct > 0`. Ordinary
+decode records `spec_verify_ct=0`, `valid_draft_len=0`, `acc_len=1`, and empty
+per-position arrays.
 
 The producer validates the field set, ordering, types, formulas, and cardinality
 before writing these files. Built-in consumers read this fixed schema, and unit
