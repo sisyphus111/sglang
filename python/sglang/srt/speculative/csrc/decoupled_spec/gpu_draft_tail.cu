@@ -1465,141 +1465,156 @@ __global__ void select_gpu_draft_tail_kernel(
     const int64_t* __restrict__ tail_tokens,
     const int64_t* __restrict__ error_codes,
     const int64_t* __restrict__ error_op_seqs,
-    const int64_t* __restrict__ pending_prefix_fast_forward_cts) {
-  const int64_t batch_index = static_cast<int64_t>(blockIdx.x);
-  if (batch_index >= batch_size || threadIdx.x != 0) return;
-  // VerifyCommit is applied from the exact accepted run before the next
-  // direct-only selector; bonus tokens no longer participate in selection.
-  (void)bonus_tokens_int32;
-  (void)bonus_tokens_int64;
-  (void)bonus_tokens_are_int32;
+    const int64_t* __restrict__ pending_prefix_fast_forward_cts,
+    bool allow_partial,
+    int64_t required_tail_len) {
+  for (int64_t batch_index = blockIdx.x * blockDim.x + threadIdx.x;
+       batch_index < batch_size;
+       batch_index += gridDim.x * blockDim.x) {
+    // VerifyCommit is applied from the exact accepted run before the next
+    // direct-only selector; bonus tokens no longer participate in selection.
+    (void)bonus_tokens_int32;
+    (void)bonus_tokens_int64;
+    (void)bonus_tokens_are_int32;
 
-  const int64_t out_width = num_draft_tokens + 2;
-  int64_t* out = compact_out + batch_index * out_width;
-  for (int64_t i = 0; i < num_draft_tokens; ++i) out[i] = 0;
-  out[num_draft_tokens] = 0;
-  out[num_draft_tokens + 1] = 0;
-  int64_t* debug = debug_out == nullptr
-      ? nullptr
-      : debug_out + batch_index * debug_width;
-  if (debug != nullptr) {
-    for (int64_t i = 0; i < debug_width; ++i) debug[i] = -1;
-    debug[0] = static_cast<int64_t>(GpuDraftTailSelectReason::kUnset);
-    if (debug_width > 7) debug[7] = 0;
-    if (debug_width > 10) debug[10] = 0;
-  }
-  if (logical_committed_lens_out != nullptr) {
-    logical_committed_lens_out[batch_index] = -1;
-  }
-
-  const int64_t seat = gpu_seats[batch_index];
-  if (seat < 0 || seat >= num_seats) {
+    const int64_t out_width = num_draft_tokens + 2;
+    int64_t* out = compact_out + batch_index * out_width;
+    for (int64_t i = 0; i < num_draft_tokens; ++i) out[i] = 0;
+    out[num_draft_tokens] = 0;
+    out[num_draft_tokens + 1] = 0;
+    int64_t* debug = debug_out == nullptr
+        ? nullptr
+        : debug_out + batch_index * debug_width;
     if (debug != nullptr) {
-      debug[0] =
-          static_cast<int64_t>(GpuDraftTailSelectReason::kInvalidSeat);
+      for (int64_t i = 0; i < debug_width; ++i) debug[i] = -1;
+      debug[0] = static_cast<int64_t>(GpuDraftTailSelectReason::kUnset);
+      if (debug_width > 7) debug[7] = 0;
+      if (debug_width > 10) debug[10] = 0;
     }
-    return;
-  }
-
-  cuda::atomic_ref<int64_t, cuda::thread_scope_device> version(
-      *const_cast<int64_t*>(versions + seat));
-  // The reader never takes the writer lock. Spin only on this request's seat
-  // until one complete old or new snapshot is available.
-  int64_t seqlock_retries = 0;
-  while (true) {
-    const int64_t version_before =
-        version.load(cuda::memory_order_acquire);
-    if ((version_before & int64_t{1}) != 0) {
-      ++seqlock_retries;
-      __nanosleep(64);
-      continue;
+    if (logical_committed_lens_out != nullptr) {
+      logical_committed_lens_out[batch_index] = -1;
     }
 
-    const int64_t publish_seq = atomic_load_relaxed(publish_seqs + seat);
-    const int64_t request_epoch = atomic_load_relaxed(request_epochs + seat);
-    const int64_t prompt_len = atomic_load_relaxed(prompt_lens + seat);
-    const int64_t committed_len = atomic_load_relaxed(committed_lens + seat);
-    const int64_t raw_tail_len = atomic_load_relaxed(raw_tail_lens + seat);
-    const int64_t consumable_tail_len =
-        atomic_load_relaxed(consumable_tail_lens + seat);
-    const int64_t pending_expected_len =
-        atomic_load_relaxed(pending_expected_lens + seat);
-    const int64_t update_error_code = atomic_load_relaxed(error_codes + seat);
-    const int64_t update_error_op_seq =
-        atomic_load_relaxed(error_op_seqs + seat);
-    const int64_t pending_prefix_fast_forward_ct =
-        debug != nullptr && debug_width > 9
-            ? atomic_load_relaxed(pending_prefix_fast_forward_cts + seat)
-            : -1;
-    const int64_t expected_epoch = expected_request_epochs[batch_index];
-    const int64_t logical_output_len = seq_lens[batch_index] - prompt_len + 1;
-    const bool identity_valid =
-        request_epoch == expected_epoch && prompt_len >= 0;
-    const int64_t delta = logical_output_len - committed_len;
-
-    bool row_valid = false;
-    GpuDraftTailSelectReason reason = GpuDraftTailSelectReason::kUnset;
-    const bool metadata_valid = committed_len >= 0 && raw_tail_len >= 0 &&
-        consumable_tail_len >= 0 && consumable_tail_len <= raw_tail_len &&
-        raw_tail_len <= tail_capacity && pending_expected_len >= 0 &&
-        pending_expected_len <= committed_len &&
-        update_error_code == 0;
-    if (!identity_valid) {
-      reason = GpuDraftTailSelectReason::kIdentityMismatch;
-    } else if (!metadata_valid) {
-      reason = GpuDraftTailSelectReason::kMetadataInvalid;
-    } else if (delta != 0) {
-      reason = GpuDraftTailSelectReason::kLogicalCursorMismatch;
-    } else if (pending_expected_len > 0) {
-      reason = GpuDraftTailSelectReason::kPendingPrefix;
-    } else {
-      row_valid = true;
-      reason = GpuDraftTailSelectReason::kDirect;
-    }
-
-    int64_t selected_len = 0;
-    if (row_valid) {
-      selected_len = consumable_tail_len;
-      if (selected_len > num_draft_tokens) selected_len = num_draft_tokens;
-      for (int64_t i = 0; i < selected_len; ++i) {
-        out[i] = atomic_load_relaxed(
-            tail_tokens + seat * tail_capacity + i);
+    const int64_t seat = gpu_seats[batch_index];
+    if (seat < 0 || seat >= num_seats) {
+      if (debug != nullptr) {
+        debug[0] =
+            static_cast<int64_t>(GpuDraftTailSelectReason::kInvalidSeat);
       }
-    }
-
-    // Close the read section before sampling the version again. The fence
-    // orders every protected relaxed load before this validation load.
-    cuda::atomic_thread_fence(
-        cuda::memory_order_acquire, cuda::thread_scope_device);
-    const int64_t version_after =
-        version.load(cuda::memory_order_relaxed);
-    if (version_before != version_after ||
-        (version_after & int64_t{1}) != 0) {
-      for (int64_t i = 0; i < num_draft_tokens; ++i) out[i] = 0;
-      ++seqlock_retries;
-      if ((version_after & int64_t{1}) != 0) __nanosleep(64);
       continue;
     }
 
-    if (logical_committed_lens_out != nullptr && identity_valid) {
-      logical_committed_lens_out[batch_index] = logical_output_len;
+    cuda::atomic_ref<int64_t, cuda::thread_scope_device> version(
+        *const_cast<int64_t*>(versions + seat));
+    // The reader never takes the writer lock. Spin only on this request's seat
+    // until one complete old or new snapshot is available.
+    int64_t seqlock_retries = 0;
+    while (true) {
+      const int64_t version_before =
+          version.load(cuda::memory_order_acquire);
+      if ((version_before & int64_t{1}) != 0) {
+        ++seqlock_retries;
+        __nanosleep(64);
+        continue;
+      }
+
+      const int64_t publish_seq = atomic_load_relaxed(publish_seqs + seat);
+      const int64_t request_epoch = atomic_load_relaxed(request_epochs + seat);
+      const int64_t prompt_len = atomic_load_relaxed(prompt_lens + seat);
+      const int64_t committed_len = atomic_load_relaxed(committed_lens + seat);
+      const int64_t raw_tail_len = atomic_load_relaxed(raw_tail_lens + seat);
+      const int64_t consumable_tail_len =
+          atomic_load_relaxed(consumable_tail_lens + seat);
+      const int64_t pending_expected_len =
+          atomic_load_relaxed(pending_expected_lens + seat);
+      const int64_t update_error_code = atomic_load_relaxed(error_codes + seat);
+      const int64_t update_error_op_seq =
+          atomic_load_relaxed(error_op_seqs + seat);
+      const int64_t pending_prefix_fast_forward_ct =
+          debug != nullptr && debug_width > 9
+              ? atomic_load_relaxed(pending_prefix_fast_forward_cts + seat)
+              : -1;
+      const int64_t expected_epoch = expected_request_epochs[batch_index];
+      const int64_t logical_output_len = seq_lens[batch_index] - prompt_len + 1;
+      const bool identity_valid =
+          request_epoch == expected_epoch && prompt_len >= 0;
+      const int64_t delta = logical_output_len - committed_len;
+
+      bool row_valid = false;
+      GpuDraftTailSelectReason reason = GpuDraftTailSelectReason::kUnset;
+      const bool metadata_valid = committed_len >= 0 && raw_tail_len >= 0 &&
+          consumable_tail_len >= 0 && consumable_tail_len <= raw_tail_len &&
+          raw_tail_len <= tail_capacity && pending_expected_len >= 0 &&
+          pending_expected_len <= committed_len &&
+          update_error_code == 0;
+      if (!identity_valid) {
+        reason = GpuDraftTailSelectReason::kIdentityMismatch;
+      } else if (!metadata_valid) {
+        reason = GpuDraftTailSelectReason::kMetadataInvalid;
+      } else if (delta != 0) {
+        reason = GpuDraftTailSelectReason::kLogicalCursorMismatch;
+      } else if (pending_expected_len > 0) {
+        reason = GpuDraftTailSelectReason::kPendingPrefix;
+      } else {
+        row_valid = true;
+        reason = GpuDraftTailSelectReason::kDirect;
+      }
+
+      int64_t selected_len = 0;
+      if (row_valid) {
+        selected_len = consumable_tail_len;
+        if (selected_len > num_draft_tokens) selected_len = num_draft_tokens;
+        if (allow_partial || selected_len >= required_tail_len) {
+          for (int64_t i = 0; i < selected_len; ++i) {
+            out[i] = atomic_load_relaxed(
+                tail_tokens + seat * tail_capacity + i);
+          }
+        }
+      }
+
+      // Close the read section before sampling the version again. The fence
+      // orders every protected relaxed load before this validation load.
+      cuda::atomic_thread_fence(
+          cuda::memory_order_acquire, cuda::thread_scope_device);
+      const int64_t version_after =
+          version.load(cuda::memory_order_relaxed);
+      if (version_before != version_after ||
+          (version_after & int64_t{1}) != 0) {
+        for (int64_t i = 0; i < num_draft_tokens; ++i) out[i] = 0;
+        ++seqlock_retries;
+        if ((version_after & int64_t{1}) != 0) __nanosleep(64);
+        continue;
+      }
+
+      // Do not hold the writer lock while waiting: the landing stream must be
+      // able to resolve pending commits and append the remaining draft tokens.
+      // Lifecycle/cursor/update errors still return the existing invalid snapshot.
+      if (!allow_partial && identity_valid && metadata_valid && delta == 0 &&
+          (pending_expected_len > 0 || selected_len < required_tail_len)) {
+        __nanosleep(64);
+        continue;
+      }
+
+      if (logical_committed_lens_out != nullptr && identity_valid) {
+        logical_committed_lens_out[batch_index] = logical_output_len;
+      }
+      out[num_draft_tokens] = selected_len;
+      out[num_draft_tokens + 1] = row_valid ? 1 : 0;
+      if (debug != nullptr) {
+        debug[0] = static_cast<int64_t>(reason);
+        debug[1] = publish_seq;
+        debug[2] = delta;
+        debug[3] = raw_tail_len;
+        debug[4] = consumable_tail_len;
+        debug[5] = pending_expected_len;
+        debug[6] = committed_len;
+        if (debug_width > 7) debug[7] = update_error_code;
+        if (debug_width > 8) debug[8] = update_error_op_seq;
+        if (debug_width > 9) debug[9] = pending_prefix_fast_forward_ct;
+        if (debug_width > 10) debug[10] = seqlock_retries;
+      }
+      break;
     }
-    out[num_draft_tokens] = selected_len;
-    out[num_draft_tokens + 1] = row_valid ? 1 : 0;
-    if (debug != nullptr) {
-      debug[0] = static_cast<int64_t>(reason);
-      debug[1] = publish_seq;
-      debug[2] = delta;
-      debug[3] = raw_tail_len;
-      debug[4] = consumable_tail_len;
-      debug[5] = pending_expected_len;
-      debug[6] = committed_len;
-      if (debug_width > 7) debug[7] = update_error_code;
-      if (debug_width > 8) debug[8] = update_error_op_seq;
-      if (debug_width > 9) debug[9] = pending_prefix_fast_forward_ct;
-      if (debug_width > 10) debug[10] = seqlock_retries;
-    }
-    return;
   }
 }
 
@@ -2112,11 +2127,15 @@ void launch_select_gpu_draft_tail(
     const int64_t* error_codes,
     const int64_t* error_op_seqs,
     const int64_t* pending_prefix_fast_forward_cts,
-    void* stream) {
+    void* stream,
+    bool allow_partial,
+    int64_t required_tail_len) {
   if (batch_size <= 0) return;
+  // A strict selector occupies only one CTA, leaving SM capacity for landing
+  // kernels regardless of batch size. Partial selection keeps its usual grid.
   select_gpu_draft_tail_kernel<<<
-      static_cast<unsigned int>(batch_size),
-      1,
+      allow_partial ? static_cast<unsigned int>(batch_size) : 1,
+      allow_partial ? 1 : 32,
       0,
       reinterpret_cast<cudaStream_t>(stream)>>>(
       gpu_seats,
@@ -2148,7 +2167,9 @@ void launch_select_gpu_draft_tail(
       tail_tokens,
       error_codes,
       error_op_seqs,
-      pending_prefix_fast_forward_cts);
+      pending_prefix_fast_forward_cts,
+      allow_partial,
+      required_tail_len);
   check_cuda(cudaGetLastError(), "select_gpu_draft_tail_kernel");
 }
 

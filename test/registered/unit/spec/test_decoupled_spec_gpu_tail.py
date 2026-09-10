@@ -10,8 +10,10 @@ import uuid
 import torch
 import zmq
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.cpp_decoupled_spec import (
     CppDrafterDecoupledSpecDataPlane,
+    CppGpuDraftTailBuffer,
     CppVerifierDecoupledSpecDataPlane,
     GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES,
     GPU_DRAFT_TAIL_SELECT_REASON_NAMES,
@@ -76,6 +78,130 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         self.drafter.close()
         self.verifier.close()
         self.context.destroy(linger=0)
+
+    def test_strict_buffer_preallocates_the_landing_ring(self):
+        with envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.override(False):
+            tail = CppGpuDraftTailBuffer(
+                device="cuda:0",
+                num_seats=4,
+                num_draft_tokens=3,
+                landing_stream=self.landing_stream,
+            )
+        try:
+            self.assertFalse(tail.allow_partial)
+            self.assertEqual(tail.staging_slot_count, tail.max_staging_slots)
+        finally:
+            tail.close()
+
+    def test_strict_selector_waits_for_every_row_with_async_landing(self):
+        self._open("strict-a", request_epoch=7, gpu_seat=1)
+        self._open("strict-b", request_epoch=8, gpu_seat=2)
+        self._publish("strict-a", [0], token_base=10)
+        self._publish("strict-b", [0, 1, 2], token_base=20)
+        self._wait_for_result_frames(2)
+        torch.cuda.synchronize()
+        tail = self.verifier.gpu_tail_buffer
+        # More rows than strict selector lanes exercises the bounded CTA's stride.
+        seats = torch.tensor([1, 2] * 35, dtype=torch.int64, device="cuda:0")
+        epochs = torch.tensor([7, 8] * 35, dtype=torch.int64, device="cuda:0")
+        seq_lens = torch.ones_like(seats)
+        bonus = torch.zeros_like(seats, dtype=torch.int32)
+        compact, _ = tail.select_snapshot(seats, seq_lens, bonus, request_epochs=epochs)
+        self.assertEqual(compact[:, -2].cpu().tolist(), [1, 3] * 35)
+
+        tail.allow_partial = False
+        stream = torch.cuda.Stream()
+        done = torch.cuda.Event()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            compact, _ = tail.select_snapshot(
+                seats, seq_lens, bonus, request_epochs=epochs
+            )
+            done.record()
+        time.sleep(0.05)
+        self.assertFalse(done.query(), "strict selection returned with a short row")
+        self._publish("strict-a", [1], token_base=10)
+        self._wait_for_result_frames(1)
+        time.sleep(0.05)
+        self.assertFalse(done.query(), "one row still has only two of three tokens")
+        self._publish("strict-a", [2], token_base=10)
+        deadline = time.monotonic() + 5.0
+        while not done.query() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(done.query(), "landing could not unblock the strict selector")
+        self.assertEqual(
+            compact.cpu().tolist(), [[10, 11, 12, 3, 1], [20, 21, 22, 3, 1]] * 35
+        )
+
+    def test_strict_selector_waits_for_pending_commit_echo(self):
+        self._open("strict-pending", request_epoch=7)
+        tail = self.verifier.gpu_tail_buffer
+        seats = torch.tensor([1], dtype=torch.int64, device="cuda:0")
+        epochs = torch.full_like(seats, 7)
+        seq_lens = torch.full_like(seats, 2)
+        bonus = torch.zeros_like(seats, dtype=torch.int32)
+        tail.apply_verify_commit_from_device(
+            seats,
+            epochs,
+            None,
+            torch.tensor([90, 0, 0, 0], dtype=torch.int32, device="cuda:0"),
+            torch.ones(1, dtype=torch.int32, device="cuda:0"),
+            accept_token_stride=4,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tail.pending_expected_lens[1].item(), 1)
+        tail.allow_partial = False
+        stream = torch.cuda.Stream()
+        done = torch.cuda.Event()
+        with torch.cuda.stream(stream):
+            compact, _ = tail.select_snapshot(
+                seats, seq_lens, bonus, request_epochs=epochs
+            )
+            done.record()
+        time.sleep(0.05)
+        self.assertFalse(done.query())
+        self._send_raw_tail(
+            request_id="strict-pending",
+            base_committed_len=1,
+            start_token_pos=0,
+            tokens=90,
+            frame_seq=450,
+            is_commit_echo=True,
+        )
+        self._wait_for_result_frames(1)
+        time.sleep(0.05)
+        self.assertFalse(done.query())
+        self._publish(
+            "strict-pending", [1, 2, 3], token_base=90, base_committed_lens=[1] * 3
+        )
+        deadline = time.monotonic() + 5.0
+        while not done.query() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(
+            done.query(), "commit echo and draft append did not unblock selection"
+        )
+        self.assertEqual(compact.cpu().tolist(), [[91, 92, 93, 3, 1]])
+
+    def test_strict_selector_uses_active_steps_and_returns_invalid_rows(self):
+        self._open("strict-active", request_epoch=7)
+        self._publish("strict-active", [0], token_base=10)
+        self._wait_for_result_frames(1)
+        torch.cuda.synchronize()
+        tail = self.verifier.gpu_tail_buffer
+        tail.allow_partial = False
+        seats = torch.tensor([1, 1, -1], dtype=torch.int64, device="cuda:0")
+        epochs = torch.tensor([7, 99, 7], dtype=torch.int64, device="cuda:0")
+        compact, _ = tail.select_snapshot(
+            seats,
+            torch.ones_like(seats),
+            torch.zeros_like(seats, dtype=torch.int32),
+            request_epochs=epochs,
+            required_tail_len=1,
+        )
+        self.assertEqual(
+            compact.cpu().tolist(),
+            [[10, 0, 0, 1, 1], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+        )
 
     def test_mock_profile_selector_reads_static_gpu_tail(self):
         suffix = uuid.uuid4().hex
@@ -1659,6 +1785,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         *,
         request_epoch: int,
         committed_outputs: tuple[int, ...] = (),
+        gpu_seat: int = 1,
     ) -> None:
         self.verifier.open_request(
             DraftSync(
@@ -1668,7 +1795,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
                 prompt_token_ids=[7, 8],
                 committed_outputs=list(committed_outputs),
             ),
-            gpu_seat=1,
+            gpu_seat=gpu_seat,
             request_epoch=request_epoch,
         )
         deadline = time.monotonic() + 3.0

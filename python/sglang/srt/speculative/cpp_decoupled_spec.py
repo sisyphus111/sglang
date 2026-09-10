@@ -290,6 +290,7 @@ class CppGpuDraftTailBuffer:
         self.device = device
         self.num_seats = int(num_seats)
         self.num_draft_tokens = int(num_draft_tokens)
+        self.allow_partial = envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.get()
         self.tail_capacity = 2 * self.num_draft_tokens + 1
         self.pending_token_capacity = (
             self.tail_capacity
@@ -387,6 +388,7 @@ class CppGpuDraftTailBuffer:
             int(self.egress_seqs.data_ptr()),
             int(self.last_commit_tokens.data_ptr()),
             self.drafter_authoritative,
+            self.allow_partial,
         )
         self._closed = False
         # Retain stream objects as well as handles: initialization is immutable,
@@ -397,7 +399,7 @@ class CppGpuDraftTailBuffer:
 
     @property
     def staging_slot_count(self) -> int:
-        """Number of landing slots allocated so far (initially eight)."""
+        """Allocated landing slots; strict verification preallocates the full ring."""
 
         return int(self._cpp.staging_slot_count)
 
@@ -556,12 +558,18 @@ class CppGpuDraftTailBuffer:
         out: torch.Tensor | None = None,
         out_cursor: torch.Tensor | None = None,
         debug_out: torch.Tensor | None = None,
+        required_tail_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select and materialize tails on the caller's current CUDA stream."""
+        """Select tails; strict mode waits on GPU for the requested live-row length."""
 
         if self._closed:
             raise RuntimeError("GPU draft-tail buffer is closed")
         batch_size = int(gpu_seats.numel())
+        required_tail_len = (
+            self.num_draft_tokens if required_tail_len is None else required_tail_len
+        )
+        if not 0 <= required_tail_len <= self.num_draft_tokens:
+            raise ValueError("required_tail_len is outside the configured draft width")
         self._validate_vector(gpu_seats, "gpu_seats", batch_size, (torch.int64,))
         self._validate_vector(seq_lens, "seq_lens", batch_size, (torch.int64,))
         self._validate_vector(
@@ -643,6 +651,8 @@ class CppGpuDraftTailBuffer:
                 debug_width,
                 batch_size,
                 int(current_stream.cuda_stream),
+                self.allow_partial,
+                required_tail_len,
             )
         return out, out_cursor
 

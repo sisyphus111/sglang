@@ -1863,11 +1863,25 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
+        # Strict selection needs the final prefill commit on the drafter before
+        # decode bootstraps its kernels. Drain this boundary so first-use JIT
+        # loading cannot wait on a selector whose commit is still on the CPU.
+        # Use the result snapshot: planning may have reused last_batch as the
+        # running decode batch. Consecutive decode batches keep overlap.
+        need_draft_prefill_sync = (
+            batch
+            and batch.forward_mode.is_decode()
+            and batch.spec_algorithm.is_decoupled_verify()
+            and not envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.get()
+            and self.result_queue
+            and is_extend(self.result_queue[-1][0])
+        )
+
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        return disable_overlap_for_batch or need_grammar_sync or need_draft_prefill_sync
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet

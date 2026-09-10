@@ -1,5 +1,23 @@
 # Server Config and Topology
 
+For a decoupled verifier, `verifier.runtime.env.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL`
+defaults to `"1"`. Set it to `"0"` to make the GPU selector wait until every live
+request has the active K consumable draft tokens, including resolution of any
+pending committed prefix. It waits on the verifier CUDA stream while draft
+landing continues asynchronously; it does not change the compact snapshot shape.
+Strict verifier startup selects `CUDA_MODULE_LOADING=EAGER` and initializes the
+TP broadcast before serving, so lazy kernel loading cannot block the scheduler
+CPU behind a selector waiting for that CPU's commit. The prefill-to-decode
+boundary drains the final prefill result to send its initial commit before
+first-use JIT loading. Consecutive decode batches keep overlap enabled.
+Initialization also loads the KV-allocation and verify-preparation BS/K kernel
+variants using scratch storage; these helpers are outside the target CUDA graph.
+The strict verifier also preallocates its full landing ring for all completed
+egress snapshots (including commit echoes and seat-group offsets). It must not
+allocate or free pinned staging buffers while a selector waits on GPU landing.
+Invalid lifecycle or update state retains the existing invalid-row diagnostics.
+Record this setting with the server config when comparing throughput.
+
 ## Unified config contract
 
 One YAML describes the complete Ray fleet:

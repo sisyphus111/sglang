@@ -2463,7 +2463,8 @@ class GpuDraftTailBufferCore {
       uintptr_t checkpoint_positions,
       uintptr_t egress_seqs,
       uintptr_t last_commit_tokens,
-      bool drafter_authoritative)
+      bool drafter_authoritative,
+      bool allow_partial)
       : device_index_(device_index),
         num_seats_(num_seats),
         num_draft_tokens_(num_draft_tokens),
@@ -2499,7 +2500,8 @@ class GpuDraftTailBufferCore {
         egress_seqs_(reinterpret_cast<int64_t*>(egress_seqs)),
         last_commit_tokens_(
             reinterpret_cast<int64_t*>(last_commit_tokens)),
-        drafter_authoritative_(drafter_authoritative) {
+        drafter_authoritative_(drafter_authoritative),
+        strict_selection_(!allow_partial && !drafter_authoritative) {
     if (device_index_ < 0 || num_seats_ <= 0 || num_draft_tokens_ <= 0 ||
         pending_token_capacity_ < tail_capacity_) {
       throw std::runtime_error(
@@ -2529,10 +2531,16 @@ class GpuDraftTailBufferCore {
       free_seats_.push_back(seat);
     }
     staging_slots_.reserve(kMaxStagingSlots);
+    // Include seat-group offsets. Each completed egress snapshot can contribute
+    // an echo and a tail per seat. No pinned allocation/free is safe while a
+    // strict selector waits for this landing thread to publish remaining rows.
+    const size_t rows_per_seat = strict_selection_ ? 2 * kEgressSnapshotSlots : 1;
     const size_t staging_words = static_cast<size_t>(num_seats_) *
-        static_cast<size_t>(
-            kGpuDraftTailUpdateMetadataWidth + tail_capacity_);
-    for (size_t i = 0; i < kInitialStagingSlots; ++i) {
+        (rows_per_seat * static_cast<size_t>(
+            kGpuDraftTailUpdateMetadataWidth + tail_capacity_) + 1) + 1;
+    const size_t initial_slots = strict_selection_
+        ? kMaxStagingSlots : kInitialStagingSlots;
+    for (size_t i = 0; i < initial_slots; ++i) {
       add_staging_slot(staging_words);
     }
     for (auto& slot : commit_handoff_slots_) {
@@ -3012,11 +3020,16 @@ class GpuDraftTailBufferCore {
       uintptr_t debug_out,
       int64_t debug_width,
       int64_t batch_size,
-      uintptr_t verify_stream) {
+      uintptr_t verify_stream,
+      bool allow_partial,
+      int64_t required_tail_len) {
     if (batch_size < 0) {
       throw std::runtime_error("GPU draft-tail batch size must be non-negative");
     }
     if (batch_size == 0) return;
+    if (required_tail_len < 0 || required_tail_len > num_draft_tokens_) {
+      throw std::runtime_error("GPU draft-tail required length is outside draft width");
+    }
     if (gpu_seats == 0 || expected_request_epochs == 0 || seq_lens == 0 ||
         bonus_tokens == 0 || compact_out == 0) {
       throw std::runtime_error(
@@ -3055,7 +3068,9 @@ class GpuDraftTailBufferCore {
         error_codes_,
         error_op_seqs_,
         pending_prefix_fast_forward_cts_,
-        reinterpret_cast<void*>(verify_stream));
+        reinterpret_cast<void*>(verify_stream),
+        allow_partial,
+        required_tail_len);
   }
 
   void select_mock_snapshot(
@@ -3561,6 +3576,11 @@ class GpuDraftTailBufferCore {
       StagingSlotCpp& slot,
       size_t required_words) {
     if (slot.capacity_words >= required_words) return;
+    if (strict_selection_ && slot.capacity_words != 0) {
+      throw std::runtime_error(
+          "Strict GPU draft-tail publication exceeds its preallocated "
+          "egress-snapshot staging capacity");
+    }
     if (slot.in_flight) {
       throw std::runtime_error(
           "Cannot resize an in-flight GPU draft-tail staging slot");
@@ -3789,6 +3809,7 @@ class GpuDraftTailBufferCore {
   int64_t* egress_seqs_;
   int64_t* last_commit_tokens_;
   bool drafter_authoritative_;
+  const bool strict_selection_;
   std::mutex binding_mu_;
   std::unordered_map<std::string, GpuDraftTailBindingCpp> request_bindings_;
   std::unordered_map<int64_t, SeatBindingCpp> seat_bindings_;
@@ -5408,6 +5429,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               uintptr_t,
               uintptr_t,
               uintptr_t,
+              bool,
               bool>(),
           py::arg("device_index"),
           py::arg("num_seats"),
@@ -5435,7 +5457,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("checkpoint_positions"),
           py::arg("egress_seqs"),
           py::arg("last_commit_tokens"),
-          py::arg("drafter_authoritative"))
+          py::arg("drafter_authoritative"),
+          py::arg("allow_partial"))
       .def(
           "bind_request",
           &GpuDraftTailBufferCore::bind_request,
@@ -5476,7 +5499,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("debug_out"),
           py::arg("debug_width"),
           py::arg("batch_size"),
-          py::arg("verify_stream"))
+          py::arg("verify_stream"),
+          py::arg("allow_partial"),
+          py::arg("required_tail_len"))
       .def(
           "prepare_decode_native",
           &GpuDraftTailBufferCore::prepare_decode,

@@ -305,7 +305,9 @@ void launch_select_gpu_draft_tail(
     const int64_t* error_codes,
     const int64_t* error_op_seqs,
     const int64_t* pending_prefix_fast_forward_cts,
-    void* stream);
+    void* stream,
+    bool allow_partial,
+    int64_t required_tail_len);
 
 /**
  * Offline-profiler selector. It performs the same row-indexed GPU tail reads

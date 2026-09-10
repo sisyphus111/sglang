@@ -911,6 +911,8 @@ class Envs:
     # Spec Config
     # Select the native C++ transport/tail implementation for decoupled spec.
     SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND = EnvBool(False)
+    # If disabled, GPU selection waits for every live row's requested draft tail.
+    SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL = EnvBool(True)
     # Optional absolute libzmq path used by the JIT-loaded native transport.
     SGLANG_DECOUPLED_SPEC_ZMQ_LIB = EnvStr(None)
     # Complete scheduler-cycle cost profile consumed by the decoupled verifier.

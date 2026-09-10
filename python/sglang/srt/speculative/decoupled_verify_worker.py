@@ -6,10 +6,13 @@ import time
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_uniform_func
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -69,6 +72,7 @@ def select_decoupled_gpu_tail_snapshot(
     seq_lens: torch.Tensor,
     bonus_tokens: torch.Tensor,
     num_draft_tokens: int,
+    required_tail_len: int | None = None,
     out: torch.Tensor | None = None,
     out_cursor: torch.Tensor | None = None,
     debug_out: torch.Tensor | None = None,
@@ -102,6 +106,7 @@ def select_decoupled_gpu_tail_snapshot(
                 out=out,
                 out_cursor=out_cursor,
                 debug_out=debug_out,
+                required_tail_len=required_tail_len,
             )
     else:
         compact_snapshot = (
@@ -285,6 +290,12 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             dtype=torch.int64,
             device=self.device,
         )
+        # ProcessGroupNCCL lazily loads kernels on its first broadcast. Do that
+        # before a strict selector can be in flight: module loading may wait on
+        # CUDA work whose draft commit still needs the scheduler CPU to advance.
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            tp_group.broadcast(self._gpu_tail_snapshot_buffers[0, :1], src=0)
         if self.ps.tp_rank == 0:
             device_module = torch.get_device_module(self.device)
             self._gpu_tail_expected_epoch_buffers = torch.empty(
@@ -326,6 +337,44 @@ class DecoupledVerifyWorker(BaseSpecWorker):
                 .expand(num_gpu_seats, -1)
                 .contiguous()
             )
+        if (
+            torch.device(self.device).type == "cuda"
+            and not envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.get()
+        ):
+            # These scheduler/verify-prep kernels sit outside target CUDA graphs.
+            # Load their BS/K specializations before a strict selector can wait
+            # on the landing stream: first-use Triton module loading may sync
+            # the context. Scratch rows keep warmup independent of live KV state.
+            scratch_pool = torch.zeros_like(self.req_to_token_pool.req_to_token[:1])
+            scratch_seats = torch.zeros(
+                num_gpu_seats, dtype=torch.int64, device=self.device
+            )
+            scratch_lens = torch.zeros(
+                num_gpu_seats, dtype=torch.int32, device=self.device
+            )
+            scratch_locs = torch.empty(2, dtype=torch.int64, device=self.device)
+            for exponent in range((num_gpu_seats - 1).bit_length() + 1):
+                warmup_bs = min(1 << exponent, num_gpu_seats)
+                # Free-list slices may have either int64 pointer alignment.
+                for offset in (0, 1):
+                    assign_req_to_token_pool_func(
+                        scratch_seats,
+                        scratch_pool,
+                        scratch_lens,
+                        scratch_lens,
+                        scratch_locs[offset:],
+                        warmup_bs,
+                    )
+            scratch_seq_lens = scratch_lens.to(torch.int64)
+            for steps in topology_steps:
+                assign_extend_cache_locs_uniform_func(
+                    scratch_seats,
+                    scratch_pool,
+                    scratch_seq_lens,
+                    1,
+                    steps + 1,
+                    self.device,
+                )
         self._gpu_tail_buffer_attached = True
 
     def capture_expected_request_epochs(self, batch: ScheduleBatch) -> None:
@@ -558,6 +607,7 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             seq_lens=batch.seq_lens,
             bonus_tokens=draft_input.bonus_tokens,
             num_draft_tokens=self.max_draft_tokens,
+            required_tail_len=applied_steps,
             out=self._gpu_tail_snapshot_buffers[snapshot_slot, :batch_size],
             out_cursor=self._gpu_tail_cursor_buffers[snapshot_slot, :batch_size],
             debug_out=(

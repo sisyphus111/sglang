@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative.decoupled_verify_worker import (
+    DECOUPLED_TAIL_SELECT_DEBUG_WIDTH,
     DecoupledVerifyWorker,
     select_decoupled_gpu_tail_snapshot,
 )
@@ -38,6 +39,7 @@ class _GpuTail:
         out=None,
         out_cursor=None,
         debug_out=None,
+        required_tail_len=None,
     ):
         self.calls.append((gpu_seats, request_epochs, seq_lens, bonus_tokens))
         if out is not None:
@@ -351,7 +353,14 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
         worker._linear_selected_index_by_step = {}
         worker._linear_parent_list_by_step = {}
 
-        worker.attach_gpu_tail_buffer(None)
+        group = _BroadcastGroup()
+        with patch(
+            "sglang.srt.speculative.decoupled_verify_worker.get_tp_group",
+            return_value=group,
+        ):
+            worker.attach_gpu_tail_buffer(None)
+        self.assertEqual(len(group.calls), 1)
+        self.assertEqual(tuple(group.calls[0][0].shape), (1, 5))
 
         self.assertEqual(tuple(worker._gpu_tail_snapshot_buffers.shape), (2, 9, 5))
         self.assertEqual(tuple(worker._gpu_tail_cursor_buffers.shape), (2, 9))
@@ -388,12 +397,19 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
         worker._linear_parent_list_by_step = {}
         gpu_tail = SimpleNamespace(num_seats=9, num_draft_tokens=3)
 
-        worker.attach_gpu_tail_buffer(gpu_tail)
+        with patch(
+            "sglang.srt.speculative.decoupled_verify_worker.get_tp_group",
+            return_value=_BroadcastGroup(),
+        ):
+            worker.attach_gpu_tail_buffer(gpu_tail)
 
         self.assertEqual(tuple(worker._gpu_tail_snapshot_buffers.shape), (2, 9, 5))
         self.assertEqual(tuple(worker._gpu_tail_expected_epoch_buffers.shape), (2, 9))
         self.assertEqual(len(worker._gpu_tail_landing_events), 2)
-        self.assertEqual(tuple(worker._gpu_tail_debug_buffers.shape), (2, 9, 10))
+        self.assertEqual(
+            tuple(worker._gpu_tail_debug_buffers.shape),
+            (2, 9, DECOUPLED_TAIL_SELECT_DEBUG_WIDTH),
+        )
 
     def test_tp0_captures_batch_owned_request_epochs_in_overlap_slot(self):
         calls = []
