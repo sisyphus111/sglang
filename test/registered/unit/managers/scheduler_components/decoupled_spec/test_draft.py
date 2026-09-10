@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler_components.decoupled_spec.draft import (  # noqa: E402
     DecoupledDraftManager,
 )
@@ -39,6 +40,7 @@ class _DraftBatch:
         self.batch_is_full = True
         self.defer_decode_kv_binding = False
         self.decoupled_draft_mirror_seats = None
+        self.chunked_req = None
 
     def filter_batch(self, *, keep_indices) -> None:
         self.reqs = [self.reqs[index] for index in keep_indices]
@@ -817,6 +819,53 @@ class TestDecoupledDraftManager(CustomTestCase):
         )
 
         self.assertFalse(self.manager.before_process_batch_result(batch, result))
+
+    def test_gpu_overlap_mixed_prefill_defers_middle_chunk_state(self):
+        self._enable_gpu_overlap()
+        final_req, _ = self._install_request(request_id="final", output_tokens=[10])
+        middle_req, _ = self._install_request(request_id="middle", output_tokens=[])
+        middle_req.inflight_middle_chunks = 1
+        batch = ScheduleBatch(
+            reqs=[final_req, middle_req], forward_mode=ForwardMode.EXTEND
+        )
+        batch.chunked_req = middle_req
+        batch.contains_last_prefill_chunk = True
+        batch.decoupled_draft_mirror_seats = torch.tensor([1, 2])
+        batch.decoupled_draft_request_epochs = torch.tensor([0, 0])
+        batch.req_pool_indices = torch.tensor([1, 2])
+        result = SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([11, 99]))
+
+        def append_prefill(seats, epochs, tokens, *, accept_out):
+            accept_out.copy_(seats >= 0)
+
+        self.data_plane.gpu_tail_buffer.append_prefill_sample.side_effect = (
+            append_prefill
+        )
+        self.assertTrue(self.manager.finish_forward(batch, result))
+        call_args = self.data_plane.gpu_tail_buffer.append_prefill_sample.call_args
+        self.assertEqual(call_args.args[0].tolist(), [1, -1])
+        self.assertEqual(batch.decoupled_draft_mirror_seats.tolist(), [1, 2])
+        self.assertEqual(
+            result.decoupled_draft_candidate_committed.tolist(), [True, False]
+        )
+        batch = batch.copy()
+        self.assertIs(batch.chunked_req, middle_req)
+        self.assertFalse(self.manager.before_process_batch_result(batch, result))
+        self.assertFalse(getattr(middle_req, "is_retracted", False))
+        self.assertEqual(middle_req.inflight_middle_chunks, 1)
+        self.assertEqual(list(middle_req.output_ids), [])
+
+        # Result processing can mutate the live counter; batch identity must
+        # still prevent a checkpoint from being published for the middle chunk.
+        middle_req.inflight_middle_chunks = 0
+        final_req.is_retracted = False
+        self.manager.checkpoints = MagicMock()
+        self.manager.after_process_batch_result(batch, result)
+        self.manager.checkpoints.commit_after_forward.assert_called_once()
+        self.assertEqual(
+            self.manager.checkpoints.commit_after_forward.call_args.args[0],
+            final_req.decoupled_draft_generation,
+        )
 
     def test_gpu_overlap_candidate_ownership_advances_exact_kv_highwater(self):
         self._enable_gpu_overlap()

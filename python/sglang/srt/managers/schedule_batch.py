@@ -3245,6 +3245,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
+            # Delayed prefill results must retain their launch-time chunk row.
+            chunked_req=self.chunked_req,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             decoupled_launch_mirror_ids=(

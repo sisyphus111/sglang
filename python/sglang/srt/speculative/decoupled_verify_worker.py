@@ -633,7 +633,9 @@ class DecoupledVerifyWorker(BaseSpecWorker):
                     commit_rows = [
                         not req.finished()
                         and not req.is_retracted
-                        and req.inflight_middle_chunks <= 0
+                        # The previous chunk's CPU result can still be in flight.
+                        # Only the current batch identifies a non-final row.
+                        and req is not batch.chunked_req
                         for req in batch.reqs
                     ]
                     commit_mask = (

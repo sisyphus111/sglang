@@ -182,6 +182,16 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
                 [make_req(), make_req()],
                 None,
                 True,
+                None,
+            ),
+            (
+                "final_chunk_with_prior_result_in_flight",
+                True,
+                False,
+                [make_req(middle_chunks=1), make_req()],
+                None,
+                False,
+                None,
             ),
             (
                 "mixed_filters_non_committing_rows",
@@ -195,6 +205,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
                 ],
                 [True, False, False, False],
                 False,
+                1,
             ),
         )
 
@@ -205,6 +216,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
             reqs,
             expected_mask,
             has_new_lifecycle,
+            chunked_row,
         ) in cases:
             with self.subTest(name=name):
                 events = []
@@ -221,6 +233,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
                     forward_mode=SimpleNamespace(is_extend=lambda: is_extend),
                     is_extend_in_batch=is_extend_in_batch,
                     reqs=reqs,
+                    chunked_req=None if chunked_row is None else reqs[chunked_row],
                     req_pool_indices=gpu_seats,
                     decoupled_expected_request_epochs=expected_request_epochs,
                     decoupled_has_new_lifecycle=has_new_lifecycle,

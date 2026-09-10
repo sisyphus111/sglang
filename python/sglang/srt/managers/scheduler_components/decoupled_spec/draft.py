@@ -941,13 +941,20 @@ class DecoupledDraftManager:
             )
             result.decoupled_draft_kv_outcomes_ready.record()
         else:
+            mirror_seats = batch.decoupled_draft_mirror_seats
+            if batch.chunked_req is not None:
+                # A mixed prefill batch includes an unfinished chunk. Its
+                # sample is not an output token and must not initialize the
+                # authoritative decode state before the final chunk runs.
+                mirror_seats = mirror_seats.clone()
+                mirror_seats[batch.reqs.index(batch.chunked_req)] = -1
             candidate_committed = torch.empty(
                 sampled_tokens.shape,
                 dtype=torch.bool,
                 device=sampled_tokens.device,
             )
             self.data_plane.gpu_tail_buffer.append_prefill_sample(
-                batch.decoupled_draft_mirror_seats,
+                mirror_seats,
                 batch.decoupled_draft_request_epochs,
                 sampled_tokens,
                 accept_out=candidate_committed,
@@ -1139,6 +1146,9 @@ class DecoupledDraftManager:
         for req, candidate_committed in zip(
             batch.reqs, committed_mask.tolist()
         ):
+            if req is batch.chunked_req:
+                # The generic processor still owns middle-chunk accounting.
+                continue
             if not bool(candidate_committed):
                 req.is_retracted = True
         return False
