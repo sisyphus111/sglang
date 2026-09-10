@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -472,6 +473,78 @@ def _observed_targets(
     return normalized
 
 
+def _fixed_batch_decode_window(
+    run_dir: Path,
+    records: list[dict[str, Any]],
+    start: float,
+    finish: float,
+    errors: list[str],
+) -> tuple[float, float] | None:
+    """Bound queue checks by full-BS verifier decode, excluding batch fill/drain."""
+    try:
+        client = _read_json(run_dir / "config.json")["client"]
+        batch_size = int(client["batch"]["size"])
+        with (run_dir / "client" / "requests.csv").open(newline="") as handle:
+            requests = list(csv.DictReader(handle))
+        if batch_size <= 0 or len(requests) != batch_size:
+            raise ValueError("request count does not match the configured batch size")
+        # The Client launch precedes individual request starts. This bound is
+        # conservative; it must not extend into the first request's drain phase.
+        latencies = [float(r["e2e_latency_s"]) for r in requests]
+        if not all(math.isfinite(value) and value > 0 for value in latencies):
+            raise ValueError("request latencies must be finite and positive")
+        finish = min(finish, start + min(latencies))
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"cannot determine full-BS decode window: {exc}")
+        return None
+
+    windows: dict[tuple[str, int], dict[int, dict[str, Any]]] = {}
+    selected_target = client.get("server", {}).get("target_id")
+    for record in records:
+        if record.get("role") not in {"target", "verifier"} or not _is_success(record):
+            continue
+        if selected_target is not None and record["target_id"] != selected_target:
+            continue
+        for load in record["payload"]["loads"]:
+            if not isinstance(load, dict):
+                continue
+            key = (record["target_id"], int(load.get("dp_rank", 0)))
+            for window in load.get("decode_metrics_windows") or []:
+                if (
+                    not isinstance(window, dict)
+                    or type(window.get("window_id")) is not int
+                ):
+                    continue
+                end = window.get("end_time")
+                if isinstance(end, (int, float)) and start <= end < finish:
+                    windows.setdefault(key, {})[window["window_id"]] = window
+    bounds = []
+    for engine_windows in windows.values():
+        full_ends = []
+        for window in sorted(engine_windows.values(), key=lambda w: w["window_id"]):
+            iters = window.get("num_decode_iters", 0)
+            full = (
+                type(iters) is int
+                and iters > 0
+                and window.get("num_decode_rows") == batch_size * iters
+            )
+            if full:
+                full_ends.append(float(window["end_time"]))
+            elif full_ends:
+                break
+        # The first full window has no trustworthy start boundary. Use its end
+        # as the start and retain only subsequent complete full-batch windows.
+        if len(full_ends) >= 2:
+            bounds.append((full_ends[0], full_ends[-1]))
+    if len(bounds) != 1:
+        errors.append(
+            "cannot determine one full-BS decode window before the first exit: "
+            f"found {len(bounds)} eligible engines"
+        )
+        return None
+    return bounds[0]
+
+
 def validate_samples(
     run_dir: Path,
     required_roles: list[str],
@@ -597,6 +670,11 @@ def validate_samples(
         ):
             errors.append("benchmark timeline observer_elapsed_s is inconsistent")
 
+    decode_queue_window = None
+    if formal_start is not None and formal_finish is not None:
+        decode_queue_window = _fixed_batch_decode_window(
+            run_dir, records, formal_start, formal_finish, errors
+        )
     role_reports: dict[str, Any] = {}
     for role in required_roles:
         role_records = [record for record in records if record.get("role") == role]
@@ -615,20 +693,30 @@ def validate_samples(
             "max_success_gap_s": _max_gap(times),
         }
         formal_waiting_samples = []
-        if formal_start is not None and formal_finish is not None:
+        decode_queue_sample_count = 0
+        decode_queue_target_counts: dict[str, int] = {}
+        if decode_queue_window is not None:
             for record in successful:
                 collected_at = record.get("collected_wall_time")
-                if not isinstance(collected_at, (int, float)) or not (
-                    formal_start <= collected_at <= formal_finish
-                ):
+                if not isinstance(collected_at, (int, float)):
                     continue
                 for load in record["payload"]["loads"]:
                     if not isinstance(load, dict):
                         continue
+                    sampled_at = load.get("timestamp", collected_at)
+                    if not isinstance(sampled_at, (int, float)) or not (
+                        decode_queue_window[0] < sampled_at <= decode_queue_window[1]
+                    ):
+                        continue
+                    decode_queue_sample_count += 1
+                    target_id = str(record.get("target_id", role))
+                    decode_queue_target_counts[target_id] = (
+                        decode_queue_target_counts.get(target_id, 0) + 1
+                    )
                     waiting = load.get("num_waiting_reqs")
                     if type(waiting) is not int or waiting < 0:
                         errors.append(
-                            f"{role}: formal-window load sample lacks a valid "
+                            f"{role}: full-BS decode load sample lacks a valid "
                             f"num_waiting_reqs: sample_id={record.get('sample_id')!r} "
                             f"value={waiting!r}"
                         )
@@ -640,9 +728,11 @@ def validate_samples(
                                 "sample_id": record.get("sample_id"),
                                 "dp_rank": int(load.get("dp_rank", 0)),
                                 "collected_wall_time": float(collected_at),
+                                "sampled_wall_time": float(sampled_at),
                                 "num_waiting_reqs": waiting,
                             }
                         )
+        report["decode_queue_sample_count"] = decode_queue_sample_count
         report["formal_waiting_sample_count"] = len(formal_waiting_samples)
         report["max_waiting_reqs_in_formal_window"] = max(
             (sample["num_waiting_reqs"] for sample in formal_waiting_samples),
@@ -651,7 +741,7 @@ def validate_samples(
         report["formal_waiting_samples"] = formal_waiting_samples
         if formal_waiting_samples:
             errors.append(
-                f"{role}: waiting requests observed inside the formal window: "
+                f"{role}: waiting requests observed inside the full-BS decode window: "
                 f"max={report['max_waiting_reqs_in_formal_window']} "
                 f"sample_count={len(formal_waiting_samples)}"
             )
@@ -749,6 +839,9 @@ def validate_samples(
                 if isinstance(record.get("collected_wall_time"), (int, float))
             )
             target_window_count = sum(key[0] == target_id for key in decode_windows)
+            queue_sample_count = decode_queue_target_counts.get(target_id, 0)
+            if decode_queue_window is not None and queue_sample_count == 0:
+                errors.append(f"{target_id}: no queue sample inside the full-BS decode window")
             target_report = {
                 "success_count": len(target_successful),
                 "error_count": sum(
@@ -760,6 +853,7 @@ def validate_samples(
                 "last_success_wall_time": target_times[-1] if target_times else None,
                 "max_success_gap_s": _max_gap(target_times),
                 "decode_metrics_window_count": target_window_count,
+                "decode_queue_sample_count": queue_sample_count,
             }
             if not target_successful:
                 errors.append(f"{target_id}: no successful /v1/loads samples")
@@ -852,6 +946,7 @@ def validate_samples(
         "run_dir": str(run_dir),
         "interval_s": interval_s,
         "formal_window": formal,
+        "decode_queue_window": decode_queue_window,
         "record_count": len(records),
         "roles": role_reports,
         "errors": errors,

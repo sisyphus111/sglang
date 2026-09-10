@@ -67,11 +67,13 @@ Read [references/timing-boundaries.md](references/timing-boundaries.md), then:
 The observer may query `/model_info`, `/server_info`, and `/v1/loads`; it must
 not call `/generate`.
 
-Every successful formal-window sample must report `num_waiting_reqs == 0` for
-every manifest engine. A positive value means the requested batch was not
-served concurrently and invalidates the performance run. Optional server logs
-may provide additional queue evidence, but their absence is not an artifact
-failure.
+For fixed-BS throughput, every sample inside the full-BS verifier decode
+measurement window must report `num_waiting_reqs == 0` for every manifest
+engine. Prefill/batch-fill queues and queues after the measurement window are
+allowed. End measurement before the first request exits; missing complete
+full-BS decode windows or in-window queue samples invalidate the performance
+claim. Optional server logs use the same boundaries; their absence is not an
+artifact failure.
 
 Derive every per-engine and per-role summary from `observer/samples.jsonl`.
 Window identity is `(target_id, dp_rank, window_id)`; two replicas may
@@ -106,10 +108,10 @@ trace with a narrower timing boundary.
 
 Return the sampling interval, formal-window duration, per-engine
 successful/error sample counts, coverage before/inside/after the formal window,
-maximum sample gap, maximum formal-window waiting requests, per-engine unique
+maximum sample gap, maximum full-BS decode-window waiting requests, per-engine unique
 decode-window counts and iteration latency statistics, and paths for the running batch size,
 valid draft tail length, accept length, and iteration latency plots. Surface
-any nonzero waiting queue, missing coverage, or a missing required plot as an
+any nonzero in-window waiting queue, missing coverage, or a missing required plot as an
 observability failure even when the client request itself succeeded. When the
 new decoupled-spec window section is present, also return raw merged selector
 and transport counters/histograms plus the decoupled-spec metrics figure path.

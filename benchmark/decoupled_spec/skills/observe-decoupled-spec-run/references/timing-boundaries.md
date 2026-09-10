@@ -93,6 +93,15 @@ other presentation filtering. A future schema may retain the first window only
 when a recorded, trustworthy start time proves the entire window began at or
 after `client_started_wall_time`.
 
+For fixed-BS queue validity, additionally retain the contiguous full-batch
+verifier decode segment, using `num_decode_rows == batch.size * num_decode_iters`.
+The first full window supplies the start boundary; only subsequent complete
+windows are eligible. Bound the end by the earliest Client request completion
+and stop at the first non-full window. Prefill/batch-fill and drain queues are
+outside this measurement interval. The validator records these bounds as
+`decode_queue_window` and requires queue samples from both roles inside it.
+Missing evidence is invalid, not an implicit zero queue.
+
 Within one process, transport stages use a local monotonic clock. Cross-host
 send-to-receive and result-ready-to-receive samples are recorded only when the
 wire timestamp belongs to a calibrated peer epoch with a finite error bound.

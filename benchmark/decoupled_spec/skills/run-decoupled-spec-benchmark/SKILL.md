@@ -70,10 +70,12 @@ the retry.
 - The launcher must use the saved sparse quota graph and ranked peer configs;
   do not replace it with a dense full mesh. Verifier SWRR selection is sticky
   for the full request lifecycle.
-- Verifier and drafter must both keep `num_waiting_reqs == 0`. Require a
-  zero-waiting observer baseline before sending the client batch; any positive
-  queue telemetry in formal-window samples makes the run invalid. If an
-  optional role log exists, a positive queue there is also invalid.
+- Require a zero-waiting observer baseline before sending the client batch.
+  For fixed-BS throughput, require `num_waiting_reqs == 0` on both roles only
+  inside the full-BS verifier decode measurement window, before the first
+  request exits. Prefill/batch-fill queues and post-window drain queues are
+  allowed. Apply the same time boundaries to optional server-log evidence.
+  Missing full-BS decode windows or queue samples cannot prove performance validity.
 - All plots are derived from saved artifacts; plotting does not rerun traffic.
 - A successful client writes exactly
   `client/{requests.csv,batch.json,content.json}`. The schema is fixed by

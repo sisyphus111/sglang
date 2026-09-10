@@ -53,6 +53,11 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
     ) -> None:
         observer_dir = run_dir / "observer"
         observer_dir.mkdir(parents=True)
+        (run_dir / "config.json").write_text(
+            json.dumps({"client": {"batch": {"size": 2}}})
+        )
+        (run_dir / "client").mkdir()
+        (run_dir / "client" / "requests.csv").write_text("e2e_latency_s\n1.8\n2.0\n")
         (observer_dir / "bench_timeline.json").write_text(
             json.dumps(
                 {
@@ -90,6 +95,20 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
                                 {
                                     "dp_rank": 0,
                                     "num_waiting_reqs": waiting,
+                                    "decode_metrics_windows": [
+                                        {
+                                            "window_id": 1,
+                                            "end_time": 100.5,
+                                            "num_decode_iters": 40,
+                                            "num_decode_rows": 80,
+                                        },
+                                        {
+                                            "window_id": 2,
+                                            "end_time": 101.5,
+                                            "num_decode_iters": 40,
+                                            "num_decode_rows": 80,
+                                        },
+                                    ],
                                 }
                             ]
                         },
@@ -130,7 +149,7 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
         )
         self.assertTrue(
             any(
-                "drafter: waiting requests observed inside the formal window" in error
+                "drafter: waiting requests observed inside the full-BS decode window" in error
                 for error in report["errors"]
             )
         )
@@ -165,6 +184,36 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
         self.assertTrue(report["ok"], report["errors"])
         self.assertEqual(report["roles"]["target"]["success_count"], 3)
 
+    def test_prefill_and_drain_queues_do_not_invalidate_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            self._write_observability_fixture(run_dir)
+            path = run_dir / "observer" / "samples.jsonl"
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            for sample_id, at in ((3, 100.25), (4, 101.9)):
+                for template in records[:2]:
+                    record = json.loads(json.dumps(template))
+                    record.update(sample_id=sample_id, collected_wall_time=at)
+                    record["payload"]["loads"][0]["num_waiting_reqs"] = 12
+                    records.append(record)
+            path.write_text("".join(json.dumps(r) + "\n" for r in records))
+            report = _VALIDATOR.validate_samples(run_dir, ["verifier", "drafter"])
+        self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(report["decode_queue_window"], (100.5, 101.5))
+
+    def test_missing_full_batch_decode_evidence_invalidates_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            self._write_observability_fixture(run_dir)
+            path = run_dir / "observer" / "samples.jsonl"
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            for record in records:
+                record["payload"]["loads"][0]["decode_metrics_windows"] = []
+            path.write_text("".join(json.dumps(r) + "\n" for r in records))
+            report = _VALIDATOR.validate_samples(run_dir, ["verifier", "drafter"])
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("full-BS decode window" in e for e in report["errors"]))
+
     def test_decode_windows_before_observer_start_are_not_recounted(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
@@ -182,8 +231,15 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
                     },
                     {
                         "window_id": 2,
-                        "end_time": 101.0,
+                        "end_time": 100.5,
                         "num_decode_iters": 40,
+                        "num_decode_rows": 80,
+                    },
+                    {
+                        "window_id": 3,
+                        "end_time": 101.5,
+                        "num_decode_iters": 40,
+                        "num_decode_rows": 80,
                     },
                 ]
             samples_path.write_text(
@@ -197,7 +253,7 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
 
         self.assertTrue(report["ok"], report["errors"])
         for role in ("verifier", "drafter"):
-            self.assertEqual(report["roles"][role]["decode_metrics_window_count"], 1)
+            self.assertEqual(report["roles"][role]["decode_metrics_window_count"], 2)
 
     def test_validator_accepts_role_owned_decoupled_spec_metrics(self):
         rows = 4

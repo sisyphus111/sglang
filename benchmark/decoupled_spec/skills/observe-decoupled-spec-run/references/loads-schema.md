@@ -188,8 +188,12 @@ Field availability depends on the server's enabled metrics and requested
 to only these fields.
 
 For decoupled-spec performance validity, `num_waiting_reqs` is a hard
-invariant: every verifier and drafter engine must report zero throughout the formal
-window. A missing/non-integer value cannot prove the invariant and is rejected;
-any positive value invalidates the run.
+invariant inside the full-BS verifier decode measurement window before the first
+request exits: every verifier and drafter engine must report zero there.
+Prefill/batch-fill queues and post-window drain queues are allowed. A missing or
+non-integer in-window value cannot prove the invariant and is rejected; any
+positive in-window value invalidates the run. The validator records the bounds
+as `decode_queue_window`; its legacy `formal_waiting_*` report fields now refer
+to this narrower window.
 
 The observer does not persist startup `/model_info` or `/server_info` snapshots.
