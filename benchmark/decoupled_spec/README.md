@@ -115,13 +115,62 @@ Target 仍由 Ray placement group 管理，但不创建 decoupled transport sock
 config 或 quota graph。MTP 返回 fixed-K acceptance histogram 时，Client 会转换为
 固定结果 contract 使用的 per-position proposed/correct/rate 数组。
 
-### 3.2 Client 和 Observer
+### 3.2 Decoupled 功能开关
+
+Decoupled verifier 和 drafter 的执行行为都写在同一个 fleet YAML 中。例如：
+
+```yaml
+verifier:
+  runtime:
+    env:
+      SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
+      SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL: "1"
+      SGLANG_DECOUPLED_VERIFY_THROUGHPUT_PROFILE_PATH: /path/to/profile.json
+  server_args:
+    disable_overlap_schedule: false
+    speculative_num_steps: 6
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 7
+    speculative_adaptive: true
+    speculative_adaptive_config: /path/to/adaptive.json
+
+drafter:
+  runtime:
+    env:
+      SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
+  server_args:
+    disable_overlap_schedule: false
+    speculative_num_steps: 6
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 7
+```
+
+- **Adaptive K**：`speculative_adaptive=true` 让 verifier 在配置的候选 K 中动态选择。
+  正式实验必须先生成完整的 scheduler-cycle cost profile，并同时保存 profile、adaptive
+  配置和 SHA-256。它调整的是 verifier 的 active K，不会在线改变模型、TP 或 fleet
+  topology。
+- **Partial draft tail**：`SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL` 默认为 `"1"`。
+  设为 `"0"` 时，verifier 的 GPU selector 会等待所有 live request 都取得当前 active K
+  个可消费 draft tokens，并等待 pending committed prefix 完成；snapshot shape 不变。
+- **C++/Python transport**：`SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND="1"` 使用 C++
+  threads/libzmq，`"0"` 使用 Python threads/pyzmq。两种 transport 使用相同的 wire
+  codec 和 native GPU backend，允许 Python/C++ peer 混合部署；Python transport 仍需要
+  编译 GPU extension。
+- **Verifier/drafter overlap**：两个 role 分别设置 `disable_overlap_schedule`。两边都为
+  `false` 即 dual overlap，也可以只开启一侧。当前 drafter overlap 要求 TP1、
+  `page_size=1`、shared GPU backend、`disable_radix_cache=true`，并且不能启用 mixed
+  chunked prefill 或 ReplaySSM。
+
+Verifier 和 drafter 必须使用相同的 K、top-k 和 K+1 verify-token width。Adaptive 模式下，
+YAML 中的 K 是最大捕获宽度，运行时 active K 只能从已配置且已 profile 的候选值中选择。
+
+### 3.3 Client 和 Observer
 
 Client YAML 定义 tokenizer、dataset、chat template、batch 和 generation 参数。
 Observer YAML 定义采样周期、HTTP timeout 和 `/v1/loads` 字段组；正式运行时通过
 `--server-manifest` 展开 target 或 verifier/drafter engine，静态 URL 只用于本地检查。
 
-### 3.3 具体实验输入
+### 3.4 具体实验输入
 
 `configs/experiments/` 和 `configs/matrix/` 是保留为 untracked 的本地运行输入区。正式运行前，
 Campaign Skill 会把输入 YAML、所有引用配置、materialized cases、ledger 和 SHA-256
@@ -241,8 +290,12 @@ RUN_DIR/
 要求修改，否则不得扩展、重命名或恢复旧 client 结果文件。
 
 HTTP readiness 本身不能证明 speculative path 生效。正式结果必须同时满足
-`spec_verify_ct > 0`、请求 cardinality 完整、两侧 formal waiting queue 为零，并且
-Observer 覆盖 baseline、formal window 和 trailing sample。
+`spec_verify_ct > 0`、请求 cardinality 完整，并且 Observer 覆盖 baseline、formal
+window 和 trailing sample。Client 发流量前要求所有 engine 都有零 waiting queue 的
+baseline。固定 BS 吞吐只检查首个请求退出前的满 BS decode measurement window：该窗口内
+verifier 和 drafter 的 `num_waiting_reqs` 必须为零；prefill/batch-fill 和窗口结束后的 drain
+阶段允许排队。缺少完整满 BS decode window 或窗口内 queue sample 时，不能把结果判为有效
+吞吐数据。
 
 `RUNTIME_DIR` 中的 manifest、status、resolved config 和 Server logs 只服务运行期，
 不属于 benchmark 交付物，实验结束后可以删除。
@@ -262,9 +315,16 @@ benchmark/decoupled_spec/skills/<skill-name>/
 | `operate-decoupled-spec-servers` | 校验、启动、检查和停止统一 fleet |
 | `send-decoupled-spec-workload` | 检查并提交一个 streaming batch |
 | `observe-decoupled-spec-run` | 采集和验证所有 engine 的 HTTP 时间序列 |
+| `profile-decoupled-spec-verifier` | 生成和校验 adaptive verifier 使用的 cost profile |
 | `run-decoupled-spec-benchmark` | 完成一个 case 的全部生命周期 |
 | `run-decoupled-spec-campaign` | 展开、恢复、运行和汇总多个 case |
 | `analyze-decoupled-spec-results` | 从一个已保存 RUN_DIR 生成标准图和报告 |
+
+通常直接使用 `run-decoupled-spec-benchmark` 完成单个 case；它串联 fleet readiness、
+Observer baseline、Client、trailing sample、停止 owned processes、校验、绘图和报告。
+多个模型、K、schedule mode 或 batch size 使用 `run-decoupled-spec-campaign` 物化 case、
+记录可恢复 ledger，并逐个执行相同生命周期。因此 Agent 可以从统一配置完成整个实验流程，
+而不是只启动 server 或只发送 Client 请求。
 
 ## 8. 临时分析
 
