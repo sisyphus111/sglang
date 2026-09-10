@@ -41,6 +41,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import logging
+import math
 import mmap
 import os
 import struct
@@ -145,6 +146,256 @@ class SpeculativeMetrics(msgspec.Struct, array_like=True):
     proposed_draft_length: float = 0.0
 
 
+class IntegerHistogram(msgspec.Struct, array_like=True, frozen=True):
+    """Compact histogram over consecutive integer values.
+
+    ``counts[index]`` represents ``offset + index``. Values outside that
+    range remain visible through the underflow/overflow counters.
+    """
+
+    offset: int
+    counts: list[int]
+    underflow_count: int = 0
+    overflow_count: int = 0
+
+
+class LatencyHistogram(msgspec.Struct, array_like=True, frozen=True):
+    """Mergeable role-local latency histogram reported by the native plane.
+
+    Bucket counts are non-cumulative. The final count is the overflow bucket,
+    so its length is exactly one greater than ``bucket_upper_bounds_us``.
+    """
+
+    count: int
+    sum_us: int
+    bucket_upper_bounds_us: list[int]
+    bucket_counts: list[int]
+
+    @classmethod
+    def from_dict(cls, value: Optional[dict]) -> Optional[LatencyHistogram]:
+        if value is None:
+            return None
+        histogram = cls(
+            count=int(value.get("count", 0)),
+            sum_us=int(value.get("sum_us", 0)),
+            bucket_upper_bounds_us=[
+                int(bound) for bound in value.get("bucket_upper_bounds_us", ())
+            ],
+            bucket_counts=[
+                int(bucket_count) for bucket_count in value.get("bucket_counts", ())
+            ],
+        )
+        if len(histogram.bucket_counts) != len(histogram.bucket_upper_bounds_us) + 1:
+            raise RuntimeError(
+                "Decoupled-spec latency histogram must include one overflow bucket: "
+                f"bounds={len(histogram.bucket_upper_bounds_us)} "
+                f"counts={len(histogram.bucket_counts)}"
+            )
+        if (
+            histogram.count < 0
+            or histogram.sum_us < 0
+            or any(count < 0 for count in histogram.bucket_counts)
+            or any(bound < 0 for bound in histogram.bucket_upper_bounds_us)
+            or any(
+                left >= right
+                for left, right in zip(
+                    histogram.bucket_upper_bounds_us,
+                    histogram.bucket_upper_bounds_us[1:],
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Decoupled-spec latency histogram values must be non-negative "
+                "with strictly increasing bounds."
+            )
+        if sum(histogram.bucket_counts) != histogram.count:
+            raise RuntimeError(
+                "Decoupled-spec latency histogram count disagrees with its buckets: "
+                f"count={histogram.count} buckets={sum(histogram.bucket_counts)}"
+            )
+        return histogram
+
+
+class DraftTailSelectMetrics(msgspec.Struct, array_like=True, frozen=True):
+    """Verifier GPU-tail selector counters for one decode window."""
+
+    num_select_rows: int
+    num_select_valid_rows: int
+    reason_counts: dict[str, int]
+    selected_draft_length_histogram: IntegerHistogram
+    raw_draft_tail_length_histogram: IntegerHistogram
+    consumable_draft_tail_length_histogram: IntegerHistogram
+    logical_delta_histogram: IntegerHistogram
+    pending_prefix_length_histogram: IntegerHistogram
+    num_publish_seq_initial: int = 0
+    num_publish_seq_same: int = 0
+    num_publish_seq_advance: int = 0
+    num_pending_prefix_fast_forwards: int = 0
+    num_protocol_errors: int = 0
+    num_seqlock_retry_rows: int = 0
+    num_seqlock_retries: int = 0
+    max_seqlock_retries: int = 0
+
+
+class DraftTransportMetrics(msgspec.Struct, array_like=True, frozen=True):
+    """Role-local draft-result transport counters for one decode window."""
+
+    num_draft_result_frames: int
+    num_draft_result_tokens: int
+    draft_send_queue_latency_us: Optional[LatencyHistogram] = None
+    draft_send_queue_depth_max: Optional[int] = None
+    draft_receive_to_gpu_publish_enqueue_latency_us: Optional[LatencyHistogram] = None
+    draft_gpu_publish_completion_latency_us: Optional[LatencyHistogram] = None
+    draft_transport_one_way_latency_us: Optional[LatencyHistogram] = None
+    draft_result_ready_to_receive_latency_us: Optional[LatencyHistogram] = None
+    gpu_publish_staging_slots_max: Optional[int] = None
+    clock_sync_valid: Optional[bool] = None
+    clock_error_bound_us: Optional[float] = None
+    num_clock_sync_valid_peers: Optional[int] = None
+    num_clock_sync_invalid_peers: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, value: dict) -> DraftTransportMetrics:
+        """Validate and freeze one native exchange window without quantiles."""
+
+        metrics = cls(
+            num_draft_result_frames=int(value.get("num_draft_result_frames", 0)),
+            num_draft_result_tokens=int(value.get("num_draft_result_tokens", 0)),
+            draft_send_queue_latency_us=LatencyHistogram.from_dict(
+                value.get("draft_send_queue_latency_us")
+            ),
+            draft_send_queue_depth_max=(
+                None
+                if value.get("draft_send_queue_depth_max") is None
+                else int(value["draft_send_queue_depth_max"])
+            ),
+            draft_receive_to_gpu_publish_enqueue_latency_us=(
+                LatencyHistogram.from_dict(
+                    value.get("draft_receive_to_gpu_publish_enqueue_latency_us")
+                )
+            ),
+            draft_gpu_publish_completion_latency_us=LatencyHistogram.from_dict(
+                value.get("draft_gpu_publish_completion_latency_us")
+            ),
+            draft_transport_one_way_latency_us=LatencyHistogram.from_dict(
+                value.get("draft_transport_one_way_latency_us")
+            ),
+            draft_result_ready_to_receive_latency_us=LatencyHistogram.from_dict(
+                value.get("draft_result_ready_to_receive_latency_us")
+            ),
+            gpu_publish_staging_slots_max=(
+                None
+                if value.get("gpu_publish_staging_slots_max") is None
+                else int(value["gpu_publish_staging_slots_max"])
+            ),
+            clock_sync_valid=(
+                None
+                if value.get("clock_sync_valid") is None
+                else bool(value["clock_sync_valid"])
+            ),
+            clock_error_bound_us=(
+                None
+                if value.get("clock_error_bound_us") is None
+                else float(value["clock_error_bound_us"])
+            ),
+            num_clock_sync_valid_peers=(
+                None
+                if value.get("num_clock_sync_valid_peers") is None
+                else int(value["num_clock_sync_valid_peers"])
+            ),
+            num_clock_sync_invalid_peers=(
+                None
+                if value.get("num_clock_sync_invalid_peers") is None
+                else int(value["num_clock_sync_invalid_peers"])
+            ),
+        )
+        if (
+            metrics.num_draft_result_frames < 0
+            or metrics.num_draft_result_tokens < 0
+            or (
+                metrics.draft_send_queue_depth_max is not None
+                and metrics.draft_send_queue_depth_max < 0
+            )
+            or (
+                metrics.gpu_publish_staging_slots_max is not None
+                and metrics.gpu_publish_staging_slots_max < 0
+            )
+            or (
+                metrics.clock_error_bound_us is not None
+                and (
+                    not math.isfinite(metrics.clock_error_bound_us)
+                    or metrics.clock_error_bound_us < 0
+                )
+            )
+            or (
+                metrics.num_clock_sync_valid_peers is not None
+                and metrics.num_clock_sync_valid_peers < 0
+            )
+            or (
+                metrics.num_clock_sync_invalid_peers is not None
+                and metrics.num_clock_sync_invalid_peers < 0
+            )
+        ):
+            raise RuntimeError(
+                "Decoupled-spec transport counters must be non-negative."
+            )
+        return metrics
+
+
+class DecoupledSpecDecodeMetrics(msgspec.Struct, array_like=True, frozen=True):
+    """One aligned decoupled-spec observability window."""
+
+    tail_select: Optional[DraftTailSelectMetrics] = None
+    transport: Optional[DraftTransportMetrics] = None
+    adaptive_verify: Optional[dict] = None
+
+
+def _decode_metrics_window_to_dict(window: DecodeMetricsWindow) -> dict:
+    value = msgspec.structs.asdict(window)
+    decoupled_spec = window.decoupled_spec
+    if decoupled_spec is None:
+        value.pop("decoupled_spec", None)
+        return value
+
+    decoupled_value = {
+        key: item
+        for key, item in msgspec.structs.asdict(decoupled_spec).items()
+        if item is not None
+    }
+    if decoupled_spec.tail_select is not None:
+        tail_select = decoupled_spec.tail_select
+        tail_value = msgspec.structs.asdict(tail_select)
+        for field in (
+            "selected_draft_length_histogram",
+            "raw_draft_tail_length_histogram",
+            "consumable_draft_tail_length_histogram",
+            "logical_delta_histogram",
+            "pending_prefix_length_histogram",
+        ):
+            tail_value[field] = msgspec.structs.asdict(getattr(tail_select, field))
+        decoupled_value["tail_select"] = tail_value
+    if decoupled_spec.transport is not None:
+        transport = decoupled_spec.transport
+        transport_value = {
+            key: item
+            for key, item in msgspec.structs.asdict(transport).items()
+            if item is not None
+        }
+        for field in (
+            "draft_send_queue_latency_us",
+            "draft_receive_to_gpu_publish_enqueue_latency_us",
+            "draft_gpu_publish_completion_latency_us",
+            "draft_transport_one_way_latency_us",
+            "draft_result_ready_to_receive_latency_us",
+        ):
+            histogram = getattr(transport, field)
+            if histogram is not None:
+                transport_value[field] = msgspec.structs.asdict(histogram)
+        decoupled_value["transport"] = transport_value
+    value["decoupled_spec"] = decoupled_value
+    return value
+
+
 class DecodeMetricsWindow(msgspec.Struct, array_like=True, frozen=True):
     """One fixed-iteration decode window exposed through ``/v1/loads``."""
 
@@ -161,6 +412,7 @@ class DecodeMetricsWindow(msgspec.Struct, array_like=True, frozen=True):
     num_proposed_drafts: int = 0
     accept_length: Optional[float] = None
     proposed_draft_length: Optional[float] = None
+    decoupled_spec: Optional[DecoupledSpecDecodeMetrics] = None
 
 
 class LoRAMetrics(msgspec.Struct, array_like=True):
@@ -243,7 +495,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
         load = {key: getattr(self, key) for key in _CORE_KEYS}
         if self.decode_metrics_windows is not None:
             load["decode_metrics_windows"] = [
-                msgspec.structs.asdict(window) for window in self.decode_metrics_windows
+                _decode_metrics_window_to_dict(window)
+                for window in self.decode_metrics_windows
             ]
 
         if include is None or "all" in include:
@@ -298,7 +551,9 @@ MAGIC = b"SLNS"
 VERSION = 2
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
-SLOT_SIZE = 16 * 1024
+# A full 64-window history includes selector, transport, and adaptive-decision
+# telemetry. Keep one bounded slot per DP rank rather than dropping fields.
+SLOT_SIZE = 512 * 1024
 
 
 @contextmanager
@@ -381,11 +636,11 @@ class ShmLoadSnapshotWriter:
         offset = slot_offset(self.dp_rank, self.slot_size)
         payload_start = offset + SLOT_LEN_STRUCT.size
         payload_end = payload_start + len(payload)
-        slot_end = offset + self.slot_size
 
         SLOT_LEN_STRUCT.pack_into(self.mmap, offset, 0)
         self.mmap[payload_start:payload_end] = payload
-        self.mmap[payload_end:slot_end] = b"\0" * (slot_end - payload_end)
+        # The length prefix is authoritative. Do not clear the unused tail:
+        # publication cost must scale with payload bytes, not slot capacity.
         SLOT_LEN_STRUCT.pack_into(self.mmap, offset, len(payload))
 
     def close(self) -> None:

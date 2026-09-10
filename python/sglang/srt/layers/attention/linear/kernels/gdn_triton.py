@@ -56,6 +56,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: fuse QKV extraction + gating + recurrent
@@ -78,6 +79,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
             decode kernel output layout.
         """
         B = mixed_qkv.shape[0]
+        if final_state_indices is None:
+            final_state_indices = cache_indices
         # Packed kernel expects output shape [B, 1, HV, V]
         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
 
@@ -99,6 +102,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
+            if final_state_indices is not cache_indices and not torch.equal(
+                final_state_indices, cache_indices
+            ):
+                raise NotImplementedError(
+                    "ReplaySSM decode does not support distinct state src/dst slots"
+                )
             fused_recurrent_gdn_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -128,6 +137,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=ssm_states,
             out=out,
             ssm_state_indices=cache_indices,
+            final_state_indices=final_state_indices,
             use_qk_l2norm_in_kernel=True,
         )
 
@@ -148,8 +158,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
+        if final_state_indices is None:
+            final_state_indices = cache_indices
+        if is_npu() or is_cpu():
+            if final_state_indices is not cache_indices and not torch.equal(
+                final_state_indices, cache_indices
+            ):
+                raise NotImplementedError(
+                    "GDN state routing with different src/dst slots is only "
+                    "supported by CUDA Triton decode"
+                )
+            state_route_kwargs = {}
+        else:
+            state_route_kwargs = {"final_state_indices": final_state_indices}
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -164,6 +188,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            **state_route_kwargs,
         )
 
     def extend(

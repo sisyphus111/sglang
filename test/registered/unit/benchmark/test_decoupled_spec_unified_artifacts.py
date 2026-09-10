@@ -1,4 +1,4 @@
-"""CPU tests for unified decoupled-spec manifest artifact contracts."""
+"""CPU tests for unified decoupled-spec server and observer contracts."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 _ROOT = Path(__file__).resolve().parents[4] / "benchmark" / "decoupled_spec"
 sys.path.insert(0, str(_ROOT))
 
-from common.collector import _summarize_decode_metric_windows
+from client.observer import _summarize_decode_metric_windows
 
 
 def _load_script(name: str, path: Path):
@@ -29,10 +29,6 @@ def _load_script(name: str, path: Path):
     return module
 
 
-_audit = _load_script(
-    "decoupled_spec_unified_audit",
-    _ROOT / "skills" / "audit-decoupled-spec-artifacts" / "scripts" / "audit_run.py",
-)
 _wait = _load_script(
     "decoupled_spec_unified_wait",
     _ROOT
@@ -48,11 +44,27 @@ def _engines() -> list[dict]:
     for role, count in (("verifier", 2), ("drafter", 1)):
         for rank in range(count):
             engine_id = f"{role}-{rank}"
+            gpu_id = str(len(values))
             values.append(
                 {
                     "engine_id": engine_id,
                     "role": role,
                     "rank": rank,
+                    "node_id": "mock-node",
+                    "node_ip": "127.0.0.1",
+                    "tp_size": 1,
+                    "gpu_ids": [gpu_id],
+                    "nnodes": 1,
+                    "rank_placements": [
+                        {
+                            "tp_rank": 0,
+                            "node_rank": 0,
+                            "local_gpu_index": 0,
+                            "node_id": "mock-node",
+                            "node_ip": "127.0.0.1",
+                            "gpu_id": gpu_id,
+                        }
+                    ],
                     "http_url": f"http://127.0.0.1:{30000 + len(values)}",
                     "transport_endpoint": f"tcp://127.0.0.1:{31000 + len(values)}",
                     "resolved_config_path": (
@@ -60,6 +72,19 @@ def _engines() -> list[dict]:
                     ),
                     "status_path": f"server/engines/{engine_id}/status.json",
                     "log_path": f"logs/server/{engine_id}.log",
+                    "node_actors": [
+                        {
+                            "node_rank": 0,
+                            "node_id": "mock-node",
+                            "node_ip": "127.0.0.1",
+                            "gpu_ids": [gpu_id],
+                            "resolved_config_path": (
+                                f"server/engines/{engine_id}/resolved_config.json"
+                            ),
+                            "status_path": (f"server/engines/{engine_id}/status.json"),
+                            "log_path": f"logs/server/{engine_id}.log",
+                        }
+                    ],
                 }
             )
     return values
@@ -70,7 +95,7 @@ def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-class TestUnifiedArtifactIdentity(CustomTestCase):
+class TestUnifiedServerObserverContracts(CustomTestCase):
     def _write_identity_artifacts(self, run_dir: Path, state: str) -> list[dict]:
         engines = _engines()
         _write_json(
@@ -82,52 +107,7 @@ class TestUnifiedArtifactIdentity(CustomTestCase):
                 "engines": engines,
             },
         )
-        selected = engines[1]
-        _write_json(
-            run_dir / "client" / "resolved_config.json",
-            {
-                "server": {
-                    "target_id": selected["engine_id"],
-                    "role": selected["role"],
-                    "rank": selected["rank"],
-                    "base_url": selected["http_url"],
-                }
-            },
-        )
-        _write_json(
-            run_dir / "observability" / "resolved_config.json",
-            {
-                "targets": {
-                    engine["engine_id"]: {
-                        "target_id": engine["engine_id"],
-                        "role": engine["role"],
-                        "rank": engine["rank"],
-                        "base_url": engine["http_url"],
-                    }
-                    for engine in engines
-                }
-            },
-        )
         return engines
-
-    def test_audit_closes_manifest_client_collector_identity_chain(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run_dir = Path(directory)
-            self._write_identity_artifacts(run_dir, "stopped")
-            errors = []
-            report = _audit._check_unified_consumer_identity(run_dir, errors)
-            self.assertEqual(errors, [])
-            self.assertEqual(report["engine_count"], 3)
-
-            client_path = run_dir / "client" / "resolved_config.json"
-            client = json.loads(client_path.read_text(encoding="utf-8"))
-            client["server"]["base_url"] = "http://wrong:1"
-            _write_json(client_path, client)
-            errors = []
-            _audit._check_unified_consumer_identity(run_dir, errors)
-            self.assertTrue(
-                any("selected verifier identity disagrees" in error for error in errors)
-            )
 
     def test_wait_gate_rejects_duplicate_manifest_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,6 +127,31 @@ class TestUnifiedArtifactIdentity(CustomTestCase):
                     check_http=False,
                     http_timeout_s=0.1,
                 )
+
+    def test_legacy_wait_gate_reads_server_role_subdirectories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            for role in ("verifier", "drafter"):
+                _write_json(
+                    run_dir / "server" / role / "status.json",
+                    {"state": "http_ready", "pid": 1234},
+                )
+
+            report = _wait.wait_for_roles(
+                run_dir,
+                ["verifier", "drafter"],
+                timeout_s=1.0,
+                poll_interval_s=0.01,
+                check_http=False,
+                http_timeout_s=0.1,
+            )
+
+        self.assertTrue(report["ready"])
+        self.assertTrue(
+            report["roles"]["verifier"]["status_path"].endswith(
+                "server/verifier/status.json"
+            )
+        )
 
     def test_zero_window_summary_keeps_every_engine(self):
         targets = [
@@ -169,22 +174,6 @@ class TestUnifiedArtifactIdentity(CustomTestCase):
             by_role["verifier"]["target_ids"], ["verifier-0", "verifier-1"]
         )
         self.assertIsNone(by_role["drafter"]["scheduler_cycle_ms"]["mean"])
-
-    def test_missing_legacy_logs_warn_but_unified_engine_logs_fail(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run_dir = Path(directory)
-            errors = []
-            warnings = []
-            _audit._check_zero_waiting_queues(run_dir, errors, warnings)
-            self.assertEqual(errors, [])
-            self.assertEqual(len(warnings), 2)
-
-            self._write_identity_artifacts(run_dir, "stopped")
-            errors = []
-            warnings = []
-            _audit._check_zero_waiting_queues(run_dir, errors, warnings)
-            self.assertEqual(len(errors), 3)
-            self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

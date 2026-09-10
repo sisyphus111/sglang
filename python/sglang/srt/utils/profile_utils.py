@@ -323,6 +323,11 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 if not _is_npu
                 else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
             ),
+            experimental_config=(
+                torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                if not _is_npu
+                else None
+            ),
         )
         self.torch_profiler.start()
 

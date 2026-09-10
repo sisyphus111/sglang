@@ -1,557 +1,157 @@
+"""Python socket transport for the shared decoupled-spec GPU backend.
+
+The backend owns wire encoding, bounded queues, GPU landing/egress and request
+semantics. Python owns this transport's thread and pyzmq sockets. No Python token
+transcript or second GPU state machine is maintained here.
+"""
 from __future__ import annotations
 
-import logging
-import queue
 import threading
-from collections import deque
-from collections.abc import Callable, Sequence
-from itertools import chain
 
 import zmq
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.decoupled_spec_io import (
-    DecoupledSpecIpcConfig,
-    DraftClose,
-    DraftControlBatch,
-    DraftControlInbox,
-    DraftMeshMessage,
-    DraftMeshMessageType,
-    DraftSync,
-    DraftTailStreamOutput,
-    DraftTailStreamOutputBatch,
-    ReadyDraftControls,
-    VerifierCommitSegment,
-    VerifyCommit,
+from sglang.srt.speculative.cpp_decoupled_spec import (
+    CppDrafterDecoupledSpecDataPlane,
+    CppVerifierDecoupledSpecDataPlane,
 )
-from sglang.srt.speculative.draft_tail_buffer import (
-    DraftTailBuffer,
-    DraftTailSnapshot,
-)
-
-logger = logging.getLogger(__name__)
-
-_IDLE_WAIT_S = 0.0005
-_START_TIMEOUT_S = 5.0
+from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 
 
-class _BackgroundZmqTransport:
-    """Thread-owned ZMQ sockets with fail-fast lifecycle reporting."""
+class PythonZmqTransport:
+    """Own sockets on one Python thread; share the native GPU/codec backend."""
 
     def __init__(
         self,
-        *,
+        backend,
         config: DecoupledSpecIpcConfig,
         context: zmq.Context | None,
-        thread_name: str,
+        *,
+        role: str,
     ) -> None:
-        self.config = config
-        self._peer_endpoints = {
-            int(peer.rank): str(peer.endpoint) for peer in config.peers
-        }
-        self._owns_context = context is None
-        self._context = context if context is not None else zmq.Context()
+        self._backend = backend
+        self._config = config
+        self._context = context
+        if role not in ("verifier", "drafter"):
+            raise ValueError(f"Unknown decoupled-spec transport role: {role}")
+        self._role = role
         self._closed = threading.Event()
-        self._wakeup = threading.Event()
         self._ready = threading.Event()
-        self._thread_error: BaseException | None = None
-        self._started = False
-        self._thread = threading.Thread(
-            target=self._run_guarded,
-            name=thread_name,
-            daemon=True,
-        )
+        self._error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._send_sockets: dict[int, zmq.Socket] = {}
 
-    @property
-    def has_peers(self) -> bool:
-        return bool(self._peer_endpoints)
+    def __getattr__(self, name):
+        # Role APIs operate on the same backend queues as the socket thread.
+        self.raise_if_failed()
+        return getattr(self._backend, name)
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(
+                f"Decoupled-spec Python transport failed: {self._error}"
+            ) from self._error
 
     def start(self) -> None:
-        if self._started:
-            return
         if self._closed.is_set():
             raise RuntimeError("A closed decoupled-spec transport cannot be restarted")
-        self._started = True
+        if self._thread is not None:
+            self.raise_if_failed()
+            return
+        self._backend.start()  # External-I/O mode starts no native thread/socket.
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"dspec-python-{self._role}",
+            daemon=True,
+        )
         self._thread.start()
-        if not self._ready.wait(timeout=_START_TIMEOUT_S):
-            raise TimeoutError(
-                "Timed out starting decoupled-spec transport: "
-                f"bind_endpoint={self.config.bind_endpoint}"
-            )
+        if not self._ready.wait(5):
+            self.close()
+            raise TimeoutError("Timed out starting decoupled-spec Python transport")
         self.raise_if_failed()
 
     def close(self) -> None:
         self._closed.set()
-        self._wakeup.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                "Decoupled-spec transport thread did not stop: "
-                f"thread_name={self._thread.name}"
-            )
-        if self._owns_context:
-            self._context.destroy(linger=0)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                raise RuntimeError("Decoupled-spec Python transport did not stop")
+        self._backend.close()
 
-    def ensure_running(self) -> None:
-        if not self._started:
-            raise RuntimeError("Decoupled-spec transport has not been started")
-        if self._closed.is_set():
-            raise RuntimeError("Decoupled-spec transport is closed")
-        self.raise_if_failed()
-
-    def raise_if_failed(self) -> None:
-        if self._thread_error is not None:
-            raise RuntimeError(
-                "Decoupled-spec transport thread failed: "
-                f"thread_name={self._thread.name}"
-            ) from self._thread_error
-
-    def _run_guarded(self) -> None:
+    def _send(self, rank: int, frame: bytes) -> bool:
         try:
-            self._run()
-        except BaseException as exc:
-            self._thread_error = exc
-            self._ready.set()
-            logger.exception(
-                "Decoupled-spec transport thread failed: thread_name=%s",
-                self._thread.name,
-            )
+            self._send_sockets[rank].send(frame, flags=zmq.NOBLOCK)
+            return True
+        except zmq.Again:
+            return False
 
     def _run(self) -> None:
-        raise NotImplementedError
-
-    def _peer_endpoint(self, rank: int) -> str:
-        rank = int(rank)
-        endpoint = self._peer_endpoints.get(rank)
-        if endpoint is None:
-            raise RuntimeError(
-                "Missing decoupled-spec peer endpoint: "
-                f"peer_rank={rank} "
-                f"configured_peer_ranks={sorted(self._peer_endpoints)}"
-            )
-        return endpoint
-
-    @staticmethod
-    def _new_socket(context: zmq.Context, socket_type: int) -> zmq.Socket:
-        socket = context.socket(socket_type)
-        socket.setsockopt(zmq.LINGER, 0)
-        return socket
-
-
-class _VerifierTransport(_BackgroundZmqTransport):
-    def __init__(
-        self,
-        *,
-        config: DecoupledSpecIpcConfig,
-        draft_tail_buffer: DraftTailBuffer,
-        context: zmq.Context | None,
-    ) -> None:
-        super().__init__(
-            config=config,
-            context=context,
-            thread_name="sglang-decoupled-verifier-transport",
-        )
-        self._draft_tail_buffer = draft_tail_buffer
-        self._outgoing: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
-
-    def submit_control_batch(self, batch: DraftControlBatch) -> None:
-        self.ensure_running()
-        self._peer_endpoint(batch.dst_drafter_rank)
-        self._outgoing.put(batch)
-        self._wakeup.set()
-
-    def _run(self) -> None:
-        recv_socket = self._new_socket(self._context, zmq.PULL)
-        send_sockets: dict[int, zmq.Socket] = {}
+        context = self._context if self._context is not None else zmq.Context()
+        recv = None
         try:
-            recv_socket.bind(str(self.config.bind_endpoint))
-            for rank, endpoint in self._peer_endpoints.items():
-                socket = self._new_socket(self._context, zmq.PUSH)
-                socket.connect(str(endpoint))
-                send_sockets[rank] = socket
+            recv = context.socket(zmq.PULL)
+            recv.setsockopt(zmq.LINGER, 0)
+            recv.setsockopt(zmq.RCVHWM, 8192)
+            recv.setsockopt(zmq.RCVBUF, 512 * 1024 * 1024)
+            if "[" in self._config.bind_endpoint:
+                recv.setsockopt(zmq.IPV6, 1)
+            recv.bind(self._config.bind_endpoint)
+            for peer in self._config.peers:
+                socket = context.socket(zmq.PUSH)
+                self._send_sockets[int(peer.rank)] = socket
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.IMMEDIATE, 1)
+                socket.setsockopt(zmq.SNDHWM, 8192)
+                socket.setsockopt(zmq.SNDBUF, 512 * 1024 * 1024)
+                if "[" in peer.endpoint:
+                    socket.setsockopt(zmq.IPV6, 1)
+                socket.connect(peer.endpoint)
             self._ready.set()
-
-            pending: deque[DraftControlBatch] = deque()
+            backend = self._backend
+            send = self._send
             while not self._closed.is_set():
                 did_work = False
-                while True:
+                if self._role == "drafter":
+                    did_work = backend.poll_gpu_egress()
+                # Keep the queue front until send succeeds. A backpressured peer
+                # must not prevent incoming commits or GPU egress from progressing.
+                did_work = backend.send_pending(send) or did_work
+                for _ in range(64):
                     try:
-                        pending.append(self._outgoing.get_nowait())
-                    except queue.Empty:
-                        break
-
-                while pending:
-                    batch = pending[0]
-                    socket = send_sockets[int(batch.dst_drafter_rank)]
-                    try:
-                        socket.send_pyobj(
-                            DraftMeshMessage.from_control_batch(batch),
-                            flags=zmq.NOBLOCK,
-                        )
+                        frame = recv.recv(flags=zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    pending.popleft()
+                    if self._role == "verifier":
+                        backend.receive_frame(frame)
+                    else:
+                        backend.receive_frame(frame, send)
                     did_work = True
-
-                while True:
-                    try:
-                        message = recv_socket.recv_pyobj(flags=zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-                    if not isinstance(message, DraftMeshMessage):
-                        raise RuntimeError(
-                            f"Unexpected verifier transport message: {message!r}"
-                        )
-                    if (
-                        message.message_type
-                        != DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
-                        or message.tail_stream_output_batch is None
-                    ):
-                        raise RuntimeError(
-                            f"Unexpected verifier transport message: {message!r}"
-                        )
-                    self._draft_tail_buffer.append_draft_stream_batch(
-                        message.tail_stream_output_batch
-                    )
-                    did_work = True
-
+                if self._role == "verifier":
+                    did_work = backend.send_clock_probe(send) or did_work
                 if not did_work:
-                    self._wakeup.wait(timeout=_IDLE_WAIT_S)
-                    self._wakeup.clear()
+                    self._closed.wait(0.00005)
+        except BaseException as error:
+            self._error = error
         finally:
-            recv_socket.close(linger=0)
-            for socket in send_sockets.values():
-                socket.close(linger=0)
-
-
-class _DrafterTransport(_BackgroundZmqTransport):
-    def __init__(
-        self,
-        *,
-        config: DecoupledSpecIpcConfig,
-        context: zmq.Context | None,
-    ) -> None:
-        super().__init__(
-            config=config,
-            context=context,
-            thread_name="sglang-decoupled-drafter-transport",
-        )
-        self._outgoing: queue.SimpleQueue[tuple[int, DraftTailStreamOutputBatch]] = (
-            queue.SimpleQueue()
-        )
-        self._pending_lock = threading.Lock()
-        self._pending_controls: deque[DraftControlBatch] = deque()
-        self._control_ready = threading.Event()
-
-    def submit_tail_batch(
-        self, dst_verifier_rank: int, batch: DraftTailStreamOutputBatch
-    ) -> None:
-        self.ensure_running()
-        self._peer_endpoint(dst_verifier_rank)
-        self._outgoing.put((int(dst_verifier_rank), batch))
-        self._wakeup.set()
-
-    def drain_controls(self, max_batches: int | None = None) -> list[DraftControlBatch]:
-        self.ensure_running()
-        if max_batches is not None and int(max_batches) < 0:
-            raise ValueError(f"max_batches must be non-negative, got {max_batches}")
-        limit = None if max_batches is None else int(max_batches)
-        batches: list[DraftControlBatch] = []
-        with self._pending_lock:
-            while self._pending_controls and (limit is None or len(batches) < limit):
-                batches.append(self._pending_controls.popleft())
-            if not self._pending_controls:
-                self._control_ready.clear()
-        return batches
-
-    def pending_control_count(self) -> int:
-        self.raise_if_failed()
-        with self._pending_lock:
-            return len(self._pending_controls)
-
-    def wait_for_control(self, timeout_s: float) -> bool:
-        self.ensure_running()
-        if self.pending_control_count() > 0:
-            return True
-        return self._control_ready.wait(timeout=max(0.0, float(timeout_s)))
-
-    def _run(self) -> None:
-        recv_socket = self._new_socket(self._context, zmq.PULL)
-        send_sockets: dict[int, zmq.Socket] = {}
-        try:
-            recv_socket.bind(str(self.config.bind_endpoint))
-            for rank, endpoint in self._peer_endpoints.items():
-                socket = self._new_socket(self._context, zmq.PUSH)
-                socket.connect(str(endpoint))
-                send_sockets[rank] = socket
             self._ready.set()
-
-            pending: deque[tuple[int, DraftTailStreamOutputBatch]] = deque()
-            while not self._closed.is_set():
-                did_work = False
-                while True:
-                    try:
-                        pending.append(self._outgoing.get_nowait())
-                    except queue.Empty:
-                        break
-
-                while pending:
-                    dst_verifier_rank, batch = pending[0]
-                    socket = send_sockets[dst_verifier_rank]
-                    try:
-                        socket.send_pyobj(
-                            DraftMeshMessage.from_tail_stream_output_batch(batch),
-                            flags=zmq.NOBLOCK,
-                        )
-                    except zmq.Again:
-                        break
-                    pending.popleft()
-                    did_work = True
-
-                while True:
-                    try:
-                        message = recv_socket.recv_pyobj(flags=zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-                    if not isinstance(message, DraftMeshMessage):
-                        raise RuntimeError(
-                            f"Unexpected drafter transport message: {message!r}"
-                        )
-                    if (
-                        message.message_type != DraftMeshMessageType.CONTROL_BATCH
-                        or message.control_batch is None
-                    ):
-                        raise RuntimeError(
-                            f"Unexpected drafter transport message: {message!r}"
-                        )
-                    if int(message.control_batch.dst_drafter_rank) != int(
-                        self.config.rank
-                    ):
-                        raise RuntimeError(
-                            "Draft control batch targets a different drafter: "
-                            f"expected_drafter_rank={self.config.rank} "
-                            f"dst_drafter_rank="
-                            f"{message.control_batch.dst_drafter_rank}"
-                        )
-                    with self._pending_lock:
-                        self._pending_controls.append(message.control_batch)
-                        self._control_ready.set()
-                    did_work = True
-
-                if not did_work:
-                    self._wakeup.wait(timeout=_IDLE_WAIT_S)
-                    self._wakeup.clear()
-        finally:
-            recv_socket.close(linger=0)
-            for socket in send_sockets.values():
+            for socket in self._send_sockets.values():
                 socket.close(linger=0)
+            if recv is not None:
+                recv.close(linger=0)
+            if self._context is None:
+                context.destroy(linger=0)
 
 
-class VerifierDecoupledSpecDataPlane:
-    """Composition-facing verifier data plane.
+class VerifierDecoupledSpecDataPlane(CppVerifierDecoupledSpecDataPlane):
+    """Shared verifier GPU backend driven by Python sockets."""
 
-    Control submission updates the local authoritative tail synchronously before
-    the same batch is queued for the background ZMQ sender.
-    """
-
-    def __init__(
-        self,
-        config: DecoupledSpecIpcConfig,
-        *,
-        required_tail_len: int = 0,
-        context: zmq.Context | None = None,
-    ) -> None:
-        self.config = config
-        self.draft_tail_buffer = DraftTailBuffer(
-            verifier_rank=int(config.rank), required_tail_len=required_tail_len
-        )
-        self._transport = _VerifierTransport(
-            config=config,
-            draft_tail_buffer=self.draft_tail_buffer,
-            context=context,
-        )
-
-    def start(self) -> None:
-        self._transport.start()
-
-    def close(self) -> None:
-        try:
-            self._transport.close()
-        finally:
-            self.draft_tail_buffer.close()
-
-    def submit_control_batch(self, batch: DraftControlBatch) -> None:
-        self._transport.ensure_running()
-        self._validate_control_batch(batch)
-        # This ordering is the verifier-side linearization point used by both
-        # non-overlap and overlap snapshot selection.
-        self.draft_tail_buffer.apply_control_batch(batch)
-        self._transport.submit_control_batch(batch)
-
-    def open_request(self, message: DraftSync) -> None:
-        self.submit_control_batch(
-            DraftControlBatch(
-                dst_drafter_rank=int(message.dst_drafter_rank),
-                sync_messages=[message],
-            )
-        )
-
-    def commit(self, message: VerifyCommit) -> None:
-        self.submit_control_batch(
-            DraftControlBatch(
-                dst_drafter_rank=int(message.dst_drafter_rank),
-                verify_commit_messages=[message],
-            )
-        )
-
-    def close_request(self, message: DraftClose) -> None:
-        self.submit_control_batch(
-            DraftControlBatch(
-                dst_drafter_rank=int(message.dst_drafter_rank),
-                close_messages=[message],
-            )
-        )
-
-    def snapshot(
-        self,
-        request_ids: Sequence[str] | str,
-        *,
-        allow_partial: bool = True,
-        max_tail_len: int | None = None,
-        timeout_s: float | None = None,
-    ) -> list[DraftTailSnapshot]:
-        """Return one immutable snapshot row per request, in input order."""
-
-        self._transport.ensure_running()
-        if isinstance(request_ids, str):
-            request_ids = [request_ids]
-        return self.draft_tail_buffer.get_draft_snapshots(
-            request_ids,
-            allow_partial=allow_partial,
-            max_tail_len=max_tail_len,
-            timeout_s=timeout_s,
-        )
-
-    def snapshot_one(
-        self,
-        request_id: str,
-        *,
-        allow_partial: bool = True,
-        max_tail_len: int | None = None,
-        timeout_s: float | None = None,
-    ) -> DraftTailSnapshot:
-        return self.snapshot(
-            [request_id],
-            allow_partial=allow_partial,
-            max_tail_len=max_tail_len,
-            timeout_s=timeout_s,
-        )[0]
-
-    def snapshot_many(
-        self,
-        request_ids: Sequence[str],
-        *,
-        allow_partial: bool = True,
-        max_tail_len: int | None = None,
-        timeout_s: float | None = None,
-    ) -> list[DraftTailSnapshot]:
-        return self.snapshot(
-            request_ids,
-            allow_partial=allow_partial,
-            max_tail_len=max_tail_len,
-            timeout_s=timeout_s,
-        )
-
-    def _validate_control_batch(self, batch: DraftControlBatch) -> None:
-        dst_drafter_rank = int(batch.dst_drafter_rank)
-        self._transport._peer_endpoint(dst_drafter_rank)
-        messages = chain(
-            batch.sync_messages,
-            batch.verify_commit_messages,
-            batch.close_messages,
-        )
-        for message in messages:
-            if int(message.src_verifier_rank) != int(self.config.rank):
-                raise RuntimeError(
-                    "Verifier control source rank mismatch: "
-                    f"expected_verifier_rank={self.config.rank} "
-                    f"src_verifier_rank={message.src_verifier_rank}"
-                )
-            if int(message.dst_drafter_rank) != dst_drafter_rank:
-                raise RuntimeError(
-                    "Verifier control destination rank mismatch: "
-                    f"batch_drafter_rank={dst_drafter_rank} "
-                    f"message_drafter_rank={message.dst_drafter_rank}"
-                )
+    _python_transport = True
 
 
-class DrafterDecoupledSpecDataPlane:
-    """Composition-facing drafter control inbox and tail publisher."""
+class DrafterDecoupledSpecDataPlane(CppDrafterDecoupledSpecDataPlane):
+    """Shared drafter backend driven by Python sockets."""
 
-    def __init__(
-        self,
-        config: DecoupledSpecIpcConfig,
-        *,
-        context: zmq.Context | None = None,
-    ) -> None:
-        self.config = config
-        self._transport = _DrafterTransport(config=config, context=context)
-        self._control_inbox = DraftControlInbox()
-
-    def start(self) -> None:
-        self._transport.start()
-
-    def close(self) -> None:
-        self._transport.close()
-
-    def drain_controls(self, max_batches: int | None = None) -> list[DraftControlBatch]:
-        """Remove received control batches in their original wire order."""
-
-        return self._transport.drain_controls(max_batches=max_batches)
-
-    def pending_control_count(self) -> int:
-        return (
-            self._transport.pending_control_count()
-            + self._control_inbox.pending_control_count()
-        )
-
-    def wait_for_control(self, timeout_s: float) -> bool:
-        if self._control_inbox.pending_control_count() > 0:
-            return True
-        return self._transport.wait_for_control(timeout_s)
-
-    def collect_ready_controls(
-        self,
-        consumable_commit_len: Callable[[VerifierCommitSegment], int],
-    ) -> ReadyDraftControls:
-        """Coalesce wire commits per request and consume each ready prefix."""
-
-        for batch in self._transport.drain_controls():
-            self._control_inbox.add_control_batch_locked(batch)
-        return self._control_inbox.extract_ready_controls_locked(consumable_commit_len)
-
-    def publish_tail(self, output: DraftTailStreamOutput) -> None:
-        self.publish_tails(DraftTailStreamOutputBatch(outputs=[output]))
-
-    def publish_tails(self, batch: DraftTailStreamOutputBatch) -> None:
-        self._transport.ensure_running()
-        batches_by_verifier: dict[int, DraftTailStreamOutputBatch] = {}
-        for output in batch.outputs:
-            if int(output.src_drafter_rank) != int(self.config.rank):
-                raise RuntimeError(
-                    "Draft tail source rank mismatch: "
-                    f"expected_drafter_rank={self.config.rank} "
-                    f"src_drafter_rank={output.src_drafter_rank}"
-                )
-            dst_verifier_rank = int(output.dst_verifier_rank)
-            self._transport._peer_endpoint(dst_verifier_rank)
-            batches_by_verifier.setdefault(
-                dst_verifier_rank, DraftTailStreamOutputBatch()
-            ).outputs.append(output)
-
-        for dst_verifier_rank, verifier_batch in batches_by_verifier.items():
-            self._transport.submit_tail_batch(dst_verifier_rank, verifier_batch)
+    _python_transport = True
 
 
 def create_verifier_decoupled_spec_data_plane(
@@ -563,27 +163,24 @@ def create_verifier_decoupled_spec_data_plane(
     num_gpu_seats: int | None = None,
     num_draft_tokens: int | None = None,
     landing_stream=None,
+    mock_profile: bool = False,
 ):
     """Create the configured verifier data plane behind one role contract."""
 
-    if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
-        from sglang.srt.speculative.cpp_decoupled_spec import (
-            CppVerifierDecoupledSpecDataPlane,
-        )
-
-        return CppVerifierDecoupledSpecDataPlane(
-            config,
-            required_tail_len=required_tail_len,
-            context=context,
-            device=device,
-            num_gpu_seats=num_gpu_seats,
-            num_draft_tokens=num_draft_tokens,
-            landing_stream=landing_stream,
-        )
-    return VerifierDecoupledSpecDataPlane(
+    plane_type = (
+        CppVerifierDecoupledSpecDataPlane
+        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+        else VerifierDecoupledSpecDataPlane
+    )
+    return plane_type(
         config,
         required_tail_len=required_tail_len,
         context=context,
+        device=device,
+        num_gpu_seats=num_gpu_seats,
+        num_draft_tokens=num_draft_tokens,
+        landing_stream=landing_stream,
+        mock_profile=mock_profile,
     )
 
 
@@ -591,13 +188,25 @@ def create_drafter_decoupled_spec_data_plane(
     config: DecoupledSpecIpcConfig,
     *,
     context: zmq.Context | None = None,
+    device=None,
+    num_gpu_seats: int | None = None,
+    num_draft_tokens: int | None = None,
+    pending_token_capacity: int | None = None,
+    landing_stream=None,
 ):
     """Create the configured drafter data plane behind one role contract."""
 
-    if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
-        from sglang.srt.speculative.cpp_decoupled_spec import (
-            CppDrafterDecoupledSpecDataPlane,
-        )
-
-        return CppDrafterDecoupledSpecDataPlane(config, context=context)
-    return DrafterDecoupledSpecDataPlane(config, context=context)
+    plane_type = (
+        CppDrafterDecoupledSpecDataPlane
+        if envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get()
+        else DrafterDecoupledSpecDataPlane
+    )
+    return plane_type(
+        config,
+        context=context,
+        device=device,
+        num_gpu_seats=num_gpu_seats,
+        num_draft_tokens=num_draft_tokens,
+        pending_token_capacity=pending_token_capacity,
+        landing_stream=landing_stream,
+    )

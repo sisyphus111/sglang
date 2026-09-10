@@ -24,7 +24,7 @@ def _role_url(run_dir: Path, role: str, status: dict[str, Any]) -> str | None:
     host = status.get("host")
     port = status.get("port")
     if host is None or port is None:
-        config = _read_json(run_dir / "roles" / role / "resolved_config.json") or {}
+        config = _read_json(run_dir / "server" / role / "resolved_config.json") or {}
         server_args = config.get("server_args", {})
         if isinstance(server_args, dict):
             host = server_args.get("host")
@@ -85,6 +85,7 @@ def wait_for_roles(
                 targets = {}
                 seen_roles = set()
                 seen_role_ranks = set()
+                physical_gpu_owners = set()
                 for engine in engines:
                     if not isinstance(engine, dict):
                         raise RuntimeError(
@@ -108,11 +109,49 @@ def wait_for_roles(
                         )
                     seen_role_ranks.add((role, rank))
                     seen_roles.add(role)
+                    tp_size = engine.get("tp_size")
+                    node_actors = engine.get("node_actors")
+                    rank_placements = engine.get("rank_placements")
+                    if (
+                        type(tp_size) is not int
+                        or tp_size <= 0
+                        or not isinstance(node_actors, list)
+                        or not node_actors
+                        or not isinstance(rank_placements, list)
+                        or len(rank_placements) != tp_size
+                    ):
+                        raise RuntimeError(
+                            f"invalid unified server Engine placement: {engine!r}"
+                        )
+                    for expected_node_rank, node_actor in enumerate(node_actors):
+                        if (
+                            not isinstance(node_actor, dict)
+                            or node_actor.get("node_rank") != expected_node_rank
+                            or not isinstance(node_actor.get("gpu_ids"), list)
+                            or not node_actor["gpu_ids"]
+                        ):
+                            raise RuntimeError(
+                                f"invalid Engine node actor: {node_actor!r}"
+                            )
+                        for gpu_id in node_actor["gpu_ids"]:
+                            owner = (node_actor.get("node_id"), str(gpu_id))
+                            if owner in physical_gpu_owners:
+                                raise RuntimeError(f"GPU placement is reused: {owner}")
+                            physical_gpu_owners.add(owner)
+                    for tp_rank, placement in enumerate(rank_placements):
+                        if (
+                            not isinstance(placement, dict)
+                            or placement.get("tp_rank") != tp_rank
+                        ):
+                            raise RuntimeError(
+                                f"invalid TP{tp_rank} placement: {placement!r}"
+                            )
                     base_url = engine.get("http_url")
                     record = {
                         "role": role,
                         "rank": rank,
                         "base_url": base_url,
+                        "rank_placements": rank_placements,
                     }
                     if not engine_id or not isinstance(base_url, str):
                         ready = False
@@ -142,7 +181,7 @@ def wait_for_roles(
                 if ready:
                     return {
                         "ready": True,
-                        "run_dir": str(run_dir),
+                        "runtime_dir": str(run_dir),
                         "manifest_path": str(manifest_path),
                         "elapsed_s": time.monotonic() - started,
                         "engines": targets,
@@ -160,7 +199,7 @@ def wait_for_roles(
         ready = True
         last = {}
         for role in roles:
-            status_path = run_dir / "roles" / role / "status.json"
+            status_path = run_dir / "server" / role / "status.json"
             status = _read_json(status_path)
             state = status.get("state") if status else None
             record: dict[str, Any] = {
@@ -189,7 +228,7 @@ def wait_for_roles(
         if ready:
             return {
                 "ready": True,
-                "run_dir": str(run_dir),
+                "runtime_dir": str(run_dir),
                 "elapsed_s": time.monotonic() - started,
                 "roles": last,
             }
@@ -202,7 +241,7 @@ def wait_for_roles(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--runtime-dir", required=True)
     parser.add_argument(
         "--role",
         action="append",
@@ -220,7 +259,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     report = wait_for_roles(
-        Path(args.run_dir).expanduser().resolve(),
+        Path(args.runtime_dir).expanduser().resolve(),
         args.roles or ["verifier", "drafter"],
         args.timeout_s,
         args.poll_interval_s,

@@ -51,10 +51,14 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in (
+        "EAGLE",
+        "EAGLE3",
+        "DECOUPLED_VERIFY",
+    ):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/DECOUPLED_VERIFY are supported)"
         )
     if (
         server_args.speculative_eagle_topk is not None
@@ -84,6 +88,14 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
         )
+    if server_args.speculative_algorithm == "DECOUPLED_VERIFY":
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DECOUPLED_VERIFY_THROUGHPUT_PROFILE_PATH.get():
+            return (
+                "SGLANG_DECOUPLED_VERIFY_THROUGHPUT_PROFILE_PATH is unset "
+                "(adaptive decoupled verification requires an offline profile)"
+            )
     return None
 
 

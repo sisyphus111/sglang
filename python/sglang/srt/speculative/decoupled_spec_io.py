@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, Optional
 
 import msgspec
@@ -32,11 +31,6 @@ def _validate_endpoint(endpoint: Any, *, field_name: str) -> str:
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError(f"{field_name} must be a non-empty string, got {endpoint!r}.")
     return endpoint
-
-
-class DraftMeshMessageType(str, Enum):
-    CONTROL_BATCH = "control_batch"
-    TAIL_STREAM_OUTPUT_BATCH = "tail_stream_output_batch"
 
 
 @dataclass(frozen=True)
@@ -81,6 +75,7 @@ class DraftSync:
     request_id: str
     src_verifier_rank: int
     dst_drafter_rank: int
+    max_new_tokens: int = 0
     prompt_token_ids: list[int] = field(default_factory=list)
     committed_outputs: list[int] = field(default_factory=list)
 
@@ -149,26 +144,52 @@ class DraftClose:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class DraftTailStreamOutput:
-    """
-    Drafter sends one output token to the verifier-side DraftTailBuffer.
+    """One contiguous drafter stream update for a verifier-side tail.
 
-    base_committed_len records the verifier prefix length that the drafter used
-    as the base when this token was emitted. The verifier compares it with its
-    stale-base boundary before accepting the token as tail data or as
-    pending-prefix confirmation.
-
-    new_token_pos is the 0-based output token position for new_token. Normal
-    decode streams send the latest generated token.
+    Ordinary outputs append ``tokens`` at consecutive output positions starting
+    at ``start_token_pos``. Commit echoes remain singleton outputs and
+    cumulatively acknowledge the committed prefix through
+    ``start_token_pos + 1``; the echoed boundary token preserves the shared wire
+    shape but is not a value proof. Keeping an output single-purpose lets one
+    transport batch carry an echo immediately followed by a retained-tail
+    append.
     """
 
     src_drafter_rank: int
     dst_verifier_rank: int
     request_id: str
     base_committed_len: int
-    new_token_pos: int
-    new_token: int
+    start_token_pos: int
+    tokens: tuple[int, ...]
+    is_commit_echo: bool = False
+
+    def validate(self) -> None:
+        if int(self.base_committed_len) < 0:
+            raise ValueError("Draft stream base must be non-negative")
+        if int(self.start_token_pos) < 0:
+            raise ValueError("Draft stream start position must be non-negative")
+        if not isinstance(self.tokens, tuple):
+            raise TypeError("Draft stream tokens must be an immutable tuple")
+        if not self.tokens:
+            raise ValueError("Draft stream output must contain at least one token")
+        if any(
+            isinstance(token, bool) or not isinstance(token, int)
+            for token in self.tokens
+        ):
+            raise TypeError("Draft stream tokens must contain only integers")
+        if self.is_commit_echo:
+            if len(self.tokens) != 1:
+                raise ValueError("Draft commit echo must contain exactly one token")
+            if int(self.base_committed_len) != int(self.start_token_pos) + 1:
+                raise ValueError(
+                    "Draft commit echo base must equal its cumulative ACK length"
+                )
+        elif int(self.start_token_pos) < int(self.base_committed_len):
+            raise ValueError(
+                "Draft append must not start before its committed-prefix base"
+            )
 
 
 @dataclass
@@ -275,6 +296,148 @@ class VerifierCommitSegment:
         return prefix_segment
 
 
+class DraftCommitAction(msgspec.Struct, frozen=True):
+    """Native/Python data-plane decision applied by the drafter scheduler."""
+
+    draft_key: DraftReqKey
+    dst_drafter_rank: int
+    expected_output_len: int
+    pre_verify_committed_len: int
+    new_committed_len: int
+    rewrite_position: int
+    rewrite_token: int
+    echo_position: int
+    echo_token: int
+
+    @property
+    def is_rewrite(self) -> bool:
+        return int(self.rewrite_position) >= 0
+
+
+class DraftTranscriptMirror(msgspec.Struct):
+    """Bounded protocol mirror of the drafter's published output suffix."""
+
+    committed_len: int = 0
+    draft_suffix: list[int] = msgspec.field(default_factory=list)
+
+    @classmethod
+    def from_sync(cls, message: DraftSync) -> DraftTranscriptMirror:
+        return cls(committed_len=len(message.committed_outputs))
+
+    @property
+    def output_len(self) -> int:
+        return int(self.committed_len) + len(self.draft_suffix)
+
+    def append_output(
+        self,
+        output: DraftTailStreamOutput,
+    ) -> None:
+        output.validate()
+        start_token_pos = int(output.start_token_pos)
+        if output.is_commit_echo:
+            if start_token_pos >= self.committed_len:
+                raise RuntimeError(
+                    "Draft commit echo must refer to an already committed token"
+                )
+            return
+        if int(output.base_committed_len) < self.committed_len:
+            return
+        if int(output.base_committed_len) > self.committed_len:
+            raise RuntimeError(
+                "Draft output base is ahead of mirrored committed prefix"
+            )
+
+        output_end = start_token_pos + len(output.tokens)
+        current_end = self.output_len
+        if start_token_pos > current_end:
+            raise RuntimeError("Draft output skips mirrored transcript suffix")
+
+        overlap_end = min(output_end, current_end)
+        for token_position in range(start_token_pos, overlap_end):
+            existing_token = self.draft_suffix[
+                token_position - int(self.committed_len)
+            ]
+            token = output.tokens[token_position - start_token_pos]
+            if int(existing_token) != token:
+                raise RuntimeError(
+                    "Draft output conflicts with mirrored transcript suffix"
+                )
+
+        # Validate the full overlap before changing the mirror so a malformed
+        # span cannot leave a partially appended suffix behind.
+        if output_end > current_end:
+            self.draft_suffix.extend(output.tokens[current_end - start_token_pos :])
+
+    def plan_commit(
+        self, segment: VerifierCommitSegment
+    ) -> Optional[DraftCommitAction]:
+        pre_verify_committed_len = int(segment.pre_verify_committed_len)
+        if pre_verify_committed_len != self.committed_len:
+            raise RuntimeError(
+                "Verifier commit segment does not match mirrored committed prefix"
+            )
+        if not segment.committed_tokens or not self.draft_suffix:
+            return None
+
+        max_match = min(len(segment.committed_tokens), len(self.draft_suffix))
+        num_match_tokens = 0
+        while num_match_tokens < max_match and int(
+            self.draft_suffix[num_match_tokens]
+        ) == int(segment.committed_tokens[num_match_tokens]):
+            num_match_tokens += 1
+
+        rewrite_position = -1
+        rewrite_token = -1
+        if num_match_tokens == len(segment.committed_tokens):
+            num_commit_tokens = num_match_tokens
+        elif num_match_tokens < max_match:
+            num_commit_tokens = num_match_tokens + 1
+            rewrite_position = pre_verify_committed_len + num_match_tokens
+            rewrite_token = int(segment.committed_tokens[num_match_tokens])
+        else:
+            num_commit_tokens = num_match_tokens
+        if num_commit_tokens <= 0:
+            return None
+
+        new_committed_len = pre_verify_committed_len + num_commit_tokens
+        return DraftCommitAction(
+            draft_key=segment.draft_key,
+            dst_drafter_rank=int(segment.dst_drafter_rank),
+            expected_output_len=self.output_len,
+            pre_verify_committed_len=pre_verify_committed_len,
+            new_committed_len=new_committed_len,
+            rewrite_position=rewrite_position,
+            rewrite_token=rewrite_token,
+            echo_position=new_committed_len - 1,
+            echo_token=int(segment.committed_tokens[num_commit_tokens - 1]),
+        )
+
+    def apply_commit(self, action: DraftCommitAction) -> None:
+        if int(action.pre_verify_committed_len) != self.committed_len:
+            raise RuntimeError("Draft commit action does not match transcript cursor")
+        if int(action.expected_output_len) != self.output_len:
+            raise RuntimeError("Draft commit action does not match transcript length")
+        num_commit_tokens = int(action.new_committed_len) - int(
+            action.pre_verify_committed_len
+        )
+        if num_commit_tokens <= 0 or num_commit_tokens > len(self.draft_suffix):
+            raise RuntimeError("Draft commit action consumes an invalid suffix prefix")
+        if action.is_rewrite:
+            num_match_tokens = int(action.rewrite_position) - int(
+                action.pre_verify_committed_len
+            )
+            if num_match_tokens + 1 != num_commit_tokens:
+                raise RuntimeError("Draft rewrite action has inconsistent positions")
+            if int(self.draft_suffix[num_match_tokens]) == int(action.rewrite_token):
+                raise RuntimeError(
+                    "Draft rewrite token unexpectedly matches transcript suffix"
+                )
+            self.draft_suffix.clear()
+        else:
+            del self.draft_suffix[:num_commit_tokens]
+        self.committed_len = int(action.new_committed_len)
+
+
 @dataclass
 class DraftControlInbox:
     """Drafter-side inbox for verifier control messages.
@@ -361,18 +524,66 @@ class DraftControlInbox:
 
         return ready_controls
 
+    def extract_ready_actions_locked(
+        self,
+        model_ready: Callable[[DraftReqKey, int], bool],
+        transcripts: dict[DraftReqKey, DraftTranscriptMirror],
+    ) -> ReadyDraftControls:
+        """Consume data-plane-planned actions for model-ready request rows."""
+
+        ready_controls = ReadyDraftControls()
+        if self.close_keys:
+            ready_controls.close_keys = self.close_keys
+            self.close_keys = set()
+            for draft_key in ready_controls.close_keys:
+                transcripts.pop(draft_key, None)
+
+        preexisting_transcripts = set(transcripts)
+        for draft_key, segment in list(self.verifier_commit_segments.items()):
+            if draft_key not in preexisting_transcripts:
+                continue
+            transcript = transcripts[draft_key]
+            if not model_ready(draft_key, transcript.output_len):
+                continue
+            action = transcript.plan_commit(segment)
+            if action is None:
+                continue
+            num_commit_tokens = int(action.new_committed_len) - int(
+                action.pre_verify_committed_len
+            )
+            segment.extract_prefix(num_commit_tokens)
+            transcript.apply_commit(action)
+            ready_controls.commit_actions.append(action)
+            if not segment.committed_tokens:
+                self.verifier_commit_segments.pop(draft_key, None)
+
+        if self.sync_messages:
+            ready_controls.sync_messages = self.sync_messages
+            self.sync_messages = []
+            for message in ready_controls.sync_messages:
+                if message.draft_key in transcripts:
+                    raise RuntimeError(
+                        "DraftSync received for an existing transcript mirror"
+                    )
+                transcripts[message.draft_key] = DraftTranscriptMirror.from_sync(
+                    message
+                )
+        return ready_controls
+
 
 @dataclass
 class ReadyDraftControls:
     sync_messages: list[DraftSync] = field(default_factory=list)
     close_keys: set[DraftReqKey] = field(default_factory=set)
     ready_commit_segments: list[VerifierCommitSegment] = field(default_factory=list)
+    commit_actions: list[DraftCommitAction] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return (
             not self.sync_messages
             and not self.close_keys
             and not self.ready_commit_segments
+            and not self.commit_actions
         )
 
     def extracted_control_count(self) -> int:
@@ -380,29 +591,7 @@ class ReadyDraftControls:
             len(self.sync_messages)
             + len(self.close_keys)
             + len(self.ready_commit_segments)
-        )
-
-
-@dataclass
-class DraftMeshMessage:
-    message_type: DraftMeshMessageType
-    control_batch: Optional[DraftControlBatch] = None
-    tail_stream_output_batch: Optional[DraftTailStreamOutputBatch] = None
-
-    @staticmethod
-    def from_control_batch(message: DraftControlBatch) -> DraftMeshMessage:
-        return DraftMeshMessage(
-            message_type=DraftMeshMessageType.CONTROL_BATCH,
-            control_batch=message,
-        )
-
-    @staticmethod
-    def from_tail_stream_output_batch(
-        message: DraftTailStreamOutputBatch,
-    ) -> DraftMeshMessage:
-        return DraftMeshMessage(
-            message_type=DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH,
-            tail_stream_output_batch=message,
+            + len(self.commit_actions)
         )
 
 

@@ -27,33 +27,40 @@ _VALIDATOR = _load_module(
     "decoupled_spec_validate_samples_test",
     _ROOT / "skills" / "observe-decoupled-spec-run" / "scripts" / "validate_samples.py",
 )
-_AUDITOR = _load_module(
-    "decoupled_spec_audit_run_test",
-    _ROOT / "skills" / "audit-decoupled-spec-artifacts" / "scripts" / "audit_run.py",
-)
+
+
+def _integer_histogram(offset: int, counts: list[int]) -> dict:
+    return {
+        "offset": offset,
+        "counts": counts,
+        "underflow_count": 0,
+        "overflow_count": 0,
+    }
+
+
+def _latency_histogram(counts: list[int]) -> dict:
+    return {
+        "count": sum(counts),
+        "sum_us": 12.0,
+        "bucket_upper_bounds_us": [5, 10],
+        "bucket_counts": counts,
+    }
 
 
 class TestDecoupledSpecQueueGate(CustomTestCase):
     def _write_observability_fixture(
         self, run_dir: Path, *, formal_drafter_waiting: int = 0
     ) -> None:
-        observability_dir = run_dir / "observability"
-        client_dir = run_dir / "client"
-        observability_dir.mkdir(parents=True)
-        client_dir.mkdir(parents=True)
-        (observability_dir / "resolved_config.json").write_text(
-            json.dumps({"interval_s": 1.0}), encoding="utf-8"
-        )
-        (observability_dir / "summary.json").write_text(
-            json.dumps({"error_ct": 0, "target_ct": 2, "sample_ct": 3}),
-            encoding="utf-8",
-        )
-        (client_dir / "formal_window.json").write_text(
+        observer_dir = run_dir / "observer"
+        observer_dir.mkdir(parents=True)
+        (observer_dir / "bench_timeline.json").write_text(
             json.dumps(
                 {
-                    "state": "completed",
-                    "started_wall_time": 100.0,
-                    "finished_wall_time": 102.0,
+                    "observer_started_wall_time": 99.0,
+                    "client_started_wall_time": 100.0,
+                    "client_finished_wall_time": 102.0,
+                    "observer_finished_wall_time": 103.2,
+                    "observer_elapsed_s": 4.2,
                 }
             ),
             encoding="utf-8",
@@ -69,7 +76,12 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
                 records.append(
                     {
                         "sample_id": sample_id,
+                        "target_id": role,
                         "role": role,
+                        "rank": 0,
+                        "base_url": f"http://{role}",
+                        "interval_s": 1.0,
+                        "observer_started_wall_time": 98.0,
                         "collected_wall_time": collected_at,
                         "status_code": 200,
                         "error": None,
@@ -83,7 +95,7 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
                         },
                     }
                 )
-        (observability_dir / "samples.jsonl").write_text(
+        (observer_dir / "samples.jsonl").write_text(
             "".join(json.dumps(record) + "\n" for record in records),
             encoding="utf-8",
         )
@@ -123,26 +135,11 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
             )
         )
 
-    def test_decode_windows_before_collector_start_are_not_recounted(self):
+    def test_decode_windows_before_observer_start_are_not_recounted(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
             self._write_observability_fixture(run_dir)
-            summary_path = run_dir / "observability" / "summary.json"
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            summary.update(
-                {
-                    "started_wall_time": 100.0,
-                    "decode_metrics": {
-                        role: {
-                            "window_count": 1,
-                            "scheduler_cycle_ms": {"mean": 1.0},
-                        }
-                        for role in ("verifier", "drafter")
-                    },
-                }
-            )
-            summary_path.write_text(json.dumps(summary), encoding="utf-8")
-            samples_path = run_dir / "observability" / "samples.jsonl"
+            samples_path = run_dir / "observer" / "samples.jsonl"
             records = [
                 json.loads(line) for line in samples_path.read_text().splitlines()
             ]
@@ -150,7 +147,7 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
                 record["payload"]["loads"][0]["decode_metrics_windows"] = [
                     {
                         "window_id": 1,
-                        "end_time": 99.5,
+                        "end_time": 97.5,
                         "num_decode_iters": 40,
                     },
                     {
@@ -172,29 +169,159 @@ class TestDecoupledSpecQueueGate(CustomTestCase):
         for role in ("verifier", "drafter"):
             self.assertEqual(report["roles"][role]["decode_metrics_window_count"], 1)
 
-    def test_any_positive_role_log_queue_invalidates_run(self):
-        with tempfile.TemporaryDirectory() as directory:
-            run_dir = Path(directory)
-            logs = run_dir / "logs"
-            logs.mkdir()
-            (logs / "verifier.log").write_text(
-                "Decode batch, #running-req: 64, #queue-req: 0\n",
-                encoding="utf-8",
-            )
-            (logs / "drafter.log").write_text(
-                "Prefill batch, #running-req: 48, #queue-req: 16\n",
-                encoding="utf-8",
-            )
-            errors = []
-            report = _AUDITOR._check_zero_waiting_queues(run_dir, errors)
+    def test_validator_accepts_role_owned_decoupled_spec_metrics(self):
+        rows = 4
+        tail = {
+            "num_select_rows": rows,
+            "num_select_valid_rows": 3,
+            "reason_counts": {"direct": 3, "bonus_mismatch": 1},
+            "selected_draft_length_histogram": _integer_histogram(0, [1, 1, 1, 1]),
+            "raw_draft_tail_length_histogram": _integer_histogram(
+                -1, [0, 4, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            "consumable_draft_tail_length_histogram": _integer_histogram(
+                -1, [0, 4, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            "logical_delta_histogram": _integer_histogram(
+                -7, [0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            "pending_prefix_length_histogram": _integer_histogram(
+                -1, [0, 4, 0, 0, 0, 0, 0, 0, 0]
+            ),
+            "num_publish_seq_initial": 0,
+            "num_publish_seq_same": 1,
+            "num_publish_seq_advance": 3,
+            "num_pending_prefix_fast_forwards": 1,
+            "num_protocol_errors": 0,
+            "num_seqlock_retry_rows": 1,
+            "num_seqlock_retries": 3,
+            "max_seqlock_retries": 3,
+        }
+        verifier_window = {
+            "decoupled_spec": {
+                "tail_select": tail,
+                "transport": {
+                    "num_draft_result_frames": 4,
+                    "num_draft_result_tokens": 12,
+                    "clock_sync_valid": True,
+                    "clock_error_bound_us": 2.0,
+                    "num_clock_sync_valid_peers": 1,
+                    "num_clock_sync_invalid_peers": 0,
+                    "gpu_publish_staging_slots_max": 2,
+                    "draft_result_ready_to_receive_latency_us": _latency_histogram(
+                        [1, 3, 0]
+                    ),
+                    "draft_transport_one_way_latency_us": _latency_histogram([1, 3, 0]),
+                    "draft_receive_to_gpu_publish_enqueue_latency_us": (
+                        _latency_histogram([2, 2, 0])
+                    ),
+                },
+            }
+        }
+        drafter_window = {
+            "decoupled_spec": {
+                "transport": {
+                    "num_draft_result_frames": 4,
+                    "num_draft_result_tokens": 12,
+                    "draft_send_queue_depth_max": 1,
+                    "draft_send_queue_latency_us": _latency_histogram([2, 2, 0]),
+                }
+            }
+        }
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        _VALIDATOR._validate_decoupled_spec_window(
+            "drafter", "drafter", 0, 1, drafter_window, errors
+        )
+        self.assertEqual(errors, [])
 
-        self.assertEqual(report["verifier"]["max_waiting_reqs"], 0)
-        self.assertEqual(report["drafter"]["max_waiting_reqs"], 16)
+        verifier_transport = verifier_window["decoupled_spec"]["transport"]
+        verifier_transport["clock_sync_valid"] = False
+        verifier_transport["num_clock_sync_invalid_peers"] = 1
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        self.assertEqual(errors, [])
+
+        verifier_transport["num_clock_sync_valid_peers"] = 0
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        # Peer gauges describe calibration state at drain time. Histograms were
+        # already gated at record time, so an in-progress recalibration must not
+        # invalidate samples retained from the same engine window.
+        self.assertEqual(errors, [])
+        error_bound = verifier_transport.pop("clock_error_bound_us")
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
         self.assertTrue(
-            any(
-                "drafter: role log observed waiting requests" in error
-                for error in errors
-            )
+            any("clock_error_bound_us must be finite" in error for error in errors),
+            errors,
+        )
+        verifier_transport["clock_error_bound_us"] = error_bound
+        verifier_transport["num_clock_sync_valid_peers"] = 1
+
+        # Landing may process several recovery events between two stable
+        # selector observations, so event count is not bounded by row count.
+        tail["num_pending_prefix_fast_forwards"] = rows + 1
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        self.assertEqual(errors, [])
+
+        tail["num_seqlock_retry_rows"] = rows + 1
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        self.assertTrue(
+            any("seqlock retry rows exceed rows" in error for error in errors), errors
+        )
+        tail["num_seqlock_retry_rows"] = 1
+
+        tail["max_seqlock_retries"] = 4
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "verifier", "verifier", 0, 1, verifier_window, errors
+        )
+        self.assertTrue(
+            any("seqlock retry counters disagree" in error for error in errors), errors
+        )
+        tail["max_seqlock_retries"] = 3
+
+    def test_validator_rejects_wrong_role_and_malformed_histograms(self):
+        window = {
+            "decoupled_spec": {
+                "tail_select": {},
+                "transport": {
+                    "num_draft_result_frames": 1,
+                    "num_draft_result_tokens": 1,
+                    "clock_sync_valid": False,
+                    "draft_transport_one_way_latency_us": {
+                        "count": 2,
+                        "sum_us": 10.0,
+                        "bucket_upper_bounds_us": [5, 10],
+                        "bucket_counts": [1, 0],
+                    },
+                },
+            }
+        }
+        errors = []
+        _VALIDATOR._validate_decoupled_spec_window(
+            "drafter", "drafter", 0, 1, window, errors
+        )
+        self.assertTrue(any("tail_select is verifier-only" in item for item in errors))
+        self.assertTrue(any("not owned by role=drafter" in item for item in errors))
+        self.assertTrue(any("overflow bucket" in item for item in errors))
+        self.assertTrue(
+            any("clock_error_bound_us must be finite" in item for item in errors)
         )
 
 

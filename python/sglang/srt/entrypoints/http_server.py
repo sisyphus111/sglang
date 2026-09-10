@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -2467,6 +2468,7 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    http_socket: Optional[socket.socket] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
@@ -2541,6 +2543,12 @@ def _setup_and_run_http_server(
                 f"SSL enabled: certfile={server_args.ssl_certfile}, "
                 f"keyfile={server_args.ssl_keyfile}"
             )
+        if http_socket is not None:
+            logger.info(
+                "Starting HTTP server on pre-bound socket %s:%s",
+                server_args.host,
+                server_args.port,
+            )
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
@@ -2589,28 +2597,41 @@ def _setup_and_run_http_server(
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
-                        await server.serve()
+                        if http_socket is None:
+                            await server.serve()
+                        else:
+                            await server.serve(sockets=[http_socket])
                     finally:
                         refresher.stop()
 
                 import asyncio
 
                 asyncio.run(_run_with_ssl_refresh())
+                if http_socket is not None and not server.started:
+                    raise RuntimeError("Uvicorn failed to start on the HTTP socket.")
             else:
                 # Default case, one tokenizer process
-                uvicorn.run(
-                    app,
-                    host=server_args.host,
-                    port=server_args.port,
-                    root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
-                )
+                uvicorn_kwargs = {
+                    "host": server_args.host,
+                    "port": server_args.port,
+                    "root_path": server_args.fastapi_root_path,
+                    "log_level": server_args.log_level_http or server_args.log_level,
+                    "timeout_keep_alive": envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    "loop": "uvloop",
+                    "ssl_keyfile": server_args.ssl_keyfile,
+                    "ssl_certfile": server_args.ssl_certfile,
+                    "ssl_ca_certs": server_args.ssl_ca_certs,
+                    "ssl_keyfile_password": server_args.ssl_keyfile_password,
+                }
+                if http_socket is None:
+                    uvicorn.run(app, **uvicorn_kwargs)
+                else:
+                    server = uvicorn.Server(uvicorn.Config(app, **uvicorn_kwargs))
+                    server.run(sockets=[http_socket])
+                    if not server.started:
+                        raise RuntimeError(
+                            "Uvicorn failed to start on the HTTP socket."
+                        )
         else:
             # Multiple tokenizer and http processes
             from uvicorn.config import LOGGING_CONFIG
@@ -2719,6 +2740,7 @@ def launch_server(
     run_detokenizer_process_func: Callable = run_detokenizer_process,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    http_socket: Optional[socket.socket] = None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -2735,6 +2757,15 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    if http_socket is not None:
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError("A pre-bound HTTP socket is unsupported in Rust mode.")
+        if server_args.tokenizer_worker_num != 1 or server_args.enable_http2:
+            raise ValueError(
+                "A pre-bound HTTP socket requires one tokenizer worker and "
+                "the Python HTTP/1 server."
+            )
+
     # Launch subprocesses
     (
         tokenizer_manager,
@@ -2773,4 +2804,5 @@ def launch_server(
             subprocess_watchdog,
             execute_warmup_func=execute_warmup_func,
             launch_callback=launch_callback,
+            http_socket=http_socket,
         )

@@ -22,6 +22,7 @@ from sglang.srt.speculative.decoupled_draft_checkpoint import (  # noqa: E402
 )
 from sglang.srt.speculative.decoupled_spec_io import (  # noqa: E402
     DecoupledSpecIpcConfig,
+    DraftCommitAction,
     DraftControlInbox,
     DraftReqKey,
     ReadyDraftControls,
@@ -150,9 +151,15 @@ class TestSchedulerSleepPlacement(CustomTestCase):
             self.assertIsNone(batch.out_cache_loc)
             return input_batch
 
+        def prepare_decode_allocation(input_batch):
+            events.append("prepare_decode_allocation")
+            self.assertIs(input_batch, batch)
+            self.assertIsNone(batch.out_cache_loc)
+
         scheduler = SimpleNamespace(
             decoupled_spec_manager=SimpleNamespace(
-                sleep_overrun_requests=sleep_overrun_requests
+                sleep_overrun_requests=sleep_overrun_requests,
+                prepare_decode_allocation=prepare_decode_allocation,
             ),
             forward_ct=0,
             new_token_ratio_tracker=SimpleNamespace(decay_step=MagicMock()),
@@ -167,6 +174,7 @@ class TestSchedulerSleepPlacement(CustomTestCase):
                 "filter",
                 "sleep_overrun_requests",
                 "check_decode_mem",
+                "prepare_decode_allocation",
                 "prepare_for_decode",
             ],
         )
@@ -183,7 +191,7 @@ class TestDecoupledDraftSegmentAndSleep(CustomTestCase):
         self.addCleanup(data_plane_patcher.stop)
         data_plane_factory = data_plane_patcher.start()
         self.data_plane = data_plane_factory.return_value
-        self.data_plane.collect_ready_controls.return_value = ReadyDraftControls()
+        self.data_plane.collect_ready_actions.return_value = ReadyDraftControls()
         self.data_plane.pending_control_count.return_value = 0
         self.scheduler = SimpleNamespace(
             ps=SimpleNamespace(tp_rank=0, tp_size=1),
@@ -224,7 +232,7 @@ class TestDecoupledDraftSegmentAndSleep(CustomTestCase):
         self.manager = DecoupledDraftManager(self.scheduler, config)
         self.data_plane.start.assert_called_once_with()
         self.data_plane.reset_mock()
-        self.data_plane.collect_ready_controls.return_value = ReadyDraftControls()
+        self.data_plane.collect_ready_actions.return_value = ReadyDraftControls()
         self.data_plane.pending_control_count.return_value = 0
 
     def _install_request(
@@ -253,7 +261,7 @@ class TestDecoupledDraftSegmentAndSleep(CustomTestCase):
         key = DraftRequestGeneration(
             src_verifier_rank=0,
             request_id=request_id,
-            generation=0,
+            request_epoch=0,
         )
         req.decoupled_draft_generation = key
         state = SimpleNamespace(
@@ -278,23 +286,31 @@ class TestDecoupledDraftSegmentAndSleep(CustomTestCase):
             pre_verify_committed_len=1,
             committed_tokens=[11, 99, 100],
         )
-        inbox = DraftControlInbox(verifier_commit_segments={segment.draft_key: segment})
         self.manager.checkpoints = MagicMock()
         self.manager._truncate_kv = MagicMock()
-        self.data_plane.collect_ready_controls.side_effect = (
-            inbox.extract_ready_controls_locked
+        self.data_plane.collect_ready_actions.return_value = ReadyDraftControls(
+            commit_actions=[
+                DraftCommitAction(
+                    draft_key=segment.draft_key,
+                    dst_drafter_rank=0,
+                    expected_output_len=4,
+                    pre_verify_committed_len=1,
+                    new_committed_len=3,
+                    rewrite_position=2,
+                    rewrite_token=99,
+                    echo_position=2,
+                    echo_token=99,
+                )
+            ]
         )
 
         self.manager.process_pending_controls()
 
         self.assertEqual(list(req.output_ids), [10, 11, 99])
         self.assertEqual(state.committed_len, 3)
-        remainder = inbox.verifier_commit_segments[DraftReqKey(0, "req")]
-        self.assertEqual(remainder.pre_verify_committed_len, 3)
-        self.assertEqual(remainder.committed_tokens, [100])
         self.assertEqual(self.scheduler.future_map.output_tokens_buf[1].item(), 99)
         echo = self.data_plane.publish_tails.call_args.args[0].outputs[0]
-        self.assertEqual((echo.new_token_pos, echo.new_token), (2, 99))
+        self.assertEqual((echo.start_token_pos, echo.tokens), (2, (99,)))
 
     def test_sleep_retains_ownership_then_commit_rebuilds_and_merges(self):
         ready_req, _ = self._install_request(
@@ -331,8 +347,20 @@ class TestDecoupledDraftSegmentAndSleep(CustomTestCase):
             pre_verify_committed_len=1,
             committed_tokens=[1],
         )
-        self.data_plane.collect_ready_controls.return_value = ReadyDraftControls(
-            ready_commit_segments=[ready_segment]
+        self.data_plane.collect_ready_actions.return_value = ReadyDraftControls(
+            commit_actions=[
+                DraftCommitAction(
+                    draft_key=ready_segment.draft_key,
+                    dst_drafter_rank=0,
+                    expected_output_len=8,
+                    pre_verify_committed_len=1,
+                    new_committed_len=2,
+                    rewrite_position=-1,
+                    rewrite_token=-1,
+                    echo_position=1,
+                    echo_token=1,
+                )
+            ]
         )
         built_batch = _DraftBatch([sleep_req])
         with patch.object(

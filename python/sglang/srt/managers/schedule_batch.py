@@ -2021,6 +2021,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # Decoupled-drafter overlap allocates a physical candidate on the schedule
+    # stream, then binds it to the authoritative logical position only after
+    # the GPU control snapshot at forward entry.
+    defer_decode_kv_binding: bool = False
     # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
     # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
     out_cache_loc_dsv4: Optional[Any] = None
@@ -2029,6 +2033,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Optional recurrent-state routing. Both tensors are logical Mamba slot ids;
+    # decode reads src and writes dst. Set only by the decoupled drafter.
+    mamba_cache_src_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # Lazy + spec: this iteration's per-req scatter positions
     # (see mamba_lazy_spec_prepare).
     mamba_lazy_spec_track_positions_cpu: Optional[List[int]] = None  # shape: [b]
@@ -2070,9 +2078,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # One-forward GPU-tail selection results. The authoritative rolling tail
     # remains owned by the verifier data plane, outside ScheduleBatch.
     decoupled_launch_mirror_ids: Optional[List[str]] = None
+    # TP0 freezes these epochs on the scheduler stream before launching forward;
+    # stale GPU work must never infer ownership from a seat that may be reused.
+    decoupled_expected_request_epochs: Optional[torch.Tensor] = None
+    decoupled_has_new_lifecycle: bool = False
+    # Lifecycle updates land on a side stream. Fence a launch that must observe
+    # one before reading the persistent tail row.
+    decoupled_needs_landing_fence: bool = False
+    decoupled_landing_event: Optional[torch.cuda.Event] = None
     decoupled_rebase_valid: Optional[torch.Tensor] = None
     decoupled_selected_draft_lens: Optional[torch.Tensor] = None
+    decoupled_tail_select_debug: Optional[torch.Tensor] = None
     decoupled_pre_verify_output_lens: Optional[torch.Tensor] = None
+    # Active verifier K frozen at this launch boundary. Kmax-owned tail state
+    # remains outside ScheduleBatch and is never resized by adaptive switching.
+    decoupled_verify_steps: Optional[int] = None
+
+    # Drafter-only GPU control transaction. These are forward-local launch
+    # identity/snapshot tensors; the persistent transcript lives in the native
+    # data plane rather than in ScheduleBatch.
+    decoupled_draft_mirror_seats: Optional[torch.Tensor] = None
+    decoupled_draft_request_epochs: Optional[torch.Tensor] = None
+    decoupled_draft_captured_state_positions: Optional[torch.Tensor] = None
+    decoupled_draft_old_cache_locs: Optional[torch.Tensor] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2999,15 +3027,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        # Update req-level memory management fields
+        # Update req-level memory management fields. The decoupled drafter GPU
+        # transaction may rewind and overwrite logical cells while physical
+        # candidates are allocated monotonically. Its manager tracks the exact
+        # owned high-water and materializes these counters only at CLOSE.
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
+            if not self.defer_decode_kv_binding:
+                req.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
         self.seq_lens = self.seq_lens + 1
-        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        if self.defer_decode_kv_binding:
+            # The authoritative position is reconciled on GPU at forward entry.
+            # Do not maintain a second running host sequence-length shadow.
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3099,6 +3136,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_cache_src_indices = None
+        self.mamba_cache_dst_indices = None
         self.mamba_lazy_spec_track_positions_cpu = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
@@ -3159,6 +3198,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_cache_src_indices = None
+        self.mamba_cache_dst_indices = None
         self.mamba_lazy_spec_track_positions_cpu = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
@@ -3213,7 +3254,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             decoupled_rebase_valid=self.decoupled_rebase_valid,
             decoupled_selected_draft_lens=self.decoupled_selected_draft_lens,
+            decoupled_tail_select_debug=self.decoupled_tail_select_debug,
             decoupled_pre_verify_output_lens=self.decoupled_pre_verify_output_lens,
+            decoupled_verify_steps=self.decoupled_verify_steps,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

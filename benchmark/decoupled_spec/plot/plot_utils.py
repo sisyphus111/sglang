@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
+import statistics
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +17,18 @@ import matplotlib.pyplot as plt
 
 COLORS = ("#202124", "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00")
 
+UPPER_IQR_OUTLIER_POLICY = (
+    "per target/DP series, exclude value > Q3 + 3 * IQR using inclusive "
+    "quartiles when at least 8 finite windows are present"
+)
+
 
 def load_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def load_csv(path: str | Path) -> list[dict[str, str]]:
-    # Long generations can put more than Python's 128 KiB default in one text
-    # field. The benchmark owns these local artifacts, so accept platform-size
-    # fields rather than truncating or dropping response provenance.
+    # Keep the loader safe for large fixed-schema JSON-array cells.
     csv.field_size_limit(sys.maxsize)
     with Path(path).open(encoding="utf-8", newline="") as stream:
         return list(csv.DictReader(stream))
@@ -42,8 +44,19 @@ def finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def sha256(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def upper_iqr_outlier_threshold(
+    values: list[Any], *, minimum_count: int = 8
+) -> float | None:
+    """Return the deterministic presentation-only upper-outlier threshold."""
+    finite_values = [
+        number for value in values if (number := finite_float(value)) is not None
+    ]
+    if len(finite_values) < minimum_count:
+        return None
+    q1, _, q3 = statistics.quantiles(
+        finite_values, n=4, method="inclusive"
+    )
+    return q3 + 3 * (q3 - q1)
 
 
 def style_axis(
@@ -66,7 +79,7 @@ def save_figure(
     output_dir: str | Path,
     stem: str,
     source: str,
-) -> tuple[Path, Path]:
+) -> tuple[Path]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     figure.text(
@@ -79,31 +92,7 @@ def save_figure(
         color="#666666",
     )
     figure.tight_layout(rect=(0, 0.05, 1, 1))
-    svg_path = output_path / f"{stem}.svg"
     png_path = output_path / f"{stem}.png"
-    figure.savefig(svg_path, bbox_inches="tight")
     figure.savefig(png_path, dpi=220, bbox_inches="tight")
     plt.close(figure)
-    return svg_path, png_path
-
-
-def build_manifest(
-    *,
-    kind: str,
-    run_dir: Path,
-    sources: list[Path],
-    outputs: list[Path],
-) -> dict[str, Any]:
-    """Describe one independently reproducible derived artifact."""
-    return {
-        "schema_version": 1,
-        "kind": kind,
-        "created_at": time.time(),
-        "run_dir": str(run_dir),
-        "sources": [
-            {"path": str(path.relative_to(run_dir)), "sha256": sha256(path)}
-            for path in sources
-            if path.is_file()
-        ],
-        "outputs": [str(path.relative_to(run_dir)) for path in outputs],
-    }
+    return (png_path,)

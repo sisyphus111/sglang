@@ -18,8 +18,9 @@ A span has two independent emitters:
 * ``record_function`` -- emitted whenever a torch profiler is active, so spans
   show up in torch/Perfetto traces for free (no env, no extra package).
 * ``nvtx`` range -- emitted only when the caller opts in via ``nvtx_enabled``
-  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate) and the ``nvtx``
-  package is importable, for Nsight Systems timelines.
+  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate), for Nsight Systems
+  timelines. Prefer the standalone ``nvtx`` package and fall back to PyTorch's
+  CUDA NVTX bindings so profiling does not depend on an optional Python wheel.
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
@@ -31,6 +32,7 @@ from functools import partial, wraps
 from typing import Optional
 
 import torch
+from torch.autograd import profiler as autograd_profiler
 
 from sglang.srt.environ import envs
 
@@ -39,19 +41,32 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
 
-_nvtx_module = None
+
+def _torch_cuda_nvtx_range(debug_name: str, *, color: Optional[str] = None):
+    # torch.cuda.nvtx does not expose the color attribute supported by the
+    # standalone nvtx package, but preserves the range name and nesting.
+    return torch.cuda.nvtx.range(debug_name)
+
+
+_nvtx_annotate = None
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
     try:
         import nvtx as _nvtx_module  # type: ignore
     except ImportError:
-        logger.warning(
-            "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
-        )
+        if torch.version.cuda is not None and hasattr(torch.cuda, "nvtx"):
+            _nvtx_annotate = _torch_cuda_nvtx_range
+        else:
+            logger.warning(
+                "An SGLANG_ENABLE_NVTX_* flag is set, but neither the `nvtx` "
+                "package nor PyTorch CUDA NVTX bindings are available. NVTX "
+                "markers are disabled; torch profiler spans still emit."
+            )
+    else:
+        _nvtx_annotate = _nvtx_module.annotate
 
-NVTX_AVAILABLE = _nvtx_module is not None
-# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set AND the
-# package is importable. The record_function path is independent of both.
+NVTX_AVAILABLE = _nvtx_annotate is not None
+# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set and an
+# NVTX backend is available. The record_function path is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
 
@@ -77,7 +92,7 @@ def _profile_range_impl(
         if nvtx_enabled:
             if color is None:
                 color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            stack.enter_context(_nvtx_annotate(debug_name, color=color))
         yield
 
 
@@ -89,9 +104,13 @@ def profile_range(
     A torch ``record_function`` is emitted whenever a torch profiler is active;
     an nvtx range is emitted additionally when ``nvtx_enabled`` is true. Returns a
     shared no-op when neither applies, so off-profile hot paths pay only one
-    ``_profiler_enabled()`` check.
+    process-global profiler-state check.
     """
-    record = torch.autograd._profiler_enabled()
+    # The C++ thread-local torch.autograd._profiler_enabled() stays false when
+    # SGLang enables Kineto's profile_all_threads mode. PyTorch maintains this
+    # Python global specifically for fast instrumentation guards, and updates it
+    # for both ordinary and all-thread profiler sessions.
+    record = autograd_profiler._is_profiler_enabled
     if not record and not nvtx_enabled:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, color, record, nvtx_enabled)

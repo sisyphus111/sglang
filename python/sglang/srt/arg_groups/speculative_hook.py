@@ -169,16 +169,6 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
     if role not in ("verifier", "drafter"):
         raise ValueError(f"Unsupported decoupled speculative role: {role!r}.")
 
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.get():
-        raise ValueError(
-            "Active decoupled speculative decoding requires the native C++ "
-            "data plane. Set SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND=1 for both "
-            "verifier and drafter; the Python implementation is retained only "
-            "as a CPU semantic reference."
-        )
-
     if role == "verifier":
         if algorithm != "DECOUPLED_VERIFY":
             raise ValueError(
@@ -190,11 +180,6 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
             raise ValueError(
                 "The decoupled drafter is a plain decode engine and requires "
                 "--speculative-algorithm to be unset."
-            )
-        if not server_args.disable_overlap_schedule:
-            raise ValueError(
-                "The phase-one decoupled drafter requires "
-                "--disable-overlap-schedule."
             )
         if server_args.tp_size != 1:
             raise ValueError(
@@ -209,7 +194,24 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
         if getattr(server_args, "enable_linear_replayssm", False):
             raise ValueError(
                 "The phase-one decoupled drafter requires ReplaySSM disabled "
-                "because dense checkpoints do not copy its pending ring."
+                "because rollback routes complete dense GDN states between slots."
+            )
+        if (
+            not server_args.disable_overlap_schedule
+            and not server_args.disable_radix_cache
+        ):
+            raise ValueError(
+                "Decoupled drafter GPU overlap requires --disable-radix-cache; "
+                "its GPU checkpoint ring owns recurrent-state rollback."
+            )
+        if (
+            not server_args.disable_overlap_schedule
+            and getattr(server_args, "enable_mixed_chunk", False)
+        ):
+            raise ValueError(
+                "Decoupled drafter overlap does not support mixed chunked "
+                "prefill because decode KV/state binding is a forward-local "
+                "GPU transaction."
             )
     if server_args.dp_size != 1:
         raise ValueError(
@@ -919,6 +921,34 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
+    if server_args.speculative_algorithm == "DECOUPLED_VERIFY":
+        from sglang.srt.speculative.decoupled_verify_throughput_controller import (
+            resolve_decoupled_verify_candidate_steps,
+        )
+
+        if server_args.speculative_num_steps is None:
+            raise ValueError(
+                "Adaptive decoupled verification requires "
+                "--speculative-num-steps as the fixed Kmax."
+            )
+        max_steps = int(server_args.speculative_num_steps)
+        if max_steps <= 0:
+            raise ValueError("Adaptive decoupled verification requires Kmax > 0.")
+        resolve_decoupled_verify_candidate_steps(
+            server_args.speculative_adaptive_config,
+            max_steps=max_steps,
+        )
+        if server_args.speculative_eagle_topk is None:
+            server_args.speculative_eagle_topk = 1
+        if server_args.speculative_num_draft_tokens is None:
+            server_args.speculative_num_draft_tokens = max_steps + 1
+        if int(server_args.speculative_num_draft_tokens) != max_steps + 1:
+            raise ValueError(
+                "Adaptive decoupled verification keeps Kmax allocations fixed and "
+                "requires speculative_num_draft_tokens == Kmax + 1."
+            )
+        return
+
     from sglang.srt.speculative.adaptive_spec_params import (
         resolve_candidate_steps_from_config,
     )

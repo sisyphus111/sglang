@@ -94,7 +94,21 @@ class GenerationBatchResult:
     # result-copy phase; they never add a next-launch host dependency.
     decoupled_rebase_valid: Optional[torch.Tensor] = None
     decoupled_selected_draft_lens: Optional[torch.Tensor] = None
+    decoupled_tail_select_debug: Optional[torch.Tensor] = None
     decoupled_pre_output_lens: Optional[torch.Tensor] = None
+    decoupled_verify_steps: Optional[int] = None
+
+    # Decoupled drafter overlap transaction result. Decode owns its token on GPU
+    # and copies back only allocator ownership/reclaim metadata. Final prefill
+    # additionally returns one lifecycle verdict for ordinary result admission.
+    decoupled_draft_gpu_managed: bool = False
+    decoupled_draft_candidate_committed: Optional[torch.Tensor] = None
+    # Decode rows: [accepted, owned_bound_position, reclaim_cache_loc].
+    decoupled_draft_kv_outcomes: Optional[torch.Tensor] = None
+    decoupled_draft_kv_outcomes_ready: Optional[torch.cuda.Event] = None
+    # CLOSE may drain a queued multi-request result before normal result-order
+    # processing so it can release one row's KV ownership safely.
+    decoupled_draft_kv_outcomes_drained: bool = False
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
@@ -155,8 +169,17 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
+        if not self.decoupled_draft_gpu_managed:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
+        if self.decoupled_draft_candidate_committed is not None:
+            self.decoupled_draft_candidate_committed = _async_d2h(
+                self.decoupled_draft_candidate_committed
+            )
+        if self.decoupled_draft_kv_outcomes is not None:
+            self.decoupled_draft_kv_outcomes = _async_d2h(
+                self.decoupled_draft_kv_outcomes
+            )
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
 
@@ -171,6 +194,10 @@ class GenerationBatchResult:
         if self.decoupled_selected_draft_lens is not None:
             self.decoupled_selected_draft_lens = _async_d2h(
                 self.decoupled_selected_draft_lens
+            )
+        if self.decoupled_tail_select_debug is not None:
+            self.decoupled_tail_select_debug = _async_d2h(
+                self.decoupled_tail_select_debug
             )
         if self.decoupled_pre_output_lens is not None:
             self.decoupled_pre_output_lens = _async_d2h(self.decoupled_pre_output_lens)

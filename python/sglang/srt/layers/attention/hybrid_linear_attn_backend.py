@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
+    fused_replay_routed_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
@@ -56,7 +57,13 @@ class MambaAttnBackendBase(AttentionBackend):
             is HybridReqToTokenPool.translate_mamba_indices
         )
         self.forward_metadata: ForwardMetadata = None
+        self.enable_state_routing = (
+            model_runner.server_args.decoupled_spec_role == "drafter"
+        )
+        # The existing list remains the destination/ordinary in-place buffer so
+        # non-decoupled graph replay keeps its single-buffer fast path.
         self.state_indices_list = []
+        self.state_src_indices_list = [] if self.enable_state_routing else None
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
         self.mamba_track_indices_buf = None
@@ -90,12 +97,33 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
-        # Translate virtual->physical BEFORE the padding sentinel below, so the
-        # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
-        mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        route_src = getattr(forward_batch, "mamba_cache_src_indices", None)
+        route_dst = getattr(forward_batch, "mamba_cache_dst_indices", None)
+        if (route_src is None) != (route_dst is None):
+            raise ValueError(
+                "mamba_cache_src_indices and mamba_cache_dst_indices must be "
+                "provided together"
+            )
+        if route_src is None:
+            mamba_cache_src_indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            )
+            # Translate virtual->physical before installing padding sentinels.
+            mamba_cache_src_indices = self._translate_mamba_indices(
+                mamba_cache_src_indices
+            )
+            mamba_cache_dst_indices = mamba_cache_src_indices
+        else:
+            if not self.enable_state_routing:
+                raise RuntimeError(
+                    "recurrent-state src/dst routing is only enabled for the "
+                    "decoupled drafter"
+                )
+            if route_src.ndim != 1 or route_src.shape != route_dst.shape:
+                raise ValueError("Mamba state routing tensors must be matching 1D tensors")
+            mamba_cache_src_indices = self._translate_mamba_indices(route_src)
+            mamba_cache_dst_indices = self._translate_mamba_indices(route_dst)
+        mamba_cache_indices = mamba_cache_dst_indices
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -107,8 +135,12 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
-            mamba_cache_indices = mamba_cache_indices.clone()
-            mamba_cache_indices[_real_bs:] = -1
+            mamba_cache_src_indices = mamba_cache_src_indices.clone()
+            mamba_cache_src_indices[_real_bs:] = -1
+            if mamba_cache_dst_indices is mamba_cache_indices:
+                mamba_cache_dst_indices = mamba_cache_dst_indices.clone()
+                mamba_cache_dst_indices[_real_bs:] = -1
+            mamba_cache_indices = mamba_cache_dst_indices
 
         replayssm_write_pos = None
         replayssm_force_flush = None
@@ -226,6 +258,8 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -258,6 +292,12 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            mamba_cache_src_indices=getattr(
+                forward_batch, "mamba_cache_src_indices", None
+            ),
+            mamba_cache_dst_indices=getattr(
+                forward_batch, "mamba_cache_dst_indices", None
+            ),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -425,6 +465,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if self.state_src_indices_list is not None:
+                self.state_src_indices_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
             if self.replayssm_write_pos_list is not None:
                 self.replayssm_write_pos_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
@@ -472,6 +521,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if self.state_src_indices_list is not None:
+                self.state_src_indices_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -508,6 +566,10 @@ class MambaAttnBackendBase(AttentionBackend):
         # before copying (no-op for non-unified pool).
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        capture_src_indices = self.state_indices_list[bs - 1]
+        if self.state_src_indices_list is not None:
+            capture_src_indices = self.state_src_indices_list[bs - 1]
+            capture_src_indices[: len(mamba_indices)].copy_(mamba_indices)
 
         # Capture records the pointer to the static per-bs buffers; their zeros are
         # overwritten in-place by _replay_metadata before each replay. None when off.
@@ -527,6 +589,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=capture_src_indices,
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -537,6 +601,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=capture_src_indices,
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -551,6 +617,8 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_cache_src_indices: Optional[torch.Tensor] = None,
+        mamba_cache_dst_indices: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -559,7 +627,50 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
+        if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
+            raise ValueError(
+                "mamba_cache_src_indices and mamba_cache_dst_indices must be "
+                "provided together"
+            )
+        if mamba_cache_src_indices is not None:
+            if not self.enable_state_routing or self.state_src_indices_list is None:
+                raise RuntimeError(
+                    "recurrent-state src/dst routing is only enabled for the "
+                    "decoupled drafter"
+                )
+            valid_bs = bs - int(num_padding)
+            if (
+                mamba_cache_src_indices.ndim != 1
+                or mamba_cache_src_indices.shape != mamba_cache_dst_indices.shape
+                or mamba_cache_src_indices.numel() != valid_bs
+            ):
+                raise ValueError(
+                    "Mamba graph state routing tensors must be matching "
+                    "[valid_batch] vectors"
+                )
+            static_src = self.state_src_indices_list[bs - 1]
+            static_dst = self.state_indices_list[bs - 1]
+            if self._fused_state_indices_ok:
+                fused_replay_routed_state_indices(
+                    req_pool_indices=req_pool_indices,
+                    route_src_indices=mamba_cache_src_indices,
+                    route_dst_indices=mamba_cache_dst_indices,
+                    out_src_indices=static_src,
+                    out_dst_indices=static_dst,
+                    valid_bs=valid_bs,
+                    total_bs=bs,
+                )
+            else:
+                req_pool_indices[valid_bs:] = 0
+                route_src = self._translate_mamba_indices(mamba_cache_src_indices)
+                route_dst = self._translate_mamba_indices(mamba_cache_dst_indices)
+                static_src[:valid_bs].copy_(route_src)
+                static_dst[:valid_bs].copy_(route_dst)
+                if num_padding:
+                    static_src[valid_bs:].fill_(-1)
+                    static_dst[valid_bs:].fill_(-1)
+            mamba_indices = static_dst
+        elif self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
             # bit-identical to the reference chain below.
@@ -579,6 +690,15 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if self.state_src_indices_list is not None:
+            static_src = self.state_src_indices_list[bs - 1]
+            if mamba_cache_src_indices is None:
+                # Graph capture has no live decoupled request routes yet. Capture
+                # the dedicated source pointer and seed it with the in-place ids;
+                # replay will refresh it with the real source slots.
+                static_src.copy_(self.state_indices_list[bs - 1])
+        else:
+            static_src = self.state_indices_list[bs - 1]
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
@@ -708,6 +828,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=static_src,
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
@@ -719,6 +841,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_cache_src_indices=static_src,
+                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,

@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
     DraftClose,
+    DraftCommitAction,
     DraftControlBatch,
     DraftReqKey,
     DraftSync,
@@ -28,6 +29,59 @@ from sglang.srt.speculative.draft_tail_buffer import DraftTailSnapshot
 
 logger = logging.getLogger(__name__)
 
+GPU_DRAFT_TAIL_DEBUG_WIDTH = 7
+GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES = (
+    "reason",
+    # Current-epoch drafter APPEND arrival sequence; verifier-local updates do
+    # not advance it, and OPEN/CLOSE expose -1 until the next arrival.
+    "publish_seq",
+    "delta",
+    "raw_len",
+    "consumable_len",
+    "pending_len",
+    "committed_len",
+    "error_code",
+    "error_op_seq",
+    "pending_prefix_fast_forward_ct",
+    "seqlock_retries",
+)
+GPU_DRAFT_TAIL_SELECT_REASON_NAMES = (
+    "unset",
+    "invalid_seat",
+    "writer_in_progress",
+    "identity_mismatch",
+    "metadata_invalid",
+    "direct",
+    "logical_behind",
+    "delta_too_large",
+    "delta_beyond_consumable",
+    "bonus_mismatch",
+    "rebased",
+    "version_changed",
+    "logical_cursor_mismatch",
+    "pending_prefix",
+)
+GPU_DRAFT_TAIL_UPDATE_ERROR_NAMES = (
+    "none",
+    "invalid_op",
+    "op_sequence_regression",
+    "commit_prefix_mismatch",
+    "pending_tail_invariant",
+    "pending_capacity_exceeded",
+    "draft_base_ahead",
+    "draft_token_conflict",
+    "draft_token_skip",
+    "tail_capacity_exceeded",
+    "invalid_metadata",
+    "critical_commit_pending_prefix",
+    "critical_commit_invalid_length",
+    "critical_commit_logical_cursor_mismatch",
+    "commit_ack_ahead",
+    "drafter_commit_requires_replay",
+    "drafter_model_state_invalid",
+    "drafter_checkpoint_unavailable",
+)
+
 _IDLE_WAIT_S = 0.0005
 
 
@@ -40,7 +94,7 @@ def _load_decoupled_spec_cpp_module():
         source_dir / "gpu_draft_tail.cu",
     ]
     logger.info(
-        "Loading the decoupled-spec C++ data plane; JIT compilation may be "
+        "Loading the decoupled-spec GPU backend and wire codec; JIT compilation may be "
         "triggered: source=%s",
         sources,
     )
@@ -70,11 +124,14 @@ def _ensure_zmq_lib_path() -> None:
             return
 
 
-def _sync_row(message: DraftSync) -> tuple[str, int, int, list[int], list[int]]:
+def _sync_row(
+    message: DraftSync,
+) -> tuple[str, int, int, int, list[int], list[int]]:
     return (
         str(message.request_id),
         int(message.src_verifier_rank),
         int(message.dst_drafter_rank),
+        int(message.max_new_tokens),
         [int(token) for token in message.prompt_token_ids],
         [int(token) for token in message.committed_outputs],
     )
@@ -101,15 +158,39 @@ def _close_row(message: DraftClose) -> tuple[str, int, int, str]:
 
 def _tail_row(
     output: DraftTailStreamOutput,
-) -> tuple[int, int, str, int, int, int]:
+) -> tuple[int, int, str, int, int, list[int], bool]:
     return (
         int(output.src_drafter_rank),
         int(output.dst_verifier_rank),
         str(output.request_id),
         int(output.base_committed_len),
-        int(output.new_token_pos),
-        int(output.new_token),
+        int(output.start_token_pos),
+        [int(token) for token in output.tokens],
+        bool(output.is_commit_echo),
     )
+
+
+def _validate_verifier_control_batch(
+    batch: DraftControlBatch, *, verifier_rank: int
+) -> None:
+    dst_drafter_rank = int(batch.dst_drafter_rank)
+    for message in (
+        *batch.sync_messages,
+        *batch.verify_commit_messages,
+        *batch.close_messages,
+    ):
+        if int(message.src_verifier_rank) != int(verifier_rank):
+            raise RuntimeError(
+                "Verifier control source rank mismatch: "
+                f"expected_verifier_rank={verifier_rank} "
+                f"src_verifier_rank={message.src_verifier_rank}"
+            )
+        if int(message.dst_drafter_rank) != dst_drafter_rank:
+            raise RuntimeError(
+                "Verifier control destination rank mismatch: "
+                f"batch_drafter_rank={dst_drafter_rank} "
+                f"message_drafter_rank={message.dst_drafter_rank}"
+            )
 
 
 def _sync_from_native(row: Sequence[Any]) -> DraftSync:
@@ -117,8 +198,9 @@ def _sync_from_native(row: Sequence[Any]) -> DraftSync:
         request_id=str(row[0]),
         src_verifier_rank=int(row[1]),
         dst_drafter_rank=int(row[2]),
-        prompt_token_ids=[int(token) for token in row[3]],
-        committed_outputs=[int(token) for token in row[4]],
+        max_new_tokens=int(row[3]),
+        prompt_token_ids=[int(token) for token in row[4]],
+        committed_outputs=[int(token) for token in row[5]],
     )
 
 
@@ -153,12 +235,29 @@ def _segment_from_native(row: Sequence[Any]) -> VerifierCommitSegment:
     )
 
 
+def _action_from_native(row: Sequence[Any]) -> DraftCommitAction:
+    return DraftCommitAction(
+        draft_key=DraftReqKey(
+            src_verifier_rank=int(row[1]),
+            request_id=str(row[0]),
+        ),
+        dst_drafter_rank=int(row[2]),
+        expected_output_len=int(row[3]),
+        pre_verify_committed_len=int(row[4]),
+        new_committed_len=int(row[5]),
+        rewrite_position=int(row[6]),
+        rewrite_token=int(row[7]),
+        echo_position=int(row[8]),
+        echo_token=int(row[9]),
+    )
+
+
 class CppGpuDraftTailBuffer:
     """One rolling GPU tail row per request-pool seat.
 
-    The native verifier daemon is the only tail writer. The verify stream
-    calls :meth:`select_snapshot` immediately before target verification and
-    materializes a fixed-shape, forward-local snapshot without a host read.
+    The verifier role materializes direct snapshots from remote draft arrivals.
+    In drafter-authoritative mode, network controls and forward completion
+    instead share the same writer lock around branch/KV/state reconciliation.
     """
 
     def __init__(
@@ -168,6 +267,9 @@ class CppGpuDraftTailBuffer:
         num_seats: int,
         num_draft_tokens: int,
         landing_stream: torch.cuda.Stream,
+        mock_profile: bool = False,
+        drafter_authoritative: bool = False,
+        pending_token_capacity: int | None = None,
     ) -> None:
         device = torch.device(device)
         if device.type != "cuda":
@@ -189,7 +291,20 @@ class CppGpuDraftTailBuffer:
         self.num_seats = int(num_seats)
         self.num_draft_tokens = int(num_draft_tokens)
         self.tail_capacity = 2 * self.num_draft_tokens + 1
+        self.pending_token_capacity = (
+            self.tail_capacity
+            if pending_token_capacity is None
+            else int(pending_token_capacity)
+        )
+        if self.pending_token_capacity < self.tail_capacity:
+            raise ValueError(
+                "GPU pending-token capacity must cover the draft tail: "
+                f"pending={self.pending_token_capacity} "
+                f"tail={self.tail_capacity}"
+            )
         self.landing_stream = landing_stream
+        self.mock_profile = bool(mock_profile)
+        self.drafter_authoritative = bool(drafter_authoritative)
         with torch.cuda.device(device):
             self.versions = torch.zeros(
                 self.num_seats, dtype=torch.int64, device=device
@@ -199,12 +314,46 @@ class CppGpuDraftTailBuffer:
             self.active_request_epochs = torch.full_like(self.versions, -1)
             self.prompt_lens = torch.full_like(self.versions, -1)
             self.committed_lens = torch.full_like(self.versions, -1)
+            self.can_accept_prefix_lens = torch.full_like(self.versions, -1)
             self.raw_tail_lens = torch.zeros_like(self.versions)
             self.consumable_tail_lens = torch.zeros_like(self.versions)
-            self.tail_tokens = torch.zeros(
-                (self.num_seats, self.tail_capacity),
+            self.pending_expected_lens = torch.zeros_like(self.versions)
+            # Pending verifier tokens use absolute output position modulo the
+            # fixed row capacity, retaining the newest bounded suffix on lag.
+            self.pending_expected_tokens = torch.zeros(
+                (self.num_seats, self.pending_token_capacity),
                 dtype=torch.int64,
                 device=device,
+            )
+            self.tail_tokens = torch.full(
+                (self.num_seats, self.tail_capacity),
+                100 if self.mock_profile else 0,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.last_op_seqs = torch.zeros_like(self.versions)
+            self.error_codes = torch.zeros_like(self.versions)
+            self.error_op_seqs = torch.zeros_like(self.versions)
+            self.pending_prefix_fast_forward_cts = torch.zeros_like(self.versions)
+            self.model_output_lens = torch.full_like(self.versions, -1)
+            self.model_state_positions = torch.full_like(self.versions, -1)
+            self.model_input_tokens = torch.full_like(self.versions, -1)
+            # Exact logical-position tags prevent modulo-ring ABA when a
+            # checkpoint offset is reused after a branch rewind.
+            self.checkpoint_positions = torch.full(
+                (self.num_seats, self.tail_capacity),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            # A bounded cumulative snapshot is the only production token
+            # egress from an authoritative drafter GPU row.
+            self.egress_seqs = torch.zeros_like(self.versions)
+            self.last_commit_tokens = torch.full_like(self.versions, -1)
+            # Per-seat [request epoch, exclusive KV ownership high-water].
+            # Request-table cells past this bound may belong to an old lifetime.
+            self._decode_kv_ownership = torch.full(
+                (self.num_seats, 2), -1, dtype=torch.int64, device=device
             )
             self._init_event = torch.cuda.Event()
             self._init_event.record(torch.cuda.current_stream(device))
@@ -214,18 +363,37 @@ class CppGpuDraftTailBuffer:
             int(device.index),
             self.num_seats,
             self.num_draft_tokens,
+            self.pending_token_capacity,
             int(self.landing_stream.cuda_stream),
             int(self.versions.data_ptr()),
             int(self.publish_seqs.data_ptr()),
             int(self.request_epochs.data_ptr()),
-            int(self.active_request_epochs.data_ptr()),
             int(self.prompt_lens.data_ptr()),
             int(self.committed_lens.data_ptr()),
+            int(self.can_accept_prefix_lens.data_ptr()),
             int(self.raw_tail_lens.data_ptr()),
             int(self.consumable_tail_lens.data_ptr()),
+            int(self.pending_expected_lens.data_ptr()),
+            int(self.pending_expected_tokens.data_ptr()),
             int(self.tail_tokens.data_ptr()),
+            int(self.last_op_seqs.data_ptr()),
+            int(self.error_codes.data_ptr()),
+            int(self.error_op_seqs.data_ptr()),
+            int(self.pending_prefix_fast_forward_cts.data_ptr()),
+            int(self.model_output_lens.data_ptr()),
+            int(self.model_state_positions.data_ptr()),
+            int(self.model_input_tokens.data_ptr()),
+            int(self.checkpoint_positions.data_ptr()),
+            int(self.egress_seqs.data_ptr()),
+            int(self.last_commit_tokens.data_ptr()),
+            self.drafter_authoritative,
         )
         self._closed = False
+        # Retain stream objects as well as handles: initialization is immutable,
+        # so each decode stream needs this dependency only once.
+        self._decode_initialized_streams = {}
+        self._decode_checkpoint_table = None
+        self._decode_req_table = None
 
     @property
     def staging_slot_count(self) -> int:
@@ -245,10 +413,138 @@ class CppGpuDraftTailBuffer:
         gpu_seat = int(gpu_seat)
         request_epoch = int(request_epoch)
         self._cpp.bind_request(str(request_id), gpu_seat, request_epoch)
-        # Lifecycle metadata is updated once per seat assignment on the
-        # scheduler stream. This is not a per-round host-to-device dependency.
+        # This scheduler-stream tensor is the source for immutable per-launch
+        # epochs. GPU row ownership itself linearizes at the landing OPEN lock.
         with torch.cuda.device(self.device):
+            torch.cuda.current_stream(self.device).wait_event(self._init_event)
             self.active_request_epochs[gpu_seat] = request_epoch
+
+    def lookup_binding(
+        self, request_id: str, src_verifier_rank: int
+    ) -> tuple[int, int] | None:
+        """Return the native mirror seat and lifetime epoch for one control key."""
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        seat, request_epoch = self._cpp.lookup_binding_native(
+            str(request_id), int(src_verifier_rank)
+        )
+        if int(seat) < 0:
+            return None
+        return int(seat), int(request_epoch)
+
+    def wait_for_landing(self) -> None:
+        """Fence first-use lifecycle state without synchronizing the host."""
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_event(self._init_event)
+        self._cpp.wait_for_landing_native(int(current_stream.cuda_stream))
+
+    def capture_active_request_epochs(
+        self,
+        gpu_seats: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Freeze each batch row's lifecycle identity on the caller's stream."""
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        batch_size = int(gpu_seats.numel())
+        self._validate_vector(gpu_seats, "gpu_seats", batch_size, (torch.int64,))
+        self._validate_vector(out, "out", batch_size, (torch.int64,))
+        torch.index_select(self.active_request_epochs, 0, gpu_seats, out=out)
+        return out
+
+    def wait_for_landing_event(self, event: torch.cuda.Event) -> None:
+        """Order the caller's stream after one recorded landing watermark."""
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        torch.cuda.current_stream(self.device).wait_event(event)
+
+    def apply_verify_commit_from_device(
+        self,
+        gpu_seats: torch.Tensor,
+        expected_request_epochs: torch.Tensor,
+        pre_verify_seq_lens: torch.Tensor | None,
+        accept_tokens: torch.Tensor,
+        num_accept_tokens: torch.Tensor,
+        *,
+        accept_token_stride: int,
+        commit_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Apply one target-accepted run per row before the next GPU snapshot.
+
+        Decode passes its pre-verify sequence lengths. Extend passes ``None``
+        because its OPEN cursor is already the authoritative pre-commit cursor.
+        """
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        batch_size = int(gpu_seats.numel())
+        self._validate_vector(gpu_seats, "gpu_seats", batch_size, (torch.int64,))
+        self._validate_vector(
+            expected_request_epochs,
+            "expected_request_epochs",
+            batch_size,
+            (torch.int64,),
+        )
+        if pre_verify_seq_lens is not None:
+            self._validate_vector(
+                pre_verify_seq_lens,
+                "pre_verify_seq_lens",
+                batch_size,
+                (torch.int64,),
+            )
+        self._validate_vector(
+            num_accept_tokens,
+            "num_accept_tokens",
+            batch_size,
+            (torch.int32,),
+        )
+        accept_token_stride = int(accept_token_stride)
+        if not 0 < accept_token_stride <= self.tail_capacity:
+            raise ValueError(
+                "accept_token_stride must be inside the GPU tail capacity: "
+                f"stride={accept_token_stride} capacity={self.tail_capacity}"
+            )
+        if (
+            accept_tokens.device != self.device
+            or accept_tokens.dtype != torch.int32
+            or not accept_tokens.is_contiguous()
+            or accept_tokens.ndim != 1
+            or int(accept_tokens.numel()) != batch_size * accept_token_stride
+        ):
+            raise ValueError(
+                "accept_tokens must be a contiguous int32 CUDA vector with "
+                f"batch_size * stride values on {self.device}, got "
+                f"shape={tuple(accept_tokens.shape)} dtype={accept_tokens.dtype} "
+                f"device={accept_tokens.device}"
+            )
+        if commit_mask is not None:
+            self._validate_vector(
+                commit_mask,
+                "commit_mask",
+                batch_size,
+                (torch.bool,),
+            )
+
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_event(self._init_event)
+        self._cpp.apply_verify_commit_from_device_native(
+            int(gpu_seats.data_ptr()),
+            int(expected_request_epochs.data_ptr()),
+            (0 if pre_verify_seq_lens is None else int(pre_verify_seq_lens.data_ptr())),
+            int(accept_tokens.data_ptr()),
+            int(num_accept_tokens.data_ptr()),
+            0 if commit_mask is None else int(commit_mask.data_ptr()),
+            accept_token_stride,
+            batch_size,
+            int(current_stream.cuda_stream),
+        )
 
     def select_snapshot(
         self,
@@ -259,6 +555,7 @@ class CppGpuDraftTailBuffer:
         request_epochs: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
         out_cursor: torch.Tensor | None = None,
+        debug_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Select and materialize tails on the caller's current CUDA stream."""
 
@@ -273,7 +570,11 @@ class CppGpuDraftTailBuffer:
             batch_size,
             (torch.int32, torch.int64),
         )
-        if request_epochs is not None:
+        if not self.mock_profile:
+            if request_epochs is None:
+                raise ValueError(
+                    "Real GPU draft-tail selection requires request epochs"
+                )
             self._validate_vector(
                 request_epochs,
                 "request_epochs",
@@ -294,21 +595,297 @@ class CppGpuDraftTailBuffer:
         if out_cursor is None:
             out_cursor = torch.empty(batch_size, dtype=torch.int64, device=self.device)
         self._validate_vector(out_cursor, "out_cursor", batch_size, (torch.int64,))
+        debug_width = 0
+        if debug_out is not None:
+            if debug_out.ndim != 2 or int(debug_out.shape[0]) != batch_size:
+                raise ValueError(
+                    "debug_out must have shape [batch_size, width], got "
+                    f"shape={tuple(debug_out.shape)} batch_size={batch_size}"
+                )
+            debug_width = int(debug_out.shape[1])
+            if debug_width < GPU_DRAFT_TAIL_DEBUG_WIDTH:
+                raise ValueError(
+                    "debug_out width must be at least "
+                    f"{GPU_DRAFT_TAIL_DEBUG_WIDTH}, got {debug_width}"
+                )
+            self._validate_matrix(
+                debug_out,
+                "debug_out",
+                (batch_size, debug_width),
+            )
 
         current_stream = torch.cuda.current_stream(self.device)
         current_stream.wait_event(self._init_event)
-        self._cpp.select_snapshot_native(
-            int(gpu_seats.data_ptr()),
-            0 if request_epochs is None else int(request_epochs.data_ptr()),
-            int(seq_lens.data_ptr()),
-            int(bonus_tokens.data_ptr()),
-            bonus_tokens.dtype == torch.int32,
-            int(out.data_ptr()),
-            int(out_cursor.data_ptr()),
+        if self.mock_profile:
+            self._cpp.select_mock_snapshot_native(
+                int(gpu_seats.data_ptr()),
+                int(seq_lens.data_ptr()),
+                int(bonus_tokens.data_ptr()),
+                bonus_tokens.dtype == torch.int32,
+                int(out.data_ptr()),
+                int(out_cursor.data_ptr()),
+                0 if debug_out is None else int(debug_out.data_ptr()),
+                debug_width,
+                batch_size,
+                int(current_stream.cuda_stream),
+            )
+        else:
+            assert request_epochs is not None
+            self._cpp.select_snapshot_native(
+                int(gpu_seats.data_ptr()),
+                int(request_epochs.data_ptr()),
+                int(seq_lens.data_ptr()),
+                int(bonus_tokens.data_ptr()),
+                bonus_tokens.dtype == torch.int32,
+                int(out.data_ptr()),
+                int(out_cursor.data_ptr()),
+                0 if debug_out is None else int(debug_out.data_ptr()),
+                debug_width,
+                batch_size,
+                int(current_stream.cuda_stream),
+            )
+        return out, out_cursor
+
+    def prepare_decode(
+        self,
+        mirror_seats: torch.Tensor,
+        request_epochs: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        candidate_out_cache_locs: torch.Tensor,
+        checkpoint_slot_table: torch.Tensor | None,
+        req_to_token: torch.Tensor,
+        *,
+        resolved_input_ids: torch.Tensor,
+        resolved_seq_lens: torch.Tensor,
+        resolved_orig_seq_lens: torch.Tensor,
+        mamba_src_indices: torch.Tensor | None,
+        mamba_dst_indices: torch.Tensor | None,
+        captured_state_positions: torch.Tensor,
+        old_cache_locs: torch.Tensor,
+        validate_inputs: bool = True,
+    ) -> None:
+        """Resolve and bind one overlap decode batch on the caller stream."""
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        if not self.drafter_authoritative:
+            raise RuntimeError("prepare_decode requires a drafter GPU control mirror")
+        batch_size = int(mirror_seats.numel())
+        if not (
+            (checkpoint_slot_table is None)
+            == (mamba_src_indices is None)
+            == (mamba_dst_indices is None)
+        ):
+            raise ValueError(
+                "Recurrent checkpoint table and routes must be supplied together"
+            )
+        if validate_inputs:
+            for tensor, name in (
+                (mirror_seats, "mirror_seats"),
+                (request_epochs, "request_epochs"),
+                (req_pool_indices, "req_pool_indices"),
+                (candidate_out_cache_locs, "candidate_out_cache_locs"),
+                (resolved_input_ids, "resolved_input_ids"),
+                (resolved_seq_lens, "resolved_seq_lens"),
+                (captured_state_positions, "captured_state_positions"),
+                (old_cache_locs, "old_cache_locs"),
+            ):
+                self._validate_vector(tensor, name, batch_size, (torch.int64,))
+            if checkpoint_slot_table is not None:
+                self._validate_vector(
+                    mamba_src_indices, "mamba_src_indices", batch_size, (torch.int64,)
+                )
+                self._validate_vector(
+                    mamba_dst_indices, "mamba_dst_indices", batch_size, (torch.int64,)
+                )
+            self._validate_vector(
+                resolved_orig_seq_lens,
+                "resolved_orig_seq_lens",
+                batch_size,
+                (torch.int32,),
+            )
+        # Pool tables have fixed storage throughout an engine lifetime. Retain
+        # their owners and resolve their layout once; per-batch vectors above
+        # still require validation on every call.
+        if (
+            checkpoint_slot_table is not None
+            and checkpoint_slot_table is not self._decode_checkpoint_table
+        ):
+            self._validate_matrix(
+                checkpoint_slot_table, "checkpoint_slot_table",
+                (self.num_seats, self.tail_capacity),
+            )
+            self._decode_checkpoint_table = checkpoint_slot_table
+            self._decode_checkpoint_ptr = checkpoint_slot_table.data_ptr()
+        if req_to_token is not self._decode_req_table:
+            self._validate_req_to_token(req_to_token)
+            self._decode_req_table = req_to_token
+            self._decode_req_layout = (
+                req_to_token.data_ptr(), *req_to_token.shape
+            )
+        current_stream = torch.cuda.current_stream(self.device)
+        stream_handle = current_stream.cuda_stream
+        if stream_handle not in self._decode_initialized_streams:
+            current_stream.wait_event(self._init_event)
+            self._decode_initialized_streams[stream_handle] = current_stream
+        self._cpp.prepare_decode_native(
+            int(mirror_seats.data_ptr()),
+            int(request_epochs.data_ptr()),
+            int(req_pool_indices.data_ptr()),
+            int(candidate_out_cache_locs.data_ptr()),
+            0 if checkpoint_slot_table is None else self._decode_checkpoint_ptr,
+            self.tail_capacity,
+            *self._decode_req_layout,
+            int(resolved_input_ids.data_ptr()),
+            int(resolved_seq_lens.data_ptr()),
+            int(resolved_orig_seq_lens.data_ptr()),
+            0 if mamba_src_indices is None else int(mamba_src_indices.data_ptr()),
+            0 if mamba_dst_indices is None else int(mamba_dst_indices.data_ptr()),
+            int(captured_state_positions.data_ptr()),
+            int(old_cache_locs.data_ptr()),
+            int(self._decode_kv_ownership.data_ptr()),
             batch_size,
             int(current_stream.cuda_stream),
         )
-        return out, out_cursor
+
+    def finish_decode(
+        self,
+        mirror_seats: torch.Tensor,
+        request_epochs: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        candidate_out_cache_locs: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        req_to_token: torch.Tensor,
+        *,
+        resolved_input_tokens: torch.Tensor,
+        captured_state_positions: torch.Tensor,
+        old_cache_locs: torch.Tensor,
+        kv_outcomes: torch.Tensor,
+        future_output_tokens: torch.Tensor,
+        validate_inputs: bool = True,
+    ) -> None:
+        """Linearize a sample against its prepared position and input token.
+
+        resolved_input_tokens must retain the prepare output until this call
+        executes. A BS1 FutureMap view is allowed: finish reads it before
+        updating the relay slot on the same forward stream.
+        """
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        if not self.drafter_authoritative:
+            raise RuntimeError("finish_decode requires a drafter GPU control mirror")
+        batch_size = int(mirror_seats.numel())
+        if validate_inputs:
+            for tensor, name in (
+                (mirror_seats, "mirror_seats"),
+                (request_epochs, "request_epochs"),
+                (req_pool_indices, "req_pool_indices"),
+                (candidate_out_cache_locs, "candidate_out_cache_locs"),
+                (resolved_input_tokens, "resolved_input_tokens"),
+                (captured_state_positions, "captured_state_positions"),
+                (old_cache_locs, "old_cache_locs"),
+            ):
+                self._validate_vector(tensor, name, batch_size, (torch.int64,))
+            self._validate_vector(
+                sampled_tokens,
+                "sampled_tokens",
+                batch_size,
+                (torch.int32, torch.int64),
+            )
+            self._validate_matrix(
+                kv_outcomes,
+                "kv_outcomes",
+                (batch_size, 3),
+            )
+            self._validate_vector(
+                future_output_tokens,
+                "future_output_tokens",
+                int(future_output_tokens.numel()),
+                (torch.int64,),
+            )
+        if req_to_token is not self._decode_req_table:
+            self._validate_req_to_token(req_to_token)
+            self._decode_req_table = req_to_token
+            self._decode_req_layout = (
+                req_to_token.data_ptr(), *req_to_token.shape
+            )
+        current_stream = torch.cuda.current_stream(self.device)
+        stream_handle = current_stream.cuda_stream
+        if stream_handle not in self._decode_initialized_streams:
+            current_stream.wait_event(self._init_event)
+            self._decode_initialized_streams[stream_handle] = current_stream
+        self._cpp.finish_decode_native(
+            int(mirror_seats.data_ptr()),
+            int(request_epochs.data_ptr()),
+            int(req_pool_indices.data_ptr()),
+            int(candidate_out_cache_locs.data_ptr()),
+            int(sampled_tokens.data_ptr()),
+            sampled_tokens.dtype == torch.int32,
+            *self._decode_req_layout,
+            int(resolved_input_tokens.data_ptr()),
+            int(captured_state_positions.data_ptr()),
+            int(old_cache_locs.data_ptr()),
+            int(kv_outcomes.data_ptr()),
+            int(future_output_tokens.data_ptr()),
+            int(future_output_tokens.numel()),
+            batch_size,
+            int(current_stream.cuda_stream),
+        )
+
+    def append_prefill_sample(
+        self,
+        mirror_seats: torch.Tensor,
+        request_epochs: torch.Tensor,
+        sampled_tokens: torch.Tensor,
+        *,
+        accept_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Initialize model input and checkpoint tag after final prefill.
+
+        If verifier commits landed after the prefill launch, ``sampled_tokens``
+        is overwritten in place with the first forced token so the ordinary
+        final-prefill FutureMap/result path relays the authoritative value.
+        """
+
+        if self._closed:
+            raise RuntimeError("GPU draft-tail buffer is closed")
+        if not self.drafter_authoritative:
+            raise RuntimeError(
+                "append_prefill_sample requires a drafter GPU control mirror"
+            )
+        batch_size = int(mirror_seats.numel())
+        self._validate_vector(
+            mirror_seats, "mirror_seats", batch_size, (torch.int64,)
+        )
+        self._validate_vector(
+            request_epochs, "request_epochs", batch_size, (torch.int64,)
+        )
+        self._validate_vector(
+            sampled_tokens,
+            "sampled_tokens",
+            batch_size,
+            (torch.int32, torch.int64),
+        )
+        if accept_out is None:
+            accept_out = torch.empty(
+                batch_size, dtype=torch.bool, device=self.device
+            )
+        self._validate_vector(
+            accept_out, "accept_out", batch_size, (torch.bool,)
+        )
+        current_stream = torch.cuda.current_stream(self.device)
+        current_stream.wait_event(self._init_event)
+        self._cpp.append_prefill_sample_native(
+            int(mirror_seats.data_ptr()),
+            int(request_epochs.data_ptr()),
+            int(sampled_tokens.data_ptr()),
+            sampled_tokens.dtype == torch.int32,
+            int(accept_out.data_ptr()),
+            batch_size,
+            int(current_stream.cuda_stream),
+        )
+        return accept_out
 
     def close(self) -> None:
         if self._closed:
@@ -354,6 +931,21 @@ class CppGpuDraftTailBuffer:
                 f"{self.device} with shape {shape}, got "
                 f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
                 f"device={tensor.device}"
+            )
+
+    def _validate_req_to_token(self, req_to_token: torch.Tensor) -> None:
+        if (
+            req_to_token.device != self.device
+            or req_to_token.dtype != torch.int32
+            or not req_to_token.is_contiguous()
+            or req_to_token.ndim != 2
+            or int(req_to_token.shape[0]) <= 0
+            or int(req_to_token.shape[1]) <= 0
+        ):
+            raise ValueError(
+                "req_to_token must be a non-empty contiguous int32 CUDA matrix "
+                f"on {self.device}, got shape={tuple(req_to_token.shape)} "
+                f"dtype={req_to_token.dtype} device={req_to_token.device}"
             )
 
 
@@ -428,6 +1020,7 @@ class CppDraftTailBuffer:
 
     def append_draft_stream_batch(self, batch: DraftTailStreamOutputBatch) -> None:
         for output in batch.outputs:
+            output.validate()
             if int(output.dst_verifier_rank) != self.verifier_rank:
                 raise RuntimeError(
                     "Draft stream output targets a different verifier: "
@@ -538,28 +1131,13 @@ class CppDraftTailBuffer:
         ]
 
     def _validate_control_batch(self, batch: DraftControlBatch) -> None:
-        dst_drafter_rank = int(batch.dst_drafter_rank)
-        for message in (
-            *batch.sync_messages,
-            *batch.verify_commit_messages,
-            *batch.close_messages,
-        ):
-            if int(message.src_verifier_rank) != self.verifier_rank:
-                raise RuntimeError(
-                    "Verifier control source rank mismatch: "
-                    f"expected_verifier_rank={self.verifier_rank} "
-                    f"src_verifier_rank={message.src_verifier_rank}"
-                )
-            if int(message.dst_drafter_rank) != dst_drafter_rank:
-                raise RuntimeError(
-                    "Verifier control destination rank mismatch: "
-                    f"batch_drafter_rank={dst_drafter_rank} "
-                    f"message_drafter_rank={message.dst_drafter_rank}"
-                )
+        _validate_verifier_control_batch(batch, verifier_rank=self.verifier_rank)
 
 
 class CppVerifierDecoupledSpecDataPlane:
-    """Native verifier transport with synchronous local control application."""
+    """Verifier GPU backend and role API, with selectable socket transport."""
+
+    _python_transport = False
 
     def __init__(
         self,
@@ -571,6 +1149,7 @@ class CppVerifierDecoupledSpecDataPlane:
         num_gpu_seats: int | None = None,
         num_draft_tokens: int | None = None,
         landing_stream: torch.cuda.Stream | None = None,
+        mock_profile: bool = False,
     ) -> None:
         # Keep an injected pyzmq context alive and let native sockets share its
         # underlying libzmq context. This preserves inproc test/deployment
@@ -579,10 +1158,6 @@ class CppVerifierDecoupledSpecDataPlane:
         external_context = 0 if context is None else int(context.underlying)
         self.config = config
         self._peer_ranks = frozenset(int(peer.rank) for peer in config.peers)
-        self.draft_tail_buffer = CppDraftTailBuffer(
-            verifier_rank=int(config.rank),
-            required_tail_len=required_tail_len,
-        )
         gpu_config = (device, num_gpu_seats, num_draft_tokens, landing_stream)
         if any(value is not None for value in gpu_config) and not all(
             value is not None for value in gpu_config
@@ -597,21 +1172,36 @@ class CppVerifierDecoupledSpecDataPlane:
                 num_seats=int(num_gpu_seats),
                 num_draft_tokens=int(num_draft_tokens),
                 landing_stream=landing_stream,
+                mock_profile=mock_profile,
             )
             if device is not None
             else None
         )
-        if self.gpu_tail_buffer is not None:
-            self.draft_tail_buffer._cpp.attach_gpu_tail_buffer(
-                self.gpu_tail_buffer._cpp
+        self.draft_tail_buffer = (
+            CppDraftTailBuffer(
+                verifier_rank=int(config.rank),
+                required_tail_len=required_tail_len,
             )
+            if self.gpu_tail_buffer is None
+            else None
+        )
         self._transport = _load_decoupled_spec_cpp_module().DraftProxyThread(
             int(config.rank),
             str(config.bind_endpoint),
             _peer_rows(config),
-            self.draft_tail_buffer._cpp,
+            None if self.draft_tail_buffer is None else self.draft_tail_buffer._cpp,
+            None if self.gpu_tail_buffer is None else self.gpu_tail_buffer._cpp,
             external_context,
+            bool(mock_profile),
+            self._python_transport,
         )
+        if self._python_transport:
+            from sglang.srt.speculative.decoupled_spec_data_plane import PythonZmqTransport
+
+            self._transport = PythonZmqTransport(
+                self._transport, config, context, role="verifier"
+            )
+        self.mock_profile = bool(mock_profile)
         self._started = False
         self._closed = False
 
@@ -630,22 +1220,32 @@ class CppVerifierDecoupledSpecDataPlane:
             self._transport.close()
         finally:
             try:
-                self.draft_tail_buffer.close()
+                if self.draft_tail_buffer is not None:
+                    self.draft_tail_buffer.close()
             finally:
                 if self.gpu_tail_buffer is not None:
                     self.gpu_tail_buffer.close()
 
-    def submit_control_batch(self, batch: DraftControlBatch) -> None:
+    def take_transport_metrics(self) -> dict[str, Any]:
+        """Atomically drain the verifier transport-metric window."""
+
+        return dict(self._transport.take_transport_metrics())
+
+    def submit_control_batch(
+        self,
+        batch: DraftControlBatch,
+        *,
+        apply_local_verify_commits: bool = True,
+    ) -> None:
         self._ensure_running()
         self._validate_peer_rank(int(batch.dst_drafter_rank))
-        self.draft_tail_buffer._validate_control_batch(batch)
-        # The native method applies the batch to DraftTailBuffer under its lock
-        # before placing the same encoded batch on the network send queue.
+        _validate_verifier_control_batch(batch, verifier_rank=int(self.config.rank))
         self._transport.submit_control_batch_native(
             int(batch.dst_drafter_rank),
             [_sync_row(message) for message in batch.sync_messages],
             [_commit_row(message) for message in batch.verify_commit_messages],
             [_close_row(message) for message in batch.close_messages],
+            bool(apply_local_verify_commits),
         )
 
     def open_request(
@@ -671,16 +1271,19 @@ class CppVerifierDecoupledSpecDataPlane:
             sync_messages=[message for message, _, _ in requests],
         )
         self._validate_peer_rank(dst_drafter_rank)
-        self.draft_tail_buffer._validate_control_batch(control_batch)
+        _validate_verifier_control_batch(
+            control_batch, verifier_rank=int(self.config.rank)
+        )
         if self.gpu_tail_buffer is not None:
-            for message, gpu_seat, request_epoch in requests:
-                if gpu_seat is None or request_epoch is None:
-                    raise ValueError(
-                        "GPU draft-tail open requires gpu_seat and request_epoch"
+            if not self.mock_profile:
+                for message, gpu_seat, request_epoch in requests:
+                    if gpu_seat is None or request_epoch is None:
+                        raise ValueError(
+                            "GPU draft-tail open requires gpu_seat and request_epoch"
+                        )
+                    self.gpu_tail_buffer.bind_request(
+                        str(message.request_id), int(gpu_seat), int(request_epoch)
                     )
-                self.gpu_tail_buffer.bind_request(
-                    str(message.request_id), int(gpu_seat), int(request_epoch)
-                )
         elif any(
             gpu_seat is not None or request_epoch is not None
             for _, gpu_seat, request_epoch in requests
@@ -715,8 +1318,14 @@ class CppVerifierDecoupledSpecDataPlane:
         timeout_s: float | None = None,
     ) -> list[DraftTailSnapshot]:
         self._ensure_running()
+        if self.gpu_tail_buffer is not None:
+            raise RuntimeError(
+                "CPU draft-tail snapshots are a test-only reference and are not "
+                "available from the GPU-owned production data plane"
+            )
         if isinstance(request_ids, str):
             request_ids = [request_ids]
+        assert self.draft_tail_buffer is not None
         return self.draft_tail_buffer.get_draft_snapshots(
             request_ids,
             allow_partial=allow_partial,
@@ -770,24 +1379,59 @@ class CppVerifierDecoupledSpecDataPlane:
 
 
 class CppDrafterDecoupledSpecDataPlane:
-    """Native drafter inbox and tail publisher with the Python role contract."""
+    """Drafter backend and role API, with selectable socket transport."""
+
+    _python_transport = False
 
     def __init__(
         self,
         config: DecoupledSpecIpcConfig,
         *,
         context: Any | None = None,
+        device: str | torch.device | None = None,
+        num_gpu_seats: int | None = None,
+        num_draft_tokens: int | None = None,
+        pending_token_capacity: int | None = None,
+        landing_stream: torch.cuda.Stream | None = None,
     ) -> None:
         self._context = context
         external_context = 0 if context is None else int(context.underlying)
         self.config = config
         self._peer_ranks = frozenset(int(peer.rank) for peer in config.peers)
+        gpu_config = (device, num_gpu_seats, num_draft_tokens, landing_stream)
+        if any(value is not None for value in gpu_config) and not all(
+            value is not None for value in gpu_config
+        ):
+            raise ValueError(
+                "device, num_gpu_seats, num_draft_tokens, and landing_stream "
+                "must be supplied together for the drafter GPU control path"
+            )
+        self.gpu_tail_buffer = (
+            CppGpuDraftTailBuffer(
+                device=device,
+                num_seats=int(num_gpu_seats),
+                num_draft_tokens=int(num_draft_tokens),
+                pending_token_capacity=pending_token_capacity,
+                landing_stream=landing_stream,
+                drafter_authoritative=True,
+            )
+            if device is not None
+            else None
+        )
         self._transport = _load_decoupled_spec_cpp_module().TokenSyncThread(
             int(config.rank),
             str(config.bind_endpoint),
             _peer_rows(config),
             external_context,
+            None if self.gpu_tail_buffer is None else self.gpu_tail_buffer._cpp,
+            self._python_transport,
         )
+        if self._python_transport:
+            from sglang.srt.speculative.decoupled_spec_data_plane import PythonZmqTransport
+
+            self._transport = PythonZmqTransport(
+                self._transport, config, context, role="drafter"
+            )
         self._started = False
         self._closed = False
 
@@ -802,7 +1446,16 @@ class CppDrafterDecoupledSpecDataPlane:
         if self._closed:
             return
         self._closed = True
-        self._transport.close()
+        try:
+            self._transport.close()
+        finally:
+            if self.gpu_tail_buffer is not None:
+                self.gpu_tail_buffer.close()
+
+    def take_transport_metrics(self) -> dict[str, Any]:
+        """Atomically drain the drafter transport-metric window."""
+
+        return dict(self._transport.take_transport_metrics())
 
     def drain_controls(self, max_batches: int | None = None) -> list[DraftControlBatch]:
         self._ensure_running()
@@ -827,6 +1480,21 @@ class CppDrafterDecoupledSpecDataPlane:
                 )
             )
         return batches
+
+    def lookup_gpu_binding(
+        self, request_id: str, src_verifier_rank: int
+    ) -> tuple[int, int] | None:
+        """Return the auto-assigned GPU mirror identity for one DraftSync."""
+
+        self._ensure_running()
+        if self.gpu_tail_buffer is None:
+            return None
+        seat, request_epoch = self._transport.lookup_gpu_binding_native(
+            str(request_id), int(src_verifier_rank)
+        )
+        if int(seat) < 0:
+            return None
+        return int(seat), int(request_epoch)
 
     def pending_control_count(self) -> int:
         return int(self._transport.pending_control_count())
@@ -875,12 +1543,102 @@ class CppDrafterDecoupledSpecDataPlane:
             ready_commit_segments=[_segment_from_native(row) for row in segment_rows],
         )
 
-    def publish_tail(self, output: DraftTailStreamOutput) -> None:
+    def drain_gpu_progress(
+        self,
+    ) -> list[tuple[str, int, int, int, int, int]]:
+        """Drain ``(logical_output, committed, raw_tail)`` scheduling cursors."""
+
+        self._ensure_running()
+        if self.gpu_tail_buffer is None:
+            return []
+        return [
+            (
+                str(row[0]),
+                int(row[1]),
+                int(row[2]),
+                int(row[3]),
+                int(row[4]),
+                int(row[5]),
+            )
+            for row in self._transport.drain_gpu_progress_native()
+        ]
+
+    def collect_lifecycle_controls(self) -> ReadyDraftControls:
+        """Consume only OPEN/CLOSE while leaving verifier commits queued."""
+
+        self._ensure_running()
+        if self.gpu_tail_buffer is None:
+            # Legacy mode also exposes raw batches. Bound that compatibility
+            # queue while the segmented inbox atomically extracts lifecycle.
+            self._transport.drain_control_batches_native(-1)
+        sync_rows, close_rows, segment_rows = (
+            self._transport.extract_lifecycle_controls_native()
+        )
+        if segment_rows:
+            raise RuntimeError(
+                "Native lifecycle extraction unexpectedly consumed verifier commits"
+            )
+        return ReadyDraftControls(
+            sync_messages=[_sync_from_native(row) for row in sync_rows],
+            close_keys={
+                DraftReqKey(
+                    src_verifier_rank=int(row[1]),
+                    request_id=str(row[0]),
+                )
+                for row in close_rows
+            },
+        )
+
+    def collect_ready_actions(
+        self,
+        model_ready: Callable[[DraftReqKey, int], bool],
+    ) -> ReadyDraftControls:
+        """Let the native transcript plan commits for model-ready rows."""
+
+        self._ensure_running()
+        # Network ingress already inserted controls into the native inbox.
+        self._transport.drain_control_batches_native(-1)
+        probe_id, probe_rows = self._transport.probe_pending_controls_native()
+        eligibility = bytes(
+            int(
+                model_ready(
+                    DraftReqKey(
+                        src_verifier_rank=int(row[1]),
+                        request_id=str(row[0]),
+                    ),
+                    int(row[3]),
+                )
+            )
+            for row in probe_rows
+        )
+        sync_rows, close_rows, action_rows = (
+            self._transport.consume_ready_actions_native(probe_id, eligibility)
+        )
+        return ReadyDraftControls(
+            sync_messages=[_sync_from_native(row) for row in sync_rows],
+            close_keys={
+                DraftReqKey(
+                    src_verifier_rank=int(row[1]),
+                    request_id=str(row[0]),
+                )
+                for row in close_rows
+            },
+            commit_actions=[_action_from_native(row) for row in action_rows],
+        )
+
+    def publish_tail(
+        self,
+        output: DraftTailStreamOutput,
+    ) -> None:
         self.publish_tails(DraftTailStreamOutputBatch(outputs=[output]))
 
-    def publish_tails(self, batch: DraftTailStreamOutputBatch) -> None:
+    def publish_tails(
+        self,
+        batch: DraftTailStreamOutputBatch,
+    ) -> None:
         self._ensure_running()
         for output in batch.outputs:
+            output.validate()
             if int(output.src_drafter_rank) != int(self.config.rank):
                 raise RuntimeError(
                     "Draft tail source rank mismatch: "
@@ -890,7 +1648,7 @@ class CppDrafterDecoupledSpecDataPlane:
             self._validate_peer_rank(int(output.dst_verifier_rank))
         if batch.outputs:
             self._transport.submit_draft_results_native(
-                [_tail_row(output) for output in batch.outputs]
+                [_tail_row(output) for output in batch.outputs],
             )
 
     def _ensure_running(self) -> None:
@@ -913,6 +1671,10 @@ def _peer_rows(config: DecoupledSpecIpcConfig) -> list[tuple[int, str]]:
 
 
 __all__ = [
+    "GPU_DRAFT_TAIL_DEBUG_WIDTH",
+    "GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES",
+    "GPU_DRAFT_TAIL_SELECT_REASON_NAMES",
+    "GPU_DRAFT_TAIL_UPDATE_ERROR_NAMES",
     "CppGpuDraftTailBuffer",
     "CppDraftTailBuffer",
     "CppDrafterDecoupledSpecDataPlane",

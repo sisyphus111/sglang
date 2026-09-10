@@ -389,7 +389,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_src_indices = (
+            self.forward_metadata.mamba_cache_src_indices
+            if self.forward_metadata.mamba_cache_src_indices is not None
+            else self.forward_metadata.mamba_cache_indices
+        )
+        cache_dst_indices = (
+            self.forward_metadata.mamba_cache_dst_indices
+            if self.forward_metadata.mamba_cache_dst_indices is not None
+            else self.forward_metadata.mamba_cache_indices
+        )
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -409,7 +418,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.conv_weights,
             layer.bias,
             layer.activation,
-            conv_state_indices=cache_indices,
+            conv_state_src_indices=cache_src_indices,
+            conv_state_dst_indices=cache_dst_indices,
         )
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -423,7 +433,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dt_bias=layer.dt_bias,
                 scale=layer.head_k_dim**-0.5,
                 ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                cache_indices=cache_src_indices,
+                final_state_indices=cache_dst_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 replayssm_d=replayssm_d,
@@ -433,7 +444,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+                forward_batch,
+                conv_states,
+                ssm_states,
+                cache_dst_indices,
+                layer.layer_id,
             )
             return core_attn_out
 
@@ -457,12 +472,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
-            cache_indices=cache_indices,
+            cache_indices=cache_src_indices,
+            final_state_indices=cache_dst_indices,
             query_start_loc=query_start_loc,
         )
 
         self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            forward_batch,
+            conv_states,
+            ssm_states,
+            cache_dst_indices,
+            layer.layer_id,
         )
 
         return core_attn_out

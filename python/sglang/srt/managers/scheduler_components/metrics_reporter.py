@@ -15,6 +15,8 @@ from typing import (
     Union,
 )
 
+import msgspec
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import DecodeMetricsWindow
@@ -156,6 +158,7 @@ class SchedulerMetricsReporter:
         self.decode_log_interval = self.scheduler.server_args.decode_log_interval
         self.decode_metrics_window_id = 0
         self.decode_metrics_windows = deque(maxlen=DECODE_METRICS_WINDOW_HISTORY)
+        self._pending_decoupled_decode_metrics_window = None
         self.decode_window_num_rows = 0
         self.decode_window_sum_context_lens = 0
 
@@ -398,34 +401,79 @@ class SchedulerMetricsReporter:
         """Freeze one CPU-only decode window for load-snapshot consumers."""
         if elapsed_s <= 0 or num_decode_iters <= 0:
             return
+        scheduler = getattr(self, "scheduler", None)
+        manager = (
+            None
+            if scheduler is None
+            else getattr(scheduler, "decoupled_spec_manager", None)
+        )
         self.decode_metrics_window_id += 1
+        window = DecodeMetricsWindow(
+            window_id=self.decode_metrics_window_id,
+            end_time=time.time(),
+            num_decode_iters=num_decode_iters,
+            iter_latency_ms=elapsed_s * 1000.0 / num_decode_iters,
+            num_decode_rows=num_decode_rows,
+            sum_context_lens=sum_context_lens,
+            mean_batch_size=(
+                num_decode_rows / num_decode_iters if num_decode_iters > 0 else None
+            ),
+            mean_context_length=(
+                sum_context_lens / num_decode_rows if num_decode_rows > 0 else None
+            ),
+            num_verify_rows=num_verify_rows,
+            num_accept_tokens=num_accept_tokens,
+            num_proposed_drafts=num_proposed_drafts,
+            accept_length=(
+                num_accept_tokens / num_verify_rows if num_verify_rows > 0 else None
+            ),
+            proposed_draft_length=(
+                num_proposed_drafts / num_verify_rows if num_verify_rows > 0 else None
+            ),
+        )
+        if manager is None:
+            self.decode_metrics_windows.append(window)
+            return
+        if getattr(self, "_pending_decoupled_decode_metrics_window", None) is not None:
+            raise RuntimeError(
+                "A decoupled-spec decode metrics window crossed two boundaries "
+                "without result finalization."
+            )
+        # BatchResultProcessor owns the async D2H completion barrier. Defer the
+        # selector/transport drain until manager.after_process_batch_result.
+        self._pending_decoupled_decode_metrics_window = window
+
+    def finish_decoupled_decode_metrics_window(self) -> None:
+        """Finalize a pending window after the standard result-copy barrier."""
+
+        window = getattr(self, "_pending_decoupled_decode_metrics_window", None)
+        if window is None:
+            return
+        manager = getattr(self.scheduler, "decoupled_spec_manager", None)
+        if manager is None:
+            raise RuntimeError(
+                "A pending decoupled-spec metrics window lost its manager."
+            )
+        decoupled_spec = manager.take_decode_metrics_window()
+        tail_select = None if decoupled_spec is None else decoupled_spec.tail_select
+        if (
+            tail_select is not None
+            and tail_select.num_select_rows != window.num_verify_rows
+        ):
+            raise RuntimeError(
+                "Decoupled-spec selector rows do not align with the decode window: "
+                f"window_id={window.window_id} "
+                f"select_rows={tail_select.num_select_rows} "
+                f"verify_rows={window.num_verify_rows}"
+            )
         self.decode_metrics_windows.append(
-            DecodeMetricsWindow(
-                window_id=self.decode_metrics_window_id,
+            msgspec.structs.replace(
+                window,
                 end_time=time.time(),
-                num_decode_iters=num_decode_iters,
-                iter_latency_ms=elapsed_s * 1000.0 / num_decode_iters,
-                num_decode_rows=num_decode_rows,
-                sum_context_lens=sum_context_lens,
-                mean_batch_size=(
-                    num_decode_rows / num_decode_iters if num_decode_iters > 0 else None
-                ),
-                mean_context_length=(
-                    sum_context_lens / num_decode_rows if num_decode_rows > 0 else None
-                ),
-                num_verify_rows=num_verify_rows,
-                num_accept_tokens=num_accept_tokens,
-                num_proposed_drafts=num_proposed_drafts,
-                accept_length=(
-                    num_accept_tokens / num_verify_rows if num_verify_rows > 0 else None
-                ),
-                proposed_draft_length=(
-                    num_proposed_drafts / num_verify_rows
-                    if num_verify_rows > 0
-                    else None
-                ),
+                decoupled_spec=decoupled_spec,
             )
         )
+        self._pending_decoupled_decode_metrics_window = None
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -589,6 +637,17 @@ class SchedulerMetricsReporter:
         self.spec_num_cap_tokens = 0
         self.decode_window_num_rows = 0
         self.decode_window_sum_context_lens = 0
+        scheduler = getattr(self, "scheduler", None)
+        manager = (
+            None
+            if scheduler is None
+            else getattr(scheduler, "decoupled_spec_manager", None)
+        )
+        if manager is not None:
+            # A cache flush starts a new formal measurement interval. Discard
+            # the partial native exchange window so it cannot leak across it.
+            manager.take_decode_metrics_window()
+        self._pending_decoupled_decode_metrics_window = None
 
     def report_prefill_stats(
         self,

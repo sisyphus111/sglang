@@ -133,6 +133,92 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def _build_prefill_req(
+        self, *, max_new_tokens: int, ignore_eos: bool, extend_input_len: int = 4
+    ) -> MagicMock:
+        req = self.create_mock_req(
+            "draft_mirror", priority=0, max_new_tokens=max_new_tokens
+        )
+        req.host_hit_length = 0
+        req.swa_host_hit_length = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        req.origin_input_ids = list(range(extend_input_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = ignore_eos
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_ignore_decode_budget_admits_both_eos_modes(self):
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                self.mock_tree_cache = self.create_tree_cache()
+                self.mock_tree_cache.disable = True
+                self.mock_token_allocator = self.create_token_allocator(
+                    available_size=8
+                )
+
+                guarded = self.create_adder(self.create_running_batch())
+                self.assertEqual(
+                    guarded.add_one_req(
+                        self._build_prefill_req(
+                            max_new_tokens=1 << 30, ignore_eos=ignore_eos
+                        ),
+                        has_chunked_req=False,
+                        truncation_align_size=None,
+                    ),
+                    AddReqResult.NO_TOKEN,
+                )
+
+                unguarded = self.create_adder(
+                    self.create_running_batch(), ignore_decode_budget=True
+                )
+                self.assertEqual(
+                    unguarded.add_one_req(
+                        self._build_prefill_req(
+                            max_new_tokens=1 << 30, ignore_eos=ignore_eos
+                        ),
+                        has_chunked_req=False,
+                        truncation_align_size=None,
+                    ),
+                    AddReqResult.CONTINUE,
+                )
+                self.assertEqual(len(unguarded.can_run_list), 1)
+                self.assertEqual(unguarded.rem_total_token_offset, 5)
+
+    def test_ignore_decode_budget_zeroes_running_and_swa_future_headroom(self):
+        running_req = self.create_mock_req(
+            "running", priority=0, max_new_tokens=1 << 30
+        )
+        adder = self.create_adder(
+            self.create_running_batch([running_req]), ignore_decode_budget=True
+        )
+
+        self.assertEqual(adder.rem_total_token_offset, 0)
+        self.assertEqual(adder._get_running_request_total_token_offset(running_req), 0)
+        self.assertEqual(adder._swa_new_tokens(running_req), 0)
+
+    def test_ignore_decode_budget_still_charges_actual_mamba_state(self):
+        self.mock_token_allocator = self.create_token_allocator(available_size=100)
+        adder = self.create_adder(
+            self.create_running_batch(), ignore_decode_budget=True
+        )
+        adder._mamba_slot_cost = 7
+        adder.rem_mamba_slots = 2
+        req = self._build_prefill_req(max_new_tokens=1 << 30, ignore_eos=False)
+        req.mamba_pool_idx = None
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual(adder.rem_total_token_offset, 12)
+        self.assertEqual(adder.rem_mamba_slots, 1)
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

@@ -37,8 +37,10 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=None,
             page_size=(1 if role == "drafter" else 64),
+            disable_radix_cache=(role == "drafter"),
             mamba_radix_cache_strategy="extra_buffer",
             enable_linear_replayssm=False,
+            enable_mixed_chunk=False,
             max_running_requests=None,
             max_mamba_cache_size=None,
         )
@@ -63,33 +65,76 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
 
         self.assertEqual(compute_num_reserved_tokens(args), 4)
 
-    def test_drafter_is_plain_non_overlap_decode(self):
-        args = self._args("drafter")
+    def test_drafter_plain_decode_supports_both_schedule_modes(self):
+        for disable_overlap_schedule in (True, False):
+            with self.subTest(disable_overlap_schedule=disable_overlap_schedule):
+                args = self._args(
+                    "drafter",
+                    disable_overlap_schedule=disable_overlap_schedule,
+                )
 
-        _handle_decoupled_spec(args)
+                _handle_decoupled_spec(args)
 
-        self.assertIsNone(args.speculative_algorithm)
-        self.assertTrue(args.disable_overlap_schedule)
-        self.assertEqual(args.speculative_eagle_topk, 1)
-        self.assertEqual(args.speculative_num_draft_tokens, 4)
-        self.assertEqual(args.max_running_requests, 1)
-        self.assertEqual(args.max_mamba_cache_size, 8)
+                self.assertIsNone(args.speculative_algorithm)
+                self.assertEqual(
+                    args.disable_overlap_schedule, disable_overlap_schedule
+                )
+                self.assertEqual(args.speculative_eagle_topk, 1)
+                self.assertEqual(args.speculative_num_draft_tokens, 4)
+                self.assertEqual(args.max_running_requests, 1)
+                self.assertEqual(args.max_mamba_cache_size, 8)
 
     def test_drafter_rollback_geometry_is_fail_fast(self):
-        cases = [
-            (dict(tp_size=2), "tp_size == 1"),
-            (dict(page_size=64), "page_size == 1"),
-            (dict(enable_linear_replayssm=True), "ReplaySSM disabled"),
-            (
-                dict(max_running_requests=2, max_mamba_cache_size=15),
-                "required=16",
-            ),
-        ]
-        for overrides, error in cases:
-            with self.subTest(overrides=overrides), self.assertRaisesRegex(
-                ValueError, error
-            ):
-                _handle_decoupled_spec(self._args("drafter", **overrides))
+        for disable_overlap_schedule in (True, False):
+            cases = [
+                (dict(tp_size=2), "tp_size == 1"),
+                (dict(page_size=64), "page_size == 1"),
+                (dict(enable_linear_replayssm=True), "ReplaySSM disabled"),
+                (
+                    dict(max_running_requests=2, max_mamba_cache_size=15),
+                    "required=16",
+                ),
+            ]
+            for overrides, error in cases:
+                with self.subTest(
+                    disable_overlap_schedule=disable_overlap_schedule,
+                    overrides=overrides,
+                ), self.assertRaisesRegex(ValueError, error):
+                    _handle_decoupled_spec(
+                        self._args(
+                            "drafter",
+                            disable_overlap_schedule=disable_overlap_schedule,
+                            **overrides,
+                        )
+                    )
+
+    def test_drafter_overlap_rejects_mixed_chunked_prefill(self):
+        with self.assertRaisesRegex(ValueError, "mixed chunked prefill"):
+            _handle_decoupled_spec(
+                self._args(
+                    "drafter",
+                    disable_overlap_schedule=False,
+                    enable_mixed_chunk=True,
+                )
+            )
+
+        args = self._args(
+            "drafter",
+            disable_overlap_schedule=True,
+            enable_mixed_chunk=True,
+        )
+        _handle_decoupled_spec(args)
+        self.assertTrue(args.enable_mixed_chunk)
+
+    def test_drafter_overlap_requires_private_checkpoint_ownership(self):
+        with self.assertRaisesRegex(ValueError, "disable-radix-cache"):
+            _handle_decoupled_spec(
+                self._args(
+                    "drafter",
+                    disable_overlap_schedule=False,
+                    disable_radix_cache=False,
+                )
+            )
 
     def test_role_algorithm_contract_is_fail_fast(self):
         cases = [
@@ -108,26 +153,30 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
                 self._args("null", speculative_algorithm="DECOUPLED_VERIFY"),
                 "requires --decoupled-spec-role verifier",
             ),
-            (
-                "overlap_drafter",
-                self._args("drafter", disable_overlap_schedule=False),
-                "requires --disable-overlap-schedule",
-            ),
         ]
         for name, args, error in cases:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
                 _handle_decoupled_spec(args)
 
-    def test_active_runtime_requires_the_cpp_data_plane(self):
-        for role in ("verifier", "drafter"):
+    def test_active_runtime_accepts_python_transport(self):
+        cases = [
+            ("verifier", False),
+            ("drafter", True),
+            ("drafter", False),
+        ]
+        for role, disable_overlap_schedule in cases:
             with self.subTest(
-                role=role
+                role=role,
+                disable_overlap_schedule=disable_overlap_schedule,
             ), envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(
                 False
-            ), self.assertRaisesRegex(
-                ValueError, "requires the native C\\+\\+ data plane"
             ):
-                _handle_decoupled_spec(self._args(role))
+                _handle_decoupled_spec(
+                    self._args(
+                        role,
+                        disable_overlap_schedule=disable_overlap_schedule,
+                    )
+                )
 
     def test_parallel_topology_guards_remain_fail_fast(self):
         cases = [

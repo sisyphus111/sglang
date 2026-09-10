@@ -27,6 +27,7 @@ import torch
 
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
+    fused_replay_routed_state_indices,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -186,6 +187,56 @@ class TestFusedReplayStateIndices(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out_ref, out_fused))
         self.assertTrue(torch.equal(req_ref, req_fused))
+
+    def test_routed_src_dst_matrix(self):
+        device = torch.device("cuda")
+        for total_bs in (1, 2, 7, 32, 33):
+            for num_padding in sorted(
+                {0, 1, total_bs // 2, total_bs - 1} & set(range(total_bs))
+            ):
+                valid_bs = total_bs - num_padding
+                with self.subTest(total_bs=total_bs, num_padding=num_padding):
+                    req_pool = torch.arange(
+                        total_bs + _GUARD, dtype=torch.int64, device=device
+                    )
+                    req_pool[total_bs:] = _GUARD_SENTINEL
+                    route_src = torch.arange(
+                        100, 100 + valid_bs, dtype=torch.int64, device=device
+                    )
+                    route_dst = torch.arange(
+                        200, 200 + valid_bs, dtype=torch.int64, device=device
+                    )
+                    out_src = torch.full(
+                        (total_bs + _GUARD,),
+                        _OUT_POISON,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    out_dst = torch.full_like(out_src, _OUT_POISON)
+
+                    returned_src, returned_dst = fused_replay_routed_state_indices(
+                        req_pool_indices=req_pool,
+                        route_src_indices=route_src,
+                        route_dst_indices=route_dst,
+                        out_src_indices=out_src,
+                        out_dst_indices=out_dst,
+                        valid_bs=valid_bs,
+                        total_bs=total_bs,
+                    )
+                    torch.cuda.synchronize()
+
+                    self.assertTrue(
+                        torch.equal(returned_src[:valid_bs], route_src.to(torch.int32))
+                    )
+                    self.assertTrue(
+                        torch.equal(returned_dst[:valid_bs], route_dst.to(torch.int32))
+                    )
+                    self.assertTrue((returned_src[valid_bs:] == -1).all())
+                    self.assertTrue((returned_dst[valid_bs:] == -1).all())
+                    self.assertTrue((req_pool[valid_bs:total_bs] == 0).all())
+                    self.assertTrue((req_pool[total_bs:] == _GUARD_SENTINEL).all())
+                    self.assertTrue((out_src[total_bs:] == _OUT_POISON).all())
+                    self.assertTrue((out_dst[total_bs:] == _OUT_POISON).all())
 
 
 if __name__ == "__main__":

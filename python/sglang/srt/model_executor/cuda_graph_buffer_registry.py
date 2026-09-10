@@ -512,6 +512,7 @@ def build_decode_registry(
     seq_len_fill_value: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool = False,
+    enable_mamba_cache_routing: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
@@ -530,6 +531,7 @@ def build_decode_registry(
 
       - ``seq_lens`` / ``seq_lens_cpu`` -> FILL_SENTINEL(seq_len_fill_value)
       - ``req_pool_indices`` / ``out_cache_loc`` / ``mamba_track_*`` -> ZERO
+      - ``mamba_cache_{src,dst}_indices`` -> FILL_SENTINEL(-1)
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
         triggers an illegal memory access (issue #24361).
@@ -607,6 +609,18 @@ def build_decode_registry(
             padding_policy=PaddingPolicy.ZERO,
         ),
     ]
+    if enable_mamba_cache_routing:
+        for name in ("mamba_cache_src_indices", "mamba_cache_dst_indices"):
+            slots.append(
+                GraphSlot(
+                    name,
+                    _bs,
+                    torch.int64,
+                    axis="bs",
+                    padding_policy=PaddingPolicy.FILL_SENTINEL,
+                    pad_value=-1,
+                )
+            )
     if enable_mamba_track:
         slots.append(
             GraphSlot(

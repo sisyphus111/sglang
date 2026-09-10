@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Decoupled-Spec Campaign"
+  short_description: "Run and resume multiple benchmark cases"
+  default_prompt: "Use $run-decoupled-spec-campaign to materialize and run this multi-case decoupled-spec experiment."

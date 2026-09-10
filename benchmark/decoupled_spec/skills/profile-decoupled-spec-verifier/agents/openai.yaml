@@ -1,0 +1,6 @@
+interface:
+  display_name: "Profile Decoupled Verifier"
+  short_description: "Build scheduler-cycle costs for adaptive verifier K"
+  default_prompt: "Use $profile-decoupled-spec-verifier to generate and validate a decoupled verifier profile JSON."
+policy:
+  allow_implicit_invocation: true

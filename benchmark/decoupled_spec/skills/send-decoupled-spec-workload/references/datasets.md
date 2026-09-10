@@ -1,7 +1,7 @@
 # Dataset Contracts
 
-The loader reads enough rows for one batch and saves the selected material in
-`client/sampled_requests.jsonl`.
+The loader reads enough rows for one batch. The selected material is saved in
+the fixed `client/content.json` contract.
 
 | `dataset.format` | Source behavior | Prompt/reference behavior |
 | --- | --- | --- |
@@ -28,10 +28,9 @@ saved source metadata also retains `extra_info.index` as `dataset_index`.
 - With `shuffle: false`, the first `batch.size` rows are used.
 - With `shuffle: true`, rows are shuffled with a local RNG seeded by
   `dataset.seed`, then the first `batch.size` rows are used.
-- The current `row_index` is the index within the selected batch after optional
-  shuffle. Use the saved prompt, source format, resolved config, and dataset
-  path together for provenance; do not interpret it as a stable source-file row
-  ID after shuffle.
+- `batch_row_index` is the index within the submitted batch after optional
+  shuffle. `dataset_idx` is the zero-based physical row in the selected source
+  file before shuffle and remains stable after selection.
 
 ## Synthetic inputs
 

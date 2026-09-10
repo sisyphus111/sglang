@@ -1,6 +1,6 @@
 interface:
   display_name: "Run Decoupled-Spec Benchmark"
   short_description: "Run one traceable decoupled-spec benchmark"
-  default_prompt: "Use $run-decoupled-spec-benchmark to run one fully traceable case from a unified Ray server config plus client and collector configs."
+  default_prompt: "Use $run-decoupled-spec-benchmark to run one fully traceable case from a unified Ray server config plus client and observer configs."
 policy:
   allow_implicit_invocation: true

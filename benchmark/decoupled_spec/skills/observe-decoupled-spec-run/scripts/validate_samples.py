@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
-"""Validate observability sample quality and formal-window coverage."""
+"""Validate observer sample quality and formal-window coverage."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
+
+_TAIL_HISTOGRAM_FIELDS = (
+    "selected_draft_length_histogram",
+    "raw_draft_tail_length_histogram",
+    "consumable_draft_tail_length_histogram",
+    "logical_delta_histogram",
+    "pending_prefix_length_histogram",
+)
+_DRAFTER_TRANSPORT_FIELDS = {
+    "draft_send_queue_latency_us",
+    "draft_send_queue_depth_max",
+}
+_VERIFIER_TRANSPORT_FIELDS = {
+    "draft_result_ready_to_receive_latency_us",
+    "draft_receive_to_gpu_publish_enqueue_latency_us",
+    "draft_gpu_publish_completion_latency_us",
+    "draft_transport_one_way_latency_us",
+    "gpu_publish_staging_slots_max",
+    "clock_sync_valid",
+    "clock_error_bound_us",
+    "num_clock_sync_valid_peers",
+    "num_clock_sync_invalid_peers",
+}
+_LATENCY_HISTOGRAM_FIELDS = {
+    "draft_send_queue_latency_us",
+    "draft_result_ready_to_receive_latency_us",
+    "draft_receive_to_gpu_publish_enqueue_latency_us",
+    "draft_gpu_publish_completion_latency_us",
+    "draft_transport_one_way_latency_us",
+}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -56,53 +87,384 @@ def _max_gap(times: list[float]) -> float | None:
     )
 
 
-def _expected_targets(
-    config: dict[str, Any], required_roles: list[str], errors: list[str]
-) -> dict[str, dict[str, Any]]:
-    targets = config.get("targets")
-    if not isinstance(targets, dict) or not targets:
-        if isinstance(config.get("server_manifest"), dict):
-            errors.append("observability config has no targets")
-            return {}
-        return {
-            role: {
-                "target_id": role,
-                "role": role,
-                "rank": 0,
-                "base_url": None,
-            }
-            for role in required_roles
-        }
+def _validate_nonnegative_int(value: Any, field: str, errors: list[str]) -> bool:
+    if type(value) is not int or value < 0:
+        errors.append(f"{field} must be a non-negative integer, got {value!r}")
+        return False
+    return True
 
+
+def _validate_integer_histogram(
+    value: Any,
+    field: str,
+    expected_count: int | None,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be an IntegerHistogram mapping")
+        return
+    offset = value.get("offset")
+    counts = value.get("counts")
+    if type(offset) is not int:
+        errors.append(f"{field}.offset must be an integer")
+    if not isinstance(counts, list):
+        errors.append(f"{field}.counts must be a list")
+        return
+    counts_valid = all(
+        _validate_nonnegative_int(count, f"{field}.counts[{index}]", errors)
+        for index, count in enumerate(counts)
+    )
+    underflow = value.get("underflow_count")
+    overflow = value.get("overflow_count")
+    underflow_valid = _validate_nonnegative_int(
+        underflow, f"{field}.underflow_count", errors
+    )
+    overflow_valid = _validate_nonnegative_int(
+        overflow, f"{field}.overflow_count", errors
+    )
+    if (
+        counts_valid
+        and underflow_valid
+        and overflow_valid
+        and expected_count is not None
+    ):
+        observed_count = sum(counts) + underflow + overflow
+        if observed_count != expected_count:
+            errors.append(
+                f"{field} coverage mismatch: observed={observed_count}, "
+                f"num_select_rows={expected_count}"
+            )
+
+
+def _validate_latency_histogram(value: Any, field: str, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be a LatencyHistogram mapping")
+        return
+    count = value.get("count")
+    sum_us = value.get("sum_us")
+    bounds = value.get("bucket_upper_bounds_us")
+    bucket_counts = value.get("bucket_counts")
+    count_valid = _validate_nonnegative_int(count, f"{field}.count", errors)
+    if (
+        not isinstance(sum_us, (int, float))
+        or isinstance(sum_us, bool)
+        or not math.isfinite(float(sum_us))
+        or sum_us < 0
+    ):
+        errors.append(f"{field}.sum_us must be finite and non-negative")
+    if not isinstance(bounds, list) or any(
+        not isinstance(bound, (int, float))
+        or isinstance(bound, bool)
+        or not math.isfinite(float(bound))
+        or bound < 0
+        for bound in (bounds or [])
+    ):
+        errors.append(f"{field}.bucket_upper_bounds_us must contain finite bounds")
+        return
+    if any(right <= left for left, right in zip(bounds, bounds[1:])):
+        errors.append(f"{field}.bucket_upper_bounds_us must be strictly increasing")
+    if not isinstance(bucket_counts, list):
+        errors.append(f"{field}.bucket_counts must be a list")
+        return
+    bucket_counts_valid = all(
+        _validate_nonnegative_int(
+            bucket_count, f"{field}.bucket_counts[{index}]", errors
+        )
+        for index, bucket_count in enumerate(bucket_counts)
+    )
+    if len(bucket_counts) != len(bounds) + 1:
+        errors.append(
+            f"{field}.bucket_counts must contain one non-cumulative overflow bucket"
+        )
+    if count_valid and bucket_counts_valid and count != sum(bucket_counts):
+        errors.append(f"{field}.count must equal sum(bucket_counts)")
+
+
+def _validate_decoupled_spec_window(
+    role: str,
+    target_id: str,
+    dp_rank: int,
+    window_id: int,
+    window: dict[str, Any],
+    errors: list[str],
+) -> None:
+    decoupled_spec = window.get("decoupled_spec")
+    if decoupled_spec is None:
+        return
+    prefix = f"{target_id}/dp{dp_rank}/window{window_id}.decoupled_spec"
+    if not isinstance(decoupled_spec, dict):
+        errors.append(f"{prefix} must be a mapping")
+        return
+
+    tail_select = decoupled_spec.get("tail_select")
+    if tail_select is not None:
+        if role != "verifier":
+            errors.append(f"{prefix}.tail_select is verifier-only")
+        if not isinstance(tail_select, dict):
+            errors.append(f"{prefix}.tail_select must be a mapping")
+        else:
+            rows = tail_select.get("num_select_rows")
+            valid_rows = tail_select.get("num_select_valid_rows")
+            rows_valid = _validate_nonnegative_int(
+                rows, f"{prefix}.tail_select.num_select_rows", errors
+            )
+            valid_rows_valid = _validate_nonnegative_int(
+                valid_rows,
+                f"{prefix}.tail_select.num_select_valid_rows",
+                errors,
+            )
+            if rows_valid and valid_rows_valid and valid_rows > rows:
+                errors.append(
+                    f"{prefix}.tail_select.num_select_valid_rows exceeds rows"
+                )
+            reason_counts = tail_select.get("reason_counts")
+            if not isinstance(reason_counts, dict):
+                errors.append(f"{prefix}.tail_select.reason_counts must be a mapping")
+            else:
+                reasons_valid = all(
+                    isinstance(reason, str)
+                    and bool(reason)
+                    and _validate_nonnegative_int(
+                        count,
+                        f"{prefix}.tail_select.reason_counts.{reason}",
+                        errors,
+                    )
+                    for reason, count in reason_counts.items()
+                )
+                if rows_valid and reasons_valid and sum(reason_counts.values()) != rows:
+                    errors.append(
+                        f"{prefix}.tail_select.reason_counts must cover every row"
+                    )
+            for field in _TAIL_HISTOGRAM_FIELDS:
+                if field not in tail_select:
+                    errors.append(f"{prefix}.tail_select.{field} is missing")
+                    continue
+                _validate_integer_histogram(
+                    tail_select[field],
+                    f"{prefix}.tail_select.{field}",
+                    rows if rows_valid else None,
+                    errors,
+                )
+            selected_histogram = tail_select.get("selected_draft_length_histogram")
+            if isinstance(selected_histogram, dict) and isinstance(
+                selected_histogram.get("counts"), list
+            ):
+                num_steps = len(selected_histogram["counts"]) - 1
+                if num_steps < 0 or selected_histogram.get("offset") != 0:
+                    errors.append(
+                        f"{prefix}.tail_select.selected_draft_length_histogram "
+                        "must start at zero"
+                    )
+                elif num_steps >= 0:
+                    expected_layouts = {
+                        "raw_draft_tail_length_histogram": (-1, 2 * num_steps + 3),
+                        "consumable_draft_tail_length_histogram": (
+                            -1,
+                            2 * num_steps + 3,
+                        ),
+                        "pending_prefix_length_histogram": (-1, 2 * num_steps + 3),
+                        "logical_delta_histogram": (
+                            -(2 * num_steps + 1),
+                            4 * num_steps + 3,
+                        ),
+                    }
+                    for field, (
+                        expected_offset,
+                        expected_length,
+                    ) in expected_layouts.items():
+                        histogram = tail_select.get(field)
+                        if not isinstance(histogram, dict):
+                            continue
+                        if (
+                            histogram.get("offset") != expected_offset
+                            or len(histogram.get("counts", [])) != expected_length
+                        ):
+                            errors.append(
+                                f"{prefix}.tail_select.{field} has an invalid "
+                                f"K={num_steps} bucket layout"
+                            )
+            freshness_fields = (
+                "num_publish_seq_initial",
+                "num_publish_seq_same",
+                "num_publish_seq_advance",
+            )
+            freshness_valid = True
+            for field in (*freshness_fields, "num_protocol_errors"):
+                freshness_valid &= _validate_nonnegative_int(
+                    tail_select.get(field), f"{prefix}.tail_select.{field}", errors
+                )
+            if (
+                rows_valid
+                and freshness_valid
+                and sum(tail_select[field] for field in freshness_fields) > rows
+            ):
+                errors.append(
+                    f"{prefix}.tail_select publish-sequence counts exceed rows"
+                )
+            if (
+                rows_valid
+                and freshness_valid
+                and tail_select["num_protocol_errors"] > rows
+            ):
+                errors.append(f"{prefix}.tail_select.num_protocol_errors exceeds rows")
+            fast_forwards = tail_select.get("num_pending_prefix_fast_forwards")
+            _validate_nonnegative_int(
+                fast_forwards,
+                f"{prefix}.tail_select.num_pending_prefix_fast_forwards",
+                errors,
+            )
+            retry_fields = (
+                "num_seqlock_retry_rows",
+                "num_seqlock_retries",
+                "max_seqlock_retries",
+            )
+            if any(field in tail_select for field in retry_fields):
+                retries_valid = True
+                for field in retry_fields:
+                    retries_valid &= _validate_nonnegative_int(
+                        tail_select.get(field),
+                        f"{prefix}.tail_select.{field}",
+                        errors,
+                    )
+                if retries_valid:
+                    retry_rows = tail_select["num_seqlock_retry_rows"]
+                    retries = tail_select["num_seqlock_retries"]
+                    max_retries = tail_select["max_seqlock_retries"]
+                    if rows_valid and retry_rows > rows:
+                        errors.append(
+                            f"{prefix}.tail_select seqlock retry rows exceed rows"
+                        )
+                    if retries < retry_rows or max_retries > retries:
+                        errors.append(
+                            f"{prefix}.tail_select seqlock retry counters disagree"
+                        )
+                    if (
+                        bool(retry_rows) != bool(retries)
+                        or bool(retry_rows) != bool(max_retries)
+                    ):
+                        errors.append(
+                            f"{prefix}.tail_select seqlock retry max disagrees "
+                            "with retry rows"
+                        )
+
+    transport = decoupled_spec.get("transport")
+    if transport is None:
+        return
+    if not isinstance(transport, dict):
+        errors.append(f"{prefix}.transport must be a mapping")
+        return
+    for field in ("num_draft_result_frames", "num_draft_result_tokens"):
+        _validate_nonnegative_int(
+            transport.get(field), f"{prefix}.transport.{field}", errors
+        )
+    forbidden = (
+        _VERIFIER_TRANSPORT_FIELDS if role == "drafter" else _DRAFTER_TRANSPORT_FIELDS
+    )
+    for field in sorted(forbidden & transport.keys()):
+        errors.append(f"{prefix}.transport.{field} is not owned by role={role}")
+    for field in sorted(_LATENCY_HISTOGRAM_FIELDS & transport.keys()):
+        _validate_latency_histogram(
+            transport[field], f"{prefix}.transport.{field}", errors
+        )
+    for field in ("draft_send_queue_depth_max", "gpu_publish_staging_slots_max"):
+        if field in transport:
+            _validate_nonnegative_int(
+                transport[field], f"{prefix}.transport.{field}", errors
+            )
+    if (
+        "clock_sync_valid" in transport
+        and type(transport["clock_sync_valid"]) is not bool
+    ):
+        errors.append(f"{prefix}.transport.clock_sync_valid must be boolean")
+    valid_peers = transport.get("num_clock_sync_valid_peers")
+    invalid_peers = transport.get("num_clock_sync_invalid_peers")
+    peer_counts_reported = valid_peers is not None or invalid_peers is not None
+    peer_counts_valid = False
+    if peer_counts_reported:
+        valid_peers_valid = _validate_nonnegative_int(
+            valid_peers,
+            f"{prefix}.transport.num_clock_sync_valid_peers",
+            errors,
+        )
+        invalid_peers_valid = _validate_nonnegative_int(
+            invalid_peers,
+            f"{prefix}.transport.num_clock_sync_invalid_peers",
+            errors,
+        )
+        peer_counts_valid = valid_peers_valid and invalid_peers_valid
+        if peer_counts_valid and "clock_sync_valid" in transport:
+            expected_all_valid = valid_peers > 0 and invalid_peers == 0
+            if transport["clock_sync_valid"] != expected_all_valid:
+                errors.append(
+                    f"{prefix}.transport.clock_sync_valid disagrees with peer counts"
+                )
+    calibrated_histogram_has_samples = any(
+        isinstance(transport.get(field), dict)
+        and type(transport[field].get("count")) is int
+        and transport[field]["count"] > 0
+        for field in (
+            "draft_transport_one_way_latency_us",
+            "draft_result_ready_to_receive_latency_us",
+        )
+    )
+    if (
+        transport.get("clock_sync_valid") is True
+        or (peer_counts_valid and valid_peers > 0)
+        or calibrated_histogram_has_samples
+    ):
+        error_bound = transport.get("clock_error_bound_us")
+        if (
+            not isinstance(error_bound, (int, float))
+            or isinstance(error_bound, bool)
+            or not math.isfinite(float(error_bound))
+            or error_bound < 0
+        ):
+            errors.append(
+                f"{prefix}.transport.clock_error_bound_us must be finite when "
+                "clock-synchronized samples or peers are reported"
+            )
+
+
+def _observed_targets(
+    records: list[dict[str, Any]], required_roles: list[str], errors: list[str]
+) -> dict[str, dict[str, Any]]:
     normalized = {}
     role_ranks = set()
-    for key, target in targets.items():
-        if not isinstance(key, str) or not isinstance(target, dict):
-            errors.append(f"invalid observability target: {key!r}={target!r}")
-            continue
-        target_id = target.get("target_id", key)
-        role = target.get("role", key if key in {"verifier", "drafter"} else None)
-        rank = target.get("rank", 0)
-        base_url = target.get("base_url")
-        if target_id != key or role not in {"verifier", "drafter"}:
-            errors.append(f"invalid observability target identity: {key!r}={target!r}")
+    for record in records:
+        role = record.get("role")
+        target_id = record.get("target_id", role)
+        rank = record.get("rank", 0)
+        base_url = record.get("base_url")
+        if not isinstance(target_id, str) or role not in {"verifier", "drafter"}:
+            errors.append(f"invalid observer target identity: {record!r}")
             continue
         if type(rank) is not int or rank < 0:
             errors.append(f"{target_id}: rank must be a non-negative integer")
             continue
-        if (role, rank) in role_ranks:
-            errors.append(f"duplicate observability target role/rank: {role}/{rank}")
-            continue
         if not isinstance(base_url, str) or not base_url:
             errors.append(f"{target_id}: base_url must be a non-empty string")
             continue
-        role_ranks.add((role, rank))
-        normalized[target_id] = {
+        target = {
             "target_id": target_id,
             "role": role,
             "rank": rank,
             "base_url": base_url.rstrip("/"),
         }
+        previous = normalized.get(target_id)
+        if previous is not None:
+            if previous != target:
+                errors.append(f"conflicting observer target identity: {target_id}")
+            continue
+        if (role, rank) in role_ranks:
+            errors.append(f"duplicate observer target role/rank: {role}/{rank}")
+            continue
+        role_ranks.add((role, rank))
+        normalized[target_id] = target
+    missing_roles = set(required_roles) - {
+        target["role"] for target in normalized.values()
+    }
+    if missing_roles:
+        errors.append(f"observer samples lack required roles: {sorted(missing_roles)}")
     return normalized
 
 
@@ -113,12 +475,10 @@ def validate_samples(
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
-    samples_path = run_dir / "observability" / "samples.jsonl"
-    config_path = run_dir / "observability" / "resolved_config.json"
-    summary_path = run_dir / "observability" / "summary.json"
-    formal_path = run_dir / "client" / "formal_window.json"
+    samples_path = run_dir / "observer" / "samples.jsonl"
+    formal_path = run_dir / "observer" / "bench_timeline.json"
 
-    for path in (samples_path, config_path, summary_path):
+    for path in (samples_path,):
         if not path.is_file():
             errors.append(f"missing required file: {path}")
     if errors:
@@ -130,27 +490,11 @@ def validate_samples(
             "roles": {},
         }
 
-    try:
-        config = _read_json(config_path)
-        summary = _read_json(summary_path)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        errors.append(str(exc))
-        return {
-            "ok": False,
-            "run_dir": str(run_dir),
-            "errors": errors,
-            "warnings": warnings,
-            "roles": {},
-        }
-
     records = _read_jsonl(samples_path, errors)
-    expected_targets = _expected_targets(config, required_roles, errors)
-    manifest_mode = isinstance(config.get("server_manifest"), dict)
-    observed_target_ids = set()
+    expected_targets = _observed_targets(records, required_roles, errors)
     for record in records:
         role = record.get("role")
         target_id = str(record.get("target_id", role))
-        observed_target_ids.add(target_id)
         expected = expected_targets.get(target_id)
         if expected is None:
             errors.append(f"sample references unknown target_id={target_id!r}")
@@ -160,25 +504,38 @@ def validate_samples(
                 f"{target_id}: sample role mismatch: "
                 f"observed={role!r}, expected={expected['role']!r}"
             )
-        if manifest_mode:
-            for field in ("rank", "base_url"):
-                observed = record.get(field)
-                if field == "base_url" and isinstance(observed, str):
-                    observed = observed.rstrip("/")
-                if observed != expected[field]:
-                    errors.append(
-                        f"{target_id}: sample {field} mismatch: "
-                        f"observed={observed!r}, expected={expected[field]!r}"
-                    )
-    if manifest_mode and observed_target_ids != set(expected_targets):
+        for field in ("rank", "base_url"):
+            observed = record.get(field)
+            if field == "base_url" and isinstance(observed, str):
+                observed = observed.rstrip("/")
+            if observed != expected[field]:
+                errors.append(
+                    f"{target_id}: sample {field} mismatch: "
+                    f"observed={observed!r}, expected={expected[field]!r}"
+                )
+    interval_values = {
+        float(record["interval_s"])
+        for record in records
+        if isinstance(record.get("interval_s"), (int, float))
+    }
+    if len(interval_values) != 1:
         errors.append(
-            "observability samples do not cover the configured engine set: "
-            f"observed={sorted(observed_target_ids)}, "
-            f"expected={sorted(expected_targets)}"
+            f"observer samples have inconsistent interval_s: {interval_values}"
         )
-    interval_s = float(config.get("interval_s", 0) or 0)
+    interval_s = next(iter(interval_values), 0.0)
     if interval_s <= 0:
-        errors.append("observability interval_s must be positive")
+        errors.append("observer interval_s must be positive")
+    started_values = {
+        float(record["observer_started_wall_time"])
+        for record in records
+        if isinstance(record.get("observer_started_wall_time"), (int, float))
+    }
+    if len(started_values) != 1:
+        errors.append(
+            "observer samples have inconsistent observer_started_wall_time: "
+            f"{started_values}"
+        )
+    observer_started_at = next(iter(started_values), None)
 
     formal: dict[str, Any] | None = None
     if formal_path.is_file():
@@ -189,19 +546,52 @@ def validate_samples(
     elif require_formal_window:
         errors.append(f"missing required file: {formal_path}")
 
-    formal_start = formal.get("started_wall_time") if formal else None
-    formal_finish = formal.get("finished_wall_time") if formal else None
+    formal_start = formal.get("client_started_wall_time") if formal else None
+    formal_finish = formal.get("client_finished_wall_time") if formal else None
     if formal is not None:
-        if formal.get("state") != "completed":
-            errors.append("client formal window is not completed")
+        timeline_fields = {
+            "observer_started_wall_time",
+            "client_started_wall_time",
+            "client_finished_wall_time",
+            "observer_finished_wall_time",
+            "observer_elapsed_s",
+        }
+        if set(formal) != timeline_fields:
+            errors.append(
+                "benchmark timeline fields do not match the fixed contract: "
+                f"expected={sorted(timeline_fields)}, observed={sorted(formal)}"
+            )
         if not isinstance(formal_start, (int, float)) or not isinstance(
             formal_finish, (int, float)
         ):
-            errors.append("client formal window lacks numeric start/finish times")
+            errors.append("benchmark timeline lacks numeric client start/finish times")
             formal_start = formal_finish = None
         elif formal_finish < formal_start:
-            errors.append("client formal window finishes before it starts")
+            errors.append("benchmark client window finishes before it starts")
             formal_start = formal_finish = None
+        boundary_fields = (
+            "observer_started_wall_time",
+            "client_started_wall_time",
+            "client_finished_wall_time",
+            "observer_finished_wall_time",
+        )
+        boundaries = [formal.get(field) for field in boundary_fields]
+        if not all(isinstance(value, (int, float)) for value in boundaries):
+            errors.append("benchmark timeline lacks numeric wall-time boundaries")
+        elif boundaries != sorted(boundaries):
+            errors.append("benchmark timeline boundaries are not correctly ordered")
+        observer_elapsed_s = formal.get("observer_elapsed_s")
+        if not isinstance(observer_elapsed_s, (int, float)) or observer_elapsed_s < 0:
+            errors.append("benchmark timeline has invalid observer_elapsed_s")
+        elif all(
+            isinstance(value, (int, float)) for value in boundaries
+        ) and not math.isclose(
+            observer_elapsed_s,
+            boundaries[-1] - boundaries[0],
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            errors.append("benchmark timeline observer_elapsed_s is inconsistent")
 
     role_reports: dict[str, Any] = {}
     for role in required_roles:
@@ -262,7 +652,6 @@ def validate_samples(
                 f"sample_count={len(formal_waiting_samples)}"
             )
         decode_windows: dict[tuple[str, int, int], dict[str, Any]] = {}
-        collector_started_at = summary.get("started_wall_time")
         for record in successful:
             target_id = str(record.get("target_id", role))
             for load in record["payload"]["loads"]:
@@ -277,9 +666,9 @@ def validate_samples(
                             f"{role}: invalid decode_metrics_windows entry: {window!r}"
                         )
                         continue
-                    if isinstance(collector_started_at, (int, float)) and float(
+                    if isinstance(observer_started_at, (int, float)) and float(
                         window.get("end_time", 0)
-                    ) < float(collector_started_at):
+                    ) < float(observer_started_at):
                         continue
                     key = (target_id, dp_rank, int(window["window_id"]))
                     previous = decode_windows.get(key)
@@ -288,26 +677,30 @@ def validate_samples(
                             f"{role}: conflicting decode metrics window {key}"
                         )
                     decode_windows[key] = window
+        for (target_id, dp_rank, window_id), window in decode_windows.items():
+            _validate_decoupled_spec_window(
+                role,
+                target_id,
+                dp_rank,
+                window_id,
+                window,
+                errors,
+            )
         report["decode_metrics_window_count"] = len(decode_windows)
-        summary_decode_metrics = summary.get("decode_metrics")
-        summary_role_metrics = (
-            summary_decode_metrics.get(role)
-            if isinstance(summary_decode_metrics, dict)
-            else None
+        report["decoupled_spec_window_count"] = sum(
+            isinstance(window.get("decoupled_spec"), dict)
+            for window in decode_windows.values()
         )
-        if decode_windows:
-            if not isinstance(summary_role_metrics, dict):
-                errors.append(f"{role}: collector summary lacks decode metrics")
-            elif int(summary_role_metrics.get("window_count", -1)) != len(
-                decode_windows
-            ):
-                errors.append(
-                    f"{role}: collector decode window count does not match samples: "
-                    f"summary={summary_role_metrics.get('window_count')!r}, "
-                    f"observed={len(decode_windows)}"
-                )
-            elif not isinstance(summary_role_metrics.get("scheduler_cycle_ms"), dict):
-                errors.append(f"{role}: collector summary lacks scheduler cycle stats")
+        report["tail_select_window_count"] = sum(
+            isinstance(window.get("decoupled_spec", {}).get("tail_select"), dict)
+            for window in decode_windows.values()
+            if isinstance(window.get("decoupled_spec"), dict)
+        )
+        report["transport_window_count"] = sum(
+            isinstance(window.get("decoupled_spec", {}).get("transport"), dict)
+            for window in decode_windows.values()
+            if isinstance(window.get("decoupled_spec"), dict)
+        )
         decode_window_gaps: dict[str, dict[int, list[int]]] = {}
         for target_id in sorted({key[0] for key in decode_windows}):
             target_gaps = {}
@@ -335,7 +728,6 @@ def validate_samples(
         report["decode_metrics_window_gaps"] = decode_window_gaps
 
         target_reports = {}
-        target_summary_metrics = summary.get("decode_metrics_by_target")
         target_ids = sorted(
             target_id
             for target_id, target in expected_targets.items()
@@ -396,27 +788,6 @@ def validate_samples(
                     f"{target_id}: maximum successful-sample gap "
                     f"{target_gap:.3f}s exceeds 2.5x interval_s"
                 )
-            if target_window_count or manifest_mode:
-                summarized = (
-                    target_summary_metrics.get(target_id)
-                    if isinstance(target_summary_metrics, dict)
-                    else None
-                )
-                # Legacy single-engine runs only persisted the role aggregate.
-                # Their implicit target_id equals the role, so that aggregate
-                # is also the exact per-target summary.
-                if not isinstance(summarized, dict) and target_id == role:
-                    summarized = summary_role_metrics
-                if not isinstance(summarized, dict):
-                    errors.append(
-                        f"{target_id}: collector summary lacks decode metrics"
-                    )
-                elif int(summarized.get("window_count", -1)) != target_window_count:
-                    errors.append(
-                        f"{target_id}: decode window count mismatch: "
-                        f"summary={summarized.get('window_count')!r} "
-                        f"observed={target_window_count}"
-                    )
             target_reports[target_id] = target_report
         report["targets"] = target_reports
         if not successful:
@@ -459,32 +830,18 @@ def validate_samples(
     if unknown_roles:
         warnings.append(f"samples contain unrequested roles: {unknown_roles}")
 
-    observed_error_ct = sum(not _is_success(record) for record in records)
-    if int(summary.get("error_ct", -1)) != observed_error_ct:
-        errors.append(
-            "observability summary error_ct does not match samples.jsonl: "
-            f"summary={summary.get('error_ct')!r}, observed={observed_error_ct}"
+    targets_by_sample = {}
+    for record in records:
+        targets_by_sample.setdefault(record.get("sample_id"), set()).add(
+            str(record.get("target_id", record.get("role")))
         )
-    target_ct = int(summary.get("target_ct", 0) or 0)
-    sample_ct = int(summary.get("sample_ct", 0) or 0)
-    if manifest_mode and target_ct != len(expected_targets):
-        errors.append(
-            "observability summary target_ct does not match resolved targets: "
-            f"summary={target_ct}, expected={len(expected_targets)}"
-        )
-    summary_targets = summary.get("targets")
-    if manifest_mode and (
-        not isinstance(summary_targets, dict)
-        or set(summary_targets) != set(expected_targets)
-    ):
-        errors.append(
-            "observability summary target identities do not match resolved targets"
-        )
-    if target_ct > 0 and sample_ct * target_ct != len(records):
-        errors.append(
-            "observability summary sample_ct * target_ct does not match JSONL records: "
-            f"{sample_ct} * {target_ct} != {len(records)}"
-        )
+    expected_target_ids = set(expected_targets)
+    for sample_id, target_ids in sorted(targets_by_sample.items()):
+        if target_ids != expected_target_ids:
+            errors.append(
+                f"observer sample round {sample_id!r} has targets "
+                f"{sorted(target_ids)}, expected {sorted(expected_target_ids)}"
+            )
 
     return {
         "ok": not errors,

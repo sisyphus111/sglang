@@ -73,6 +73,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
+    mamba_cache_src_indices: Optional[torch.Tensor]
+    mamba_cache_dst_indices: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -102,6 +104,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_req: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        enable_mamba_cache_routing: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
@@ -119,6 +122,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             custom_mask = torch.ones(
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
                 dtype=torch.bool,
+            )
+            mamba_cache_src_indices = (
+                torch.full((max_bs,), -1, dtype=torch.int64)
+                if enable_mamba_cache_routing
+                else None
+            )
+            mamba_cache_dst_indices = (
+                torch.full((max_bs,), -1, dtype=torch.int64)
+                if enable_mamba_cache_routing
+                else None
             )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
@@ -208,6 +221,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
             next_token_logits_buffer=next_token_logits_buffer,
+            mamba_cache_src_indices=mamba_cache_src_indices,
+            mamba_cache_dst_indices=mamba_cache_dst_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             encoder_lens=encoder_lens,
@@ -240,6 +255,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            if self.mamba_cache_src_indices is not None:
+                self.mamba_cache_src_indices.fill_(-1)
+            if self.mamba_cache_dst_indices is not None:
+                self.mamba_cache_dst_indices.fill_(-1)
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -278,6 +297,35 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ):
             dsts.append(self.mamba_track_mask[:raw_bs])
             srcs.append(forward_batch.mamba_track_mask)
+
+        route_src = forward_batch.mamba_cache_src_indices
+        route_dst = forward_batch.mamba_cache_dst_indices
+        if (route_src is None) != (route_dst is None):
+            raise ValueError(
+                "mamba_cache_src_indices and mamba_cache_dst_indices must be "
+                "provided together"
+            )
+        if route_src is not None:
+            if (
+                self.mamba_cache_src_indices is None
+                or self.mamba_cache_dst_indices is None
+            ):
+                raise ValueError(
+                    "Mamba cache routing metadata was provided, but decode input "
+                    "buffers were created without Mamba cache routing slots"
+                )
+            dsts.extend(
+                (
+                    self.mamba_cache_src_indices[:raw_bs],
+                    self.mamba_cache_dst_indices[:raw_bs],
+                )
+            )
+            srcs.extend((route_src, route_dst))
+        else:
+            if self.mamba_cache_src_indices is not None:
+                self.mamba_cache_src_indices[:raw_bs].fill_(-1)
+            if self.mamba_cache_dst_indices is not None:
+                self.mamba_cache_dst_indices[:raw_bs].fill_(-1)
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
             dsts.append(self.encoder_lens[:raw_bs])

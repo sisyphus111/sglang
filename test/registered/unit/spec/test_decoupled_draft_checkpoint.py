@@ -118,59 +118,45 @@ class TestDecoupledDraftMambaCheckpointStore(CustomTestCase):
             self.req_pool, max_draft_tokens=2
         )
         self.key = DraftRequestGeneration(
-            src_verifier_rank=0, request_id="req-a", generation=3
+            src_verifier_rank=0, request_id="req-a", request_epoch=3
         )
         # Mirror production ownership: the request's active slot is allocated
         # before this store reserves its disjoint checkpoint slots.
         self.active_slot = self.req_pool.mamba_allocator.alloc(1)
 
-    def test_allocates_two_windows_plus_boundary_and_restores(self):
-        self.req_pool.mamba_pool.state[self.active_slot] = 101
-        self.store.checkpoint_after_forward(
-            self.key, position=10, active_slot=self.active_slot
-        )
-        self.req_pool.mamba_pool.state[self.active_slot] = 202
-        self.store.checkpoint_after_forward(
-            self.key, position=11, active_slot=self.active_slot
-        )
-        self.req_pool.mamba_pool.state[self.active_slot] = 303
+    def test_allocates_two_windows_plus_boundary_and_rewinds_without_copy(self):
+        prefill_slot = self.store.prepare_prefill_route(self.key, position=10)
+        self.store.commit_after_forward(self.key, position=10)
+        src_slot, dst_slot = self.store.prepare_decode_route(self.key, position=10)
+        self.assertEqual(src_slot, prefill_slot)
+        self.assertNotEqual(dst_slot, src_slot)
+        self.store.commit_after_forward(self.key, position=11)
 
-        self.store.restore_for_rewrite(
-            self.key, position=10, active_slot=self.active_slot
-        )
+        self.store.rewind_for_rewrite(self.key, position=10)
 
-        self.assertEqual(int(self.req_pool.mamba_pool.state[self.active_slot]), 101)
         self.assertEqual(self.store.positions(self.key), (10,))
-        checkpoint_dst = self.req_pool.mamba_pool.copies[0][1]
-        self.assertEqual(checkpoint_dst.numel(), 1)
+        self.assertEqual(self.req_pool.mamba_pool.copies, [])
         self.assertEqual(len(self.req_pool.mamba_allocator.free_slots), 58)
 
     def test_live_ring_collision_fails_until_old_position_is_pruned(self):
-        self.req_pool.mamba_pool.state[self.active_slot] = 1
-        self.store.checkpoint_after_forward(
-            self.key, position=7, active_slot=self.active_slot
-        )
+        self.store.prepare_prefill_route(self.key, position=7)
+        self.store.commit_after_forward(self.key, position=7)
         with self.assertRaisesRegex(RuntimeError, "overwrite a live state"):
-            self.store.checkpoint_after_forward(
-                self.key, position=12, active_slot=self.active_slot
-            )
+            self.store.prepare_prefill_route(self.key, position=12)
 
         self.store.prune(self.key, min_position=8)
-        self.store.checkpoint_after_forward(
-            self.key, position=12, active_slot=self.active_slot
-        )
+        self.store.prepare_prefill_route(self.key, position=12)
+        self.store.commit_after_forward(self.key, position=12)
         self.assertEqual(self.store.positions(self.key), (12,))
 
     def test_generation_isolation_and_release(self):
         next_generation = DraftRequestGeneration(
-            src_verifier_rank=0, request_id="req-a", generation=4
+            src_verifier_rank=0, request_id="req-a", request_epoch=4
         )
-        self.store.checkpoint_after_forward(
-            self.key, position=10, active_slot=self.active_slot
-        )
-        self.store.checkpoint_after_forward(
-            next_generation, position=10, active_slot=self.active_slot
-        )
+        self.store.prepare_prefill_route(self.key, position=10)
+        self.store.commit_after_forward(self.key, position=10)
+        self.store.prepare_prefill_route(next_generation, position=10)
+        self.store.commit_after_forward(next_generation, position=10)
 
         self.store.release(self.key)
 
@@ -187,7 +173,7 @@ class TestDecoupledDraftMambaCheckpointStore(CustomTestCase):
 
     def test_rejects_replayssm_active_state(self):
         self.req_pool.mamba_pool.replayssm_write_pos = torch.zeros(65)
-        with self.assertRaisesRegex(ValueError, "ReplaySSM copy_from"):
+        with self.assertRaisesRegex(ValueError, "not independently routable"):
             DecoupledDraftMambaCheckpointStore(self.req_pool, max_draft_tokens=2)
 
 

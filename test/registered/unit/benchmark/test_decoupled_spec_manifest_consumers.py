@@ -17,15 +17,14 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _ROOT = Path(__file__).resolve().parents[4] / "benchmark" / "decoupled_spec"
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(_ROOT / "client-side"))
 sys.path.insert(0, str(_ROOT / "plot"))
 
-from client import add_cli_args as add_client_cli_args
-from client import apply_cli_overrides as apply_client_cli_overrides
-from common.collector import add_cli_args as add_collector_cli_args
-from common.collector import apply_cli_overrides as apply_collector_cli_overrides
-from common.collector import collect
-from common.collector import validate_config as validate_collector_config
+from client.client import add_cli_args as add_client_cli_args
+from client.client import apply_cli_overrides as apply_client_cli_overrides
+from client.observer import add_cli_args as add_observer_cli_args
+from client.observer import apply_cli_overrides as apply_observer_cli_overrides
+from client.observer import collect
+from client.observer import validate_config as validate_observer_config
 from plot_observability import render_observability
 
 
@@ -61,6 +60,89 @@ def _write_manifest(path: Path, base_url: str, state: str = "ready") -> None:
 
 
 class TestDecoupledSpecManifestConsumers(CustomTestCase):
+    def test_client_selects_coupled_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "deployment": "coupled_spec",
+                        "state": "ready",
+                        "engines": [
+                            {
+                                "engine_id": "target-0",
+                                "role": "target",
+                                "rank": 0,
+                                "http_url": "http://127.0.0.1:31000",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            parser = argparse.ArgumentParser()
+            add_client_cli_args(parser)
+            config = {}
+            apply_client_cli_overrides(
+                config,
+                parser.parse_args(
+                    ["--server-manifest", str(manifest_path), "--engine-rank", "0"]
+                ),
+            )
+            observer_parser = argparse.ArgumentParser()
+            add_observer_cli_args(observer_parser)
+            observer_config = {
+                "schema_version": 1,
+                "interval_s": 1.0,
+                "request_timeout_s": 1.0,
+                "targets": {"verifier": {"base_url": "http://stale"}},
+            }
+            apply_observer_cli_overrides(
+                observer_config,
+                observer_parser.parse_args(
+                    ["--server-manifest", str(manifest_path)]
+                ),
+            )
+            validate_observer_config(observer_config)
+            observer_dir = Path(directory) / "observer"
+            observer_dir.mkdir()
+            (observer_dir / "samples.jsonl").write_text(
+                json.dumps(
+                    {
+                        "sample_id": 0,
+                        "target_id": "target-0",
+                        "role": "target",
+                        "rank": 0,
+                        "collected_wall_time": 100.0,
+                        "latency_ms": 1.0,
+                        "status_code": 200,
+                        "error": None,
+                        "payload": {
+                            "loads": [
+                                {
+                                    "dp_rank": 0,
+                                    "num_running_reqs": 0,
+                                    "num_waiting_reqs": 0,
+                                    "gen_throughput": 0.0,
+                                    "token_usage": 0.0,
+                                    "decode_metrics_windows": [],
+                                }
+                            ]
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            plot_manifest = render_observability(Path(directory))
+
+        self.assertEqual(config["server"]["target_id"], "target-0")
+        self.assertEqual(config["server"]["role"], "target")
+        self.assertEqual(config["server"]["base_url"], "http://127.0.0.1:31000")
+        self.assertEqual(observer_config["targets"]["target-0"]["role"], "target")
+        self.assertEqual(plot_manifest["target_ct_by_role"], {"target": 1})
+
     def test_client_selects_one_ready_verifier_and_rejects_url_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -116,7 +198,7 @@ class TestDecoupledSpecManifestConsumers(CustomTestCase):
                     parser.parse_args(["--server-manifest", str(manifest_path)]),
                 )
 
-    def test_collector_and_plot_keep_same_role_targets_separate(self):
+    def test_observer_and_plot_keep_same_role_targets_separate(self):
         async def exercise():
             window_end_times = {}
             cycle_ms = {"verifier-0": 10.0, "verifier-1": 12.0, "drafter-0": 7.0}
@@ -191,7 +273,7 @@ class TestDecoupledSpecManifestConsumers(CustomTestCase):
                     manifest_path.parent.mkdir()
                     _write_manifest(manifest_path, f"http://127.0.0.1:{port}")
                     parser = argparse.ArgumentParser()
-                    add_collector_cli_args(parser)
+                    add_observer_cli_args(parser)
                     config = {
                         "schema_version": 1,
                         "interval_s": 0.01,
@@ -201,15 +283,15 @@ class TestDecoupledSpecManifestConsumers(CustomTestCase):
                             "drafter": {"base_url": "http://stale:30001"},
                         },
                     }
-                    apply_collector_cli_overrides(
+                    apply_observer_cli_overrides(
                         config,
                         parser.parse_args(["--server-manifest", str(manifest_path)]),
                     )
-                    validate_collector_config(config)
+                    validate_observer_config(config)
                     summary = await collect(config, run_dir, duration_s=0.025)
                     records = [
                         json.loads(line)
-                        for line in (run_dir / "observability" / "samples.jsonl")
+                        for line in (run_dir / "observer" / "samples.jsonl")
                         .read_text(encoding="utf-8")
                         .splitlines()
                     ]

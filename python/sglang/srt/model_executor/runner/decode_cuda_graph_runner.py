@@ -37,6 +37,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
@@ -151,6 +152,20 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    route_src = forward_batch.mamba_cache_src_indices
+    route_dst = forward_batch.mamba_cache_dst_indices
+    if (route_src is None) != (route_dst is None):
+        raise ValueError(
+            "mamba_cache_src_indices and mamba_cache_dst_indices must be "
+            "provided together"
+        )
+    if route_src is not None:
+        # Decoupled route tensors already live in an immutable launch ring.
+        # The Mamba backend stages/casts them directly into its captured int32
+        # src/dst buffers, so a graph-registry copy would be a redundant hop.
+        if route_src.numel() != raw_bs or route_dst.numel() != raw_bs:
+            raise ValueError("Mamba cache route tensors must match the raw batch")
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -182,6 +197,8 @@ def build_replay_fb_view(
             if buffers.mamba_track_indices is None
             else buffers.mamba_track_indices[:bs]
         ),
+        mamba_cache_src_indices=route_src,
+        mamba_cache_dst_indices=route_dst,
         spec_info=forward_batch.spec_info,
     )
 
@@ -348,6 +365,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
         )
+        # Decoupled drafter decode must replay explicit read-src/write-dst
+        # recurrent-state routes through graph-resident input buffers.
+        self.enable_mamba_cache_routing = (
+            mambaish_config(self.model_runner.model_config) is not None
+            and self.model_runner.server_args.decoupled_spec_role == "drafter"
+        )
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -371,6 +394,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens_per_req=self.captured_req_width,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_mamba_cache_routing=False,
             ne_token_table=(
                 model_runner.ngram_embedding_manager.table
                 if self.use_ngram_embedding
@@ -396,6 +420,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            enable_mamba_cache_routing=False,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
             enable_num_token_non_padded=enable_num_token_non_padded(),
@@ -1118,6 +1143,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
+            )
+
+        if self.enable_mamba_cache_routing and (
+            forward_batch.mamba_cache_src_indices is None
+            or forward_batch.mamba_cache_dst_indices is None
+        ):
+            raise ValueError(
+                "Mamba cache routing buffers are enabled, but ForwardBatch is "
+                "missing mamba_cache_src_indices or mamba_cache_dst_indices"
             )
 
         self.buffer_registry.fill_from(

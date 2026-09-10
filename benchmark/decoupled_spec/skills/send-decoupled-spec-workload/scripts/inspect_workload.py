@@ -14,13 +14,15 @@ from typing import Any
 import yaml
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[3]
-CLIENT_ROOT = BENCHMARK_ROOT / "client-side"
 sys.path.insert(0, str(BENCHMARK_ROOT))
-sys.path.insert(0, str(CLIENT_ROOT))
 
-from client import add_cli_args, apply_cli_overrides, validate_config  # noqa: E402
-from common.artifacts import write_json  # noqa: E402
-from request_loader import RequestSpec, load_requests  # noqa: E402
+from client.client import (
+    add_cli_args,
+    apply_cli_overrides,
+    validate_config,
+)  # noqa: E402
+from client.request_loader import RequestSpec, load_requests  # noqa: E402
+from run_io import write_json  # noqa: E402
 
 
 def _preview(value: str, limit: int) -> str:
@@ -53,7 +55,8 @@ def build_report(
     for request in requests:
         sample = {
             "request_id": request.request_id,
-            "row_index": request.row_index,
+            "batch_row_index": request.batch_row_index,
+            "dataset_idx": request.dataset_idx,
             "source": request.source,
             "prompt_len": request.prompt_len,
             "requested_output_len": request.requested_output_len,

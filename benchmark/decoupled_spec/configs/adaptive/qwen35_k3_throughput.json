@@ -1,0 +1,12 @@
+{
+  "candidate_steps": [0, 1, 2, 3],
+  "ema_alpha": 0.2,
+  "update_interval_rounds": 5,
+  "switch_hysteresis": 0.0,
+  "1": {
+    "candidate_steps": [0, 1, 2, 3]
+  },
+  "8": {
+    "candidate_steps": [0, 1, 2, 3]
+  }
+}

@@ -579,7 +579,8 @@ def _causal_conv1d_update_kernel(
     bias_ptr,
     conv_state_ptr,
     cache_seqlens_ptr,  # circular buffer
-    conv_state_indices_ptr,
+    conv_state_src_indices_ptr,
+    conv_state_dst_indices_ptr,
     num_accept_tokens_ptr,
     intermediate_conv_window_ptr,
     intermediate_state_indices_ptr,
@@ -602,7 +603,8 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_seq: tl.constexpr,
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
-    stride_state_indices: tl.constexpr,
+    stride_src_indices: tl.constexpr,
+    stride_dst_indices: tl.constexpr,
     stride_inter_seq: tl.constexpr,
     stride_inter_step: tl.constexpr,
     stride_inter_dim: tl.constexpr,
@@ -646,8 +648,11 @@ def _causal_conv1d_update_kernel(
 
     if IS_CONTINUOUS_BATCHING:
         # mask = idx_seq < batch
-        conv_state_batch_coord = tl.load(
-            conv_state_indices_ptr + idx_seq * stride_state_indices
+        conv_state_src_batch_coord = tl.load(
+            conv_state_src_indices_ptr + idx_seq * stride_src_indices
+        ).to(tl.int64)
+        conv_state_dst_batch_coord = tl.load(
+            conv_state_dst_indices_ptr + idx_seq * stride_dst_indices
         ).to(tl.int64)
         if SAVE_INTERMEDIATE:
             intermediate_state_batch_coord = tl.load(
@@ -655,9 +660,13 @@ def _causal_conv1d_update_kernel(
                 + idx_seq * stride_intermediate_state_indices
             ).to(tl.int64)
     else:
-        conv_state_batch_coord = idx_seq
+        conv_state_src_batch_coord = idx_seq
+        conv_state_dst_batch_coord = idx_seq
     if USE_PAD_SLOT:  # noqa
-        if conv_state_batch_coord == pad_slot_id:
+        if (
+            conv_state_src_batch_coord == pad_slot_id
+            or conv_state_dst_batch_coord == pad_slot_id
+        ):
             # not processing as this is not the actual sequence
             return
 
@@ -682,7 +691,7 @@ def _causal_conv1d_update_kernel(
     # STEP 1: READ init_state data
     conv_states_base = (
         conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (conv_state_src_batch_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )
     mask_w = idx_feats < dim
@@ -709,7 +718,7 @@ def _causal_conv1d_update_kernel(
     # load since idx_tokens + 1.
     conv_state_ptrs_source = (
         conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (conv_state_src_batch_coord * stride_conv_state_seq)
         + conv_state_token_offset * stride_conv_state_tok
         + (idx_feats * stride_conv_state_dim)[None, :]
         + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
@@ -717,7 +726,7 @@ def _causal_conv1d_update_kernel(
         ]
     )  # [BLOCK_M, BLOCK_N]
     mask = (
-        (conv_state_batch_coord < num_cache_lines)
+        (conv_state_src_batch_coord < num_cache_lines)
         & ((idx_tokens + seqlen) < state_len)[:, None]
         & (idx_feats < dim)[None, :]
     )
@@ -742,7 +751,7 @@ def _causal_conv1d_update_kernel(
 
     conv_state_base = (
         conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (conv_state_dst_batch_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )  # [BLOCK_N,]
     conv_state_ptrs_target = (
@@ -996,6 +1005,8 @@ def causal_conv1d_update(
     activation: Union[bool, str, None] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
+    conv_state_src_indices: Optional[torch.Tensor] = None,
+    conv_state_dst_indices: Optional[torch.Tensor] = None,
     num_accept_tokens: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
@@ -1030,6 +1041,19 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    if conv_state_src_indices is None and conv_state_dst_indices is None:
+        conv_state_src_indices = conv_state_indices
+        conv_state_dst_indices = conv_state_indices
+    else:
+        if conv_state_src_indices is None or conv_state_dst_indices is None:
+            raise ValueError(
+                "conv_state_src_indices and conv_state_dst_indices must be "
+                "provided together"
+            )
+        if conv_state_indices is not None:
+            raise ValueError(
+                "pass either conv_state_indices or the src/dst routing pair"
+            )
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
@@ -1055,12 +1079,14 @@ def causal_conv1d_update(
         assert state_len >= width - 1
         # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)
-        if conv_state_indices is None:
+        if conv_state_src_indices is None:
             assert conv_state.size(0) >= batch
         else:
-            assert (batch,) == conv_state_indices.shape
-            assert intermediate_state_indices is not None
-            assert (batch,) == intermediate_state_indices.shape
+            assert (batch,) == conv_state_src_indices.shape
+            assert (batch,) == conv_state_dst_indices.shape
+            if intermediate_conv_window is not None:
+                assert intermediate_state_indices is not None
+                assert (batch,) == intermediate_state_indices.shape
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
@@ -1074,8 +1100,11 @@ def causal_conv1d_update(
 
     stride_o_seq, stride_o_dim, stride_o_token = out.stride()
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
-    stride_state_indices = (
-        conv_state_indices.stride(0) if conv_state_indices is not None else 0
+    stride_src_indices = (
+        conv_state_src_indices.stride(0) if conv_state_src_indices is not None else 0
+    )
+    stride_dst_indices = (
+        conv_state_dst_indices.stride(0) if conv_state_dst_indices is not None else 0
     )
     stride_intermediate_state_indices = (
         intermediate_state_indices.stride(0)
@@ -1142,7 +1171,8 @@ def causal_conv1d_update(
         bias,
         conv_state,
         cache_seqlens,
-        conv_state_indices,
+        conv_state_src_indices,
+        conv_state_dst_indices,
         num_accept_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
         intermediate_state_indices,
@@ -1165,7 +1195,8 @@ def causal_conv1d_update(
         stride_istate_seq,
         stride_istate_dim,
         stride_istate_token,
-        stride_state_indices,
+        stride_src_indices,
+        stride_dst_indices,
         stride_inter_seq,
         stride_inter_step,
         stride_inter_dim,
@@ -1186,7 +1217,7 @@ def causal_conv1d_update(
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+        IS_CONTINUOUS_BATCHING=conv_state_src_indices is not None,
         IS_SPEC_DECODING=num_accept_tokens is not None,
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,

@@ -1,0 +1,71 @@
+schema_version: 1
+
+ray:
+  address: auto
+  namespace: dspec-temp1-397b-nonoverlap
+  placement_timeout_s: 600
+  startup_timeout_s: 3600
+  shutdown_grace_s: 60
+
+verifier:
+  replicas: 1
+  runtime:
+    env:
+      SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
+      SGLANG_RAGGED_VERIFY_MODE: static
+  server_args:
+    model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-397B-A17B
+    tp_size: 16
+    random_seed: 42
+    mem_fraction_static: 0.85
+    enable_metrics: true
+    decode_log_interval: 40
+    uvicorn_access_log_exclude_prefixes: [/metrics, /v1/loads, /health]
+    skip_server_warmup: true
+    max_running_requests: 64
+    chunked_prefill_size: 16384
+    max_prefill_tokens: 16384
+    max_total_tokens: 300000
+    max_mamba_cache_size: 320
+    cuda_graph_bs_decode: [1, 8, 16, 32, 64]
+    mamba_radix_cache_strategy: extra_buffer
+    enable_linear_replayssm: false
+    enable_linear_replayssm_spec: true
+    disable_prefill_cuda_graph: true
+    mm_feature_transport: cpu
+    disable_overlap_schedule: true
+    speculative_algorithm: DECOUPLED_VERIFY
+    speculative_num_steps: 3
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 4
+
+drafter:
+  replicas: 1
+  runtime:
+    env:
+      SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND: "1"
+  server_args:
+    model_path: /path/to/ssd_dtgl/models/Qwen/Qwen3.5-0.8B
+    tp_size: 1
+    random_seed: 42
+    enable_metrics: true
+    decode_log_interval: 40
+    uvicorn_access_log_exclude_prefixes: [/metrics, /v1/loads, /health]
+    skip_server_warmup: true
+    max_running_requests: 64
+    chunked_prefill_size: 16384
+    max_prefill_tokens: 16384
+    max_total_tokens: 300000
+    max_mamba_cache_size: 512
+    cuda_graph_bs_decode: [1, 8, 16, 32, 64]
+    page_size: 1
+    disable_radix_cache: true
+    disable_prefill_cuda_graph: true
+    disable_overlap_schedule: true
+    enable_linear_replayssm: false
+    enable_linear_replayssm_spec: false
+    mm_feature_transport: cpu
+    speculative_algorithm: null
+    speculative_num_steps: 3
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 4

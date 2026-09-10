@@ -1,6 +1,0 @@
-interface:
-  display_name: "Audit Decoupled-Spec Artifacts"
-  short_description: "Verify run artifacts before and after sealing"
-  default_prompt: "Use $audit-decoupled-spec-artifacts to decide whether this RUN_DIR is complete and checksum-valid."
-policy:
-  allow_implicit_invocation: true

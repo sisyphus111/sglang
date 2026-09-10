@@ -46,9 +46,11 @@ class DraftTailBuffer:
     """Authoritative verifier-side rolling draft tail.
 
     Snapshot, commit, and stream append all linearize under the same condition
-    lock. A commit preserves a fully matching draft suffix. A short or
-    mismatching tail is cleared and converted into ``pending_expected_tokens``
-    until the drafter confirms the verifier-owned prefix token by token.
+    lock. ``committed_len`` is the verifier-authoritative target cursor, while
+    ``pending_expected_tokens`` is the suffix not yet confirmed by the drafter.
+    A commit echo cumulatively confirms through ``start_token_pos + 1``. A
+    contiguous retained span may also confirm residual pending tokens by value
+    before publishing its suffix beyond the authoritative cursor.
     """
 
     def __init__(self, *, verifier_rank: int, required_tail_len: int = 0) -> None:
@@ -136,16 +138,13 @@ class DraftTailBuffer:
             )
 
         pre_verify_committed_len = int(message.pre_verify_committed_len)
-        expected_pre_verify_len = int(state.committed_len) + len(
-            state.pending_expected_tokens
-        )
-        if pre_verify_committed_len != expected_pre_verify_len:
+        if pre_verify_committed_len != int(state.committed_len):
             raise RuntimeError(
                 "VerifyCommit prefix does not match the draft-tail state: "
                 f"request_id={message.request_id} "
                 f"pre_verify_committed_len={pre_verify_committed_len} "
                 f"state_committed_len={state.committed_len} "
-                f"pending_expected_len={len(state.pending_expected_tokens)}"
+                f"pending_count={len(state.pending_expected_tokens)}"
             )
 
         commit_tokens = [int(token) for token in message.committed_tokens]
@@ -156,10 +155,12 @@ class DraftTailBuffer:
                     f"request_id={message.request_id} "
                     f"tail_tokens={state.tail_tokens}"
                 )
+            state.committed_len += len(commit_tokens)
             state.pending_expected_tokens.extend(commit_tokens)
             return
 
         raw_tail_len = len(state.tail_tokens)
+        old_committed_len = int(state.committed_len)
         max_match_len = min(len(commit_tokens), raw_tail_len)
         match_len = 0
         while (
@@ -170,15 +171,19 @@ class DraftTailBuffer:
 
         if match_len:
             del state.tail_tokens[:match_len]
-            state.committed_len += match_len
+
+        state.committed_len += len(commit_tokens)
 
         if match_len == len(commit_tokens):
             return
 
-        # A present mismatch invalidates every stream based before this point.
-        # A merely short tail keeps the previous stale-base boundary.
         if match_len < raw_tail_len:
-            state.can_accept_prefix_len = int(state.committed_len)
+            # A real token mismatch fences off generations that did not include
+            # the verifier's replacement token. A merely short tail does not.
+            state.can_accept_prefix_len = max(
+                int(state.can_accept_prefix_len),
+                old_committed_len + match_len + 1,
+            )
         state.tail_tokens.clear()
         state.pending_expected_tokens.extend(commit_tokens[match_len:])
 
@@ -231,14 +236,14 @@ class DraftTailBuffer:
         with self._condition:
             self._ensure_open_locked()
             for output in batch.outputs:
-                self._append_one_locked(output)
+                self._append_output_locked(output)
             self._condition.notify_all()
 
-    def _append_one_locked(self, output: DraftTailStreamOutput) -> None:
+    def _append_output_locked(self, output: DraftTailStreamOutput) -> None:
+        output.validate()
         request_id = output.request_id
         base_committed_len = int(output.base_committed_len)
-        token_pos = int(output.new_token_pos)
-        token = int(output.new_token)
+        start_token_pos = int(output.start_token_pos)
         src_drafter_rank = int(output.src_drafter_rank)
 
         if int(output.dst_verifier_rank) != self.verifier_rank:
@@ -262,32 +267,68 @@ class DraftTailBuffer:
             )
 
         state_committed_len = int(state.committed_len)
+        if output.is_commit_echo:
+            pending_len = len(state.pending_expected_tokens)
+            confirmed_len = state_committed_len - pending_len
+            ack_len = start_token_pos + 1
+            if ack_len <= confirmed_len:
+                return
+            if ack_len > state_committed_len:
+                raise RuntimeError(
+                    "Draft commit ACK is ahead of the verifier committed cursor: "
+                    f"request_id={request_id} ack_len={ack_len} "
+                    f"state_committed_len={state_committed_len}"
+                )
+            for _ in range(ack_len - confirmed_len):
+                state.pending_expected_tokens.popleft()
+            if not state.pending_expected_tokens:
+                state.can_accept_prefix_len = state_committed_len
+            return
+
+        reconciled_pending = False
         if state.pending_expected_tokens:
             if state.tail_tokens:
                 raise RuntimeError(
                     "Draft tail must be empty while committed tokens are pending: "
                     f"request_id={request_id} tail_tokens={state.tail_tokens}"
                 )
+            if base_committed_len > state_committed_len:
+                raise RuntimeError(
+                    "Draft stream base is ahead of verifier state: "
+                    f"request_id={request_id} "
+                    f"base_committed_len={base_committed_len} "
+                    f"state_committed_len={state_committed_len}"
+                )
             if base_committed_len < int(state.can_accept_prefix_len):
                 return
-            if token_pos < state_committed_len:
-                return
-            # A short-tail commit may arrive before the drafter's already-sent
-            # continuation. That continuation legitimately keeps the older
-            # generation base while targeting exactly the next absolute
-            # position. Accept any base still inside the non-stale interval.
-            if base_committed_len > state_committed_len:
-                return
-            if token_pos != state_committed_len:
+            confirmed_len = state_committed_len - len(
+                state.pending_expected_tokens
+            )
+            output_end = start_token_pos + len(output.tokens)
+            if start_token_pos > confirmed_len or output_end <= confirmed_len:
                 return
 
-            expected_token = int(state.pending_expected_tokens[0])
-            if token == expected_token:
+            overlap_end = min(output_end, state_committed_len)
+            match_len = 0
+            while (
+                confirmed_len + match_len < overlap_end
+                and state.pending_expected_tokens[match_len]
+                == output.tokens[
+                    confirmed_len + match_len - start_token_pos
+                ]
+            ):
+                match_len += 1
+            for _ in range(match_len):
                 state.pending_expected_tokens.popleft()
-                state.committed_len += 1
-            else:
-                state.can_accept_prefix_len = int(state.committed_len)
-            return
+            if confirmed_len + match_len < overlap_end:
+                state.can_accept_prefix_len = max(
+                    int(state.can_accept_prefix_len),
+                    confirmed_len + match_len + 1,
+                )
+            if state.pending_expected_tokens:
+                return
+            state.can_accept_prefix_len = state_committed_len
+            reconciled_pending = True
 
         if base_committed_len > state_committed_len:
             raise RuntimeError(
@@ -296,31 +337,46 @@ class DraftTailBuffer:
                 f"base_committed_len={base_committed_len} "
                 f"state_committed_len={state_committed_len}"
             )
-        if base_committed_len < int(state.can_accept_prefix_len):
+        if (
+            not reconciled_pending
+            and base_committed_len < int(state.can_accept_prefix_len)
+        ):
             return
-        if token_pos < state_committed_len:
+
+        output_end = start_token_pos + len(output.tokens)
+        effective_start = max(start_token_pos, state_committed_len)
+        if output_end <= effective_start:
             return
 
         buffer_end_len = state_committed_len + len(state.tail_tokens)
-        if token_pos < buffer_end_len:
-            existing_token = int(state.tail_tokens[token_pos - state_committed_len])
+        if effective_start > buffer_end_len:
+            if base_committed_len == state_committed_len:
+                raise RuntimeError(
+                    "Draft stream token skips the buffered tail: "
+                    f"request_id={request_id} token_pos={effective_start} "
+                    f"buffer_end_len={buffer_end_len}"
+                )
+            return
+
+        overlap_end = min(output_end, buffer_end_len)
+        for token_pos in range(effective_start, overlap_end):
+            existing_token = int(
+                state.tail_tokens[token_pos - state_committed_len]
+            )
+            token = output.tokens[token_pos - start_token_pos]
             if existing_token != token:
                 raise RuntimeError(
                     "Draft stream token conflicts with buffered tail: "
                     f"request_id={request_id} token_pos={token_pos} "
                     f"existing_token={existing_token} new_token={token}"
                 )
-            return
-        if token_pos > buffer_end_len:
-            if base_committed_len == state_committed_len:
-                raise RuntimeError(
-                    "Draft stream token skips the buffered tail: "
-                    f"request_id={request_id} token_pos={token_pos} "
-                    f"buffer_end_len={buffer_end_len}"
-                )
-            return
 
-        state.tail_tokens.append(token)
+        # Validate the full overlap before mutating state so a malformed span
+        # cannot leave a partially appended tail behind.
+        if output_end > buffer_end_len:
+            state.tail_tokens.extend(
+                output.tokens[buffer_end_len - start_token_pos :]
+            )
 
     def snapshot(
         self,
@@ -396,7 +452,10 @@ class DraftTailBuffer:
     ) -> bool:
         for request_id in request_ids:
             state = self._states[request_id]
-            if state.pending_expected_tokens or len(state.tail_tokens) < min_tail_len:
+            if (
+                state.pending_expected_tokens
+                or len(state.tail_tokens) < min_tail_len
+            ):
                 return False
         return True
 

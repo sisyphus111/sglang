@@ -3224,6 +3224,10 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            # Draft mirrors never self-terminate (max_new_tokens=1<<30). Admit
+            # them against prompt KV/Mamba capacity without reserving future
+            # decode tokens, so every verifier request can draft in parallel.
+            ignore_decode_budget=(self.server_args.decoupled_spec_role == "drafter"),
         )
 
         if self.chunked_req is not None:
@@ -3397,6 +3401,10 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
+                if self.decoupled_spec_manager is not None:
+                    self.decoupled_spec_manager.prepare_decode_allocation(
+                        running_batch
+                    )
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
@@ -3455,6 +3463,11 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if self.decoupled_spec_manager is not None:
+                # GPU-authoritative drafter rows do not maintain the ordinary
+                # Req KV counters. Reject unsupported retraction before the
+                # generic path mutates or releases any of their ownership.
+                self.decoupled_spec_manager.before_decode_retraction(batch)
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -3530,6 +3543,8 @@ class Scheduler(
             return batch
 
         # Update batch tensors
+        if self.decoupled_spec_manager is not None:
+            self.decoupled_spec_manager.prepare_decode_allocation(batch)
         batch.prepare_for_decode()
         return batch
 
@@ -3640,6 +3655,8 @@ class Scheduler(
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if self.decoupled_spec_manager is not None:
+                        self.decoupled_spec_manager.prepare_forward(batch)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -3665,7 +3682,17 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if batch.spec_algorithm.is_none():
+                        decoupled_publish_handled = False
+                        if self.decoupled_spec_manager is not None:
+                            decoupled_publish_handled = (
+                                self.decoupled_spec_manager.finish_forward(
+                                    batch, batch_result
+                                )
+                            )
+                        if (
+                            batch.spec_algorithm.is_none()
+                            and not decoupled_publish_handled
+                        ):
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -3689,26 +3716,40 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        gpu_managed_draft_result = (
+                            batch_result.decoupled_draft_gpu_managed
+                        )
+                        batch_result.copy_done = (
+                            None
+                            if gpu_managed_draft_result
+                            else self.device_module.Event()
+                        )
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
-                                # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                            if not decoupled_publish_handled:
+                                self._relay_forward_payload(
+                                    future_indices, batch_result
                                 )
-                            else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
+                            if not gpu_managed_draft_result:
+                                if _is_hip:
+                                    # Cross-stream sync costs more than the tiny D2H
+                                    # it overlaps.
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
+                                else:
+                                    # Result D2H on copy_stream overlaps the next
+                                    # forward instead of serializing on
+                                    # forward_stream; it's a leaf gated by copy_done,
+                                    # so nothing on forward_stream waits.
+                                    self.copy_stream.wait_stream(self.forward_stream)
+                                    with self.copy_stream_ctx:
+                                        batch_result.copy_to_cpu(
+                                            return_logprob=batch.return_logprob,
+                                            return_hidden_states=(
+                                                batch.return_hidden_states
+                                            ),
+                                        )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3889,10 +3930,18 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        decoupled_result_handled = False
         if self.decoupled_spec_manager is not None:
-            self.decoupled_spec_manager.before_process_batch_result(batch, result)
+            # The GPU-authoritative drafter consumes compact ownership results
+            # without maintaining Req.output_ids as a second token transcript.
+            decoupled_result_handled = (
+                self.decoupled_spec_manager.before_process_batch_result(batch, result)
+                is True
+            )
 
-        if batch.forward_mode.is_decode():
+        if decoupled_result_handled:
+            pass
+        elif batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

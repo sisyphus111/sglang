@@ -14,13 +14,13 @@ class DraftRequestGeneration(msgspec.Struct, frozen=True):
     """Identity of one drafter-side request lifetime.
 
     ``request_id`` is only verifier-local, so the verifier rank is part of the
-    key. ``generation`` separates a re-opened request from stale checkpoints
+    key. ``request_epoch`` separates a re-opened request from stale checkpoints
     left by an earlier lifetime with the same wire identity.
     """
 
     src_verifier_rank: int
     request_id: str
-    generation: int
+    request_epoch: int
 
 
 class DraftRewritePlan(msgspec.Struct, frozen=True):
@@ -57,6 +57,7 @@ class DraftRewritePlan(msgspec.Struct, frozen=True):
 
 class _RequestCheckpointRing(msgspec.Struct):
     checkpoint_slots: torch.Tensor
+    checkpoint_slot_ids: tuple[int, ...]
     position_to_slot_offset: dict[int, int] = {}
     slot_offset_to_position: dict[int, int] = {}
 
@@ -193,21 +194,20 @@ def plan_draft_rewrite(
 
 
 class DecoupledDraftMambaCheckpointStore:
-    """GPU checkpoint rings for decoupled Qwen3.5/GDN drafter state.
+    """GPU state-slot rings for decoupled Qwen3.5/GDN drafter rollback.
 
-    Checkpoints are ordinary slots in the v0.5.17 ``HybridReqToTokenPool``.
-    This store reserves them with ``mamba_allocator`` and copies state only via
-    the official ``mamba_pool.copy_from`` API. It deliberately has no knowledge
-    of Scheduler batches, CUDA-graph routing buffers, or data-plane messages.
+    Every live logical state position owns one ordinary Mamba slot. Decode reads
+    the slot for position ``p`` and writes the slot for ``p + 1`` directly in the
+    GDN kernels. A rewrite therefore selects an older source slot and invalidates
+    its old future; it never copies the full recurrent state.
 
     ``max_draft_tokens`` is K, the maximum number of drafter-proposed tokens in
     one verifier round; it excludes the target model's bonus token. The minimum
     ring capacity is therefore exactly ``2 * K + 1``.
 
-    All state-copy and release methods must be called on the same ordered model
-    execution stream used by the drafter. Logical pruning makes ring offsets
-    reusable; physical slots stay allocated until the request generation is
-    released.
+    Slot ids are materialized on allocation so the scheduler hot path never calls
+    ``Tensor.item()`` on a CUDA tensor. Logical pruning makes ring offsets
+    reusable; physical slots stay allocated until the request generation ends.
     """
 
     def __init__(
@@ -243,60 +243,39 @@ class DecoupledDraftMambaCheckpointStore:
             is not None
         ):
             raise ValueError(
-                "decoupled draft checkpoints require dense active GDN state; "
-                "ReplaySSM copy_from omits its pending ring updates"
+                "decoupled draft state routing requires dense GDN state; "
+                "ReplaySSM pending ring updates are not independently routable"
             )
 
         self.req_to_token_pool = req_to_token_pool
         self.capacity = capacity
         self._rings: dict[DraftRequestGeneration, _RequestCheckpointRing] = {}
 
-    def checkpoint_after_forward(
+    def prepare_prefill_route(
         self,
         key: DraftRequestGeneration,
         *,
         position: int,
-        active_slot: torch.Tensor,
-    ) -> None:
-        """Checkpoint active state after the newly predicted tail is appended."""
+    ) -> int:
+        """Return the in-place destination used by a (possibly chunked) prefill."""
 
         self._validate_key(key)
         position = self._validate_position(position)
-        active_slot = self._normalize_one_slot(active_slot, "active_slot")
         ring = self._get_or_allocate_ring(key)
-
-        if position in ring.position_to_slot_offset:
-            raise RuntimeError(
-                "duplicate decoupled draft checkpoint position: "
-                f"key={key} position={position}"
-            )
         slot_offset = position % self.capacity
-        live_position = ring.slot_offset_to_position.get(slot_offset)
-        if live_position is not None:
-            raise RuntimeError(
-                "decoupled draft checkpoint ring would overwrite a live state; "
-                "the committed cursor was not pruned or the drafter exceeded "
-                f"its rollback window: key={key} position={position} "
-                f"live_position={live_position} capacity={self.capacity}"
-            )
+        self._check_writable_offset(key, ring, position, slot_offset)
+        return ring.checkpoint_slot_ids[slot_offset]
 
-        checkpoint_slot = ring.checkpoint_slots[slot_offset : slot_offset + 1]
-        self._copy_state(active_slot, checkpoint_slot)
-        ring.position_to_slot_offset[position] = slot_offset
-        ring.slot_offset_to_position[slot_offset] = position
-
-    def restore_for_rewrite(
+    def prepare_decode_route(
         self,
         key: DraftRequestGeneration,
         *,
         position: int,
-        active_slot: torch.Tensor,
-    ) -> None:
-        """Restore the matching prefix state and invalidate its old future."""
+    ) -> tuple[int, int]:
+        """Return physical source/destination slot ids for one decode step."""
 
         self._validate_key(key)
         position = self._validate_position(position)
-        active_slot = self._normalize_one_slot(active_slot, "active_slot")
         ring = self._rings.get(key)
         if ring is None or position not in ring.position_to_slot_offset:
             available = (
@@ -307,9 +286,61 @@ class DecoupledDraftMambaCheckpointStore:
                 f"key={key} position={position} available_positions={available}"
             )
 
-        slot_offset = ring.position_to_slot_offset[position]
-        checkpoint_slot = ring.checkpoint_slots[slot_offset : slot_offset + 1]
-        self._copy_state(checkpoint_slot, active_slot)
+        src_offset = ring.position_to_slot_offset[position]
+        dst_position = position + 1
+        dst_offset = dst_position % self.capacity
+        self._check_writable_offset(key, ring, dst_position, dst_offset)
+        return (
+            ring.checkpoint_slot_ids[src_offset],
+            ring.checkpoint_slot_ids[dst_offset],
+        )
+
+    def commit_after_forward(
+        self,
+        key: DraftRequestGeneration,
+        *,
+        position: int,
+    ) -> None:
+        """Mark the state written by the just-finished forward as live."""
+
+        self._validate_key(key)
+        position = self._validate_position(position)
+        ring = self._rings.get(key)
+        if ring is None:
+            raise RuntimeError(
+                "decoupled draft forward completed without a state-slot ring: "
+                f"key={key} position={position}"
+            )
+        if position in ring.position_to_slot_offset:
+            raise RuntimeError(
+                "duplicate decoupled draft checkpoint position: "
+                f"key={key} position={position}"
+            )
+        slot_offset = position % self.capacity
+        self._check_writable_offset(key, ring, position, slot_offset)
+        ring.position_to_slot_offset[position] = slot_offset
+        ring.slot_offset_to_position[slot_offset] = position
+
+    def rewind_for_rewrite(
+        self,
+        key: DraftRequestGeneration,
+        *,
+        position: int,
+    ) -> None:
+        """Select a matching prefix state by invalidating only its old future."""
+
+        self._validate_key(key)
+        position = self._validate_position(position)
+        ring = self._rings.get(key)
+        if ring is None or position not in ring.position_to_slot_offset:
+            available = (
+                () if ring is None else tuple(sorted(ring.position_to_slot_offset))
+            )
+            raise RuntimeError(
+                "missing decoupled draft recurrent-state checkpoint: "
+                f"key={key} position={position} available_positions={available}"
+            )
+
         self.prune(key, max_position=position)
 
     def has_checkpoint(self, key: DraftRequestGeneration, position: int) -> bool:
@@ -321,6 +352,17 @@ class DecoupledDraftMambaCheckpointStore:
         if ring is None:
             return ()
         return tuple(sorted(ring.position_to_slot_offset))
+
+    def checkpoint_slots(self, key: DraftRequestGeneration) -> torch.Tensor:
+        """Return the fixed physical-slot ring owned by one request lifetime.
+
+        The overlap drafter indexes this tensor on GPU by logical state
+        position modulo ``capacity``. Allocation remains a lifecycle operation;
+        steady decode only changes the device-side position.
+        """
+
+        self._validate_key(key)
+        return self._get_or_allocate_ring(key).checkpoint_slots
 
     def prune(
         self,
@@ -388,24 +430,30 @@ class DecoupledDraftMambaCheckpointStore:
                 "mamba_allocator returned an invalid checkpoint allocation: "
                 f"expected_slots={self.capacity} got={slots!r}"
             )
-        ring = _RequestCheckpointRing(checkpoint_slots=slots)
+        slot_ids = tuple(int(slot_id) for slot_id in slots.tolist())
+        ring = _RequestCheckpointRing(
+            checkpoint_slots=slots,
+            checkpoint_slot_ids=slot_ids,
+        )
         self._rings[key] = ring
         return ring
 
-    def _copy_state(self, src_slots: torch.Tensor, dst_slots: torch.Tensor) -> None:
-        src_slots = self.req_to_token_pool.translate_mamba_indices(src_slots)
-        dst_slots = self.req_to_token_pool.translate_mamba_indices(dst_slots)
-        self.req_to_token_pool.mamba_pool.copy_from(src_slots, dst_slots)
-
     @staticmethod
-    def _normalize_one_slot(slot: torch.Tensor, name: str) -> torch.Tensor:
-        if not isinstance(slot, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(slot).__name__}")
-        if slot.numel() != 1:
-            raise ValueError(
-                f"{name} must contain exactly one slot, got {slot.numel()}"
+    def _check_writable_offset(
+        key: DraftRequestGeneration,
+        ring: _RequestCheckpointRing,
+        position: int,
+        slot_offset: int,
+    ) -> None:
+        live_position = ring.slot_offset_to_position.get(slot_offset)
+        if live_position is not None and live_position != position:
+            raise RuntimeError(
+                "decoupled draft checkpoint ring would overwrite a live state; "
+                "the committed cursor was not pruned or the drafter exceeded "
+                f"its rollback window: key={key} position={position} "
+                f"live_position={live_position} "
+                f"capacity={ring.checkpoint_slots.numel()}"
             )
-        return slot.reshape(1)
 
     @staticmethod
     def _validate_key(key: DraftRequestGeneration) -> None:
@@ -414,7 +462,7 @@ class DecoupledDraftMambaCheckpointStore:
                 "checkpoint key must be DraftRequestGeneration, "
                 f"got {type(key).__name__}"
             )
-        if key.src_verifier_rank < 0 or key.generation < 0 or not key.request_id:
+        if key.src_verifier_rank < 0 or key.request_epoch < 0 or not key.request_id:
             raise ValueError(f"invalid draft request generation key: {key}")
 
     @staticmethod

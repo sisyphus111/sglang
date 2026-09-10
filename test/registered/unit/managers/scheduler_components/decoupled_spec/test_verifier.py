@@ -41,6 +41,7 @@ class _Req:
         self.output_ids = list(output_tokens)
         self.retraction_count = retraction_count
         self.req_pool_idx = req_pool_idx
+        self.sampling_params = SimpleNamespace(max_new_tokens=128)
         self.is_retracted = False
         self._finished = False
 
@@ -72,10 +73,17 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.data_plane = self.data_plane_factory.return_value
         self.gpu_tail_buffer = object()
         self.data_plane.gpu_tail_buffer = self.gpu_tail_buffer
+        self.data_plane.take_transport_metrics.return_value = {
+            "num_draft_result_frames": 0,
+            "num_draft_result_tokens": 0,
+        }
         self.verify_worker = MagicMock()
         self.scheduler = SimpleNamespace(
             ps=SimpleNamespace(tp_rank=0, tp_size=1),
-            server_args=SimpleNamespace(speculative_num_steps=3),
+            server_args=SimpleNamespace(
+                speculative_num_steps=3,
+                speculative_adaptive=False,
+            ),
             device=torch.device("cpu"),
             req_to_token_pool=SimpleNamespace(
                 size=16, req_to_token=SimpleNamespace(shape=(17, 64))
@@ -96,6 +104,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
             num_gpu_seats=17,
             num_draft_tokens=3,
             landing_stream=self.landing_stream,
+            mock_profile=False,
         )
         self.get_stream.assert_called_once_with("decoupled_spec_landing")
         self.data_plane.start.assert_called_once_with()
@@ -134,8 +143,14 @@ class TestDecoupledVerifyManager(CustomTestCase):
     def test_decode_reuses_only_an_open_lifecycle_identity(self):
         req_a = _Req("req-a", retraction_count=0)
         req_b = _Req("req-b", retraction_count=2)
-        self.manager.prepare_batch(_batch([req_a, req_b], ForwardMode.EXTEND))
+        extend_batch = _batch([req_a, req_b], ForwardMode.EXTEND)
+        self.manager.prepare_batch(extend_batch)
+        self.assertTrue(extend_batch.decoupled_has_new_lifecycle)
+        self.verify_worker.capture_expected_request_epochs.assert_called_with(
+            extend_batch
+        )
         self.data_plane.reset_mock()
+        self.verify_worker.capture_expected_request_epochs.reset_mock()
         batch = _batch([req_a, req_b], ForwardMode.DECODE)
 
         self.manager.prepare_batch(batch)
@@ -143,6 +158,10 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.assertEqual(
             batch.decoupled_launch_mirror_ids,
             ["req-a::draft-epoch::1", "req-b::draft-epoch::2"],
+        )
+        self.assertFalse(batch.decoupled_has_new_lifecycle)
+        self.verify_worker.capture_expected_request_epochs.assert_called_once_with(
+            batch
         )
         self.data_plane.assert_not_called()
 
@@ -209,6 +228,12 @@ class TestDecoupledVerifyManager(CustomTestCase):
         control_batches = [
             call.args[0] for call in self.data_plane.submit_control_batch.call_args_list
         ]
+        self.assertTrue(
+            all(
+                call.kwargs == {"apply_local_verify_commits": False}
+                for call in self.data_plane.submit_control_batch.call_args_list
+            )
+        )
         self.assertEqual([batch.dst_drafter_rank for batch in control_batches], [3, 9])
         self.assertEqual(
             [
@@ -277,6 +302,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         sync, gpu_seat, request_epoch = self._open_rows()[0]
         self.assertEqual(sync.request_id, "req::draft-epoch::1")
         self.assertEqual(sync.prompt_token_ids, [1, 2, 3])
+        self.assertEqual(sync.max_new_tokens, 128)
         self.assertEqual(gpu_seat, 5)
         self.assertEqual(request_epoch, 1)
 
@@ -307,10 +333,15 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
     def test_schedule_batch_copy_freezes_launch_mirror_ids(self):
         launch_ids = ["req::draft-epoch::1"]
+        expected_request_epochs = torch.tensor([1], dtype=torch.int64)
         batch = ScheduleBatch(
             reqs=[],
             forward_mode=ForwardMode.DECODE,
             decoupled_launch_mirror_ids=launch_ids,
+            decoupled_expected_request_epochs=expected_request_epochs,
+            decoupled_has_new_lifecycle=True,
+            decoupled_needs_landing_fence=True,
+            decoupled_landing_event=object(),
         )
 
         result_batch = batch.copy()
@@ -320,6 +351,170 @@ class TestDecoupledVerifyManager(CustomTestCase):
             result_batch.decoupled_launch_mirror_ids,
             ["req::draft-epoch::1"],
         )
+        self.assertIsNone(result_batch.decoupled_expected_request_epochs)
+        self.assertFalse(result_batch.decoupled_has_new_lifecycle)
+        self.assertFalse(result_batch.decoupled_needs_landing_fence)
+        self.assertIsNone(result_batch.decoupled_landing_event)
+
+    def test_tail_selector_metrics_are_fixed_window_counters(self):
+        batch = SimpleNamespace(
+            decoupled_result_mirror_ids=[
+                "req-a::draft-epoch::1",
+                "req-b::draft-epoch::2",
+            ]
+        )
+        self.manager._record_tail_select_result(
+            batch,
+            SimpleNamespace(
+                decoupled_rebase_valid=torch.tensor([1, 0], dtype=torch.int64),
+                decoupled_selected_draft_lens=torch.tensor([3, 0], dtype=torch.int64),
+                num_proposed_drafts_per_req_cpu=[3, 0],
+                decoupled_tail_select_debug=torch.tensor(
+                    [
+                        [5, 10, 0, 5, 5, 0, 7, 0, 0, 0, 2],
+                        [8, 20, 2, 0, 0, 2, 9, 0, 0, 0, 0],
+                    ],
+                    dtype=torch.int64,
+                ),
+            ),
+        )
+        self.manager._record_tail_select_result(
+            batch,
+            SimpleNamespace(
+                decoupled_rebase_valid=torch.tensor([1, 1], dtype=torch.int64),
+                decoupled_selected_draft_lens=torch.tensor([3, 2], dtype=torch.int64),
+                num_proposed_drafts_per_req_cpu=[3, 2],
+                decoupled_tail_select_debug=torch.tensor(
+                    [
+                        [10, 11, 1, 5, 5, 0, 8, 0, 0, 1, 3],
+                        [5, 20, 0, 2, 2, 0, 11, 0, 0, 0, 0],
+                    ],
+                    dtype=torch.int64,
+                ),
+            ),
+        )
+
+        window = self.manager.take_decode_metrics_window()
+        tail = window.tail_select
+        self.assertEqual(tail.num_select_rows, 4)
+        self.assertEqual(tail.num_select_valid_rows, 3)
+        self.assertEqual(
+            tail.reason_counts,
+            {"direct": 2, "delta_beyond_consumable": 1, "rebased": 1},
+        )
+        self.assertEqual(tail.selected_draft_length_histogram.counts, [1, 0, 1, 2])
+        self.assertEqual(tail.pending_prefix_length_histogram.offset, -1)
+        self.assertEqual(tail.pending_prefix_length_histogram.counts[1], 3)
+        self.assertEqual(tail.pending_prefix_length_histogram.counts[3], 1)
+        self.assertEqual(tail.num_publish_seq_initial, 2)
+        self.assertEqual(tail.num_publish_seq_same, 1)
+        self.assertEqual(tail.num_publish_seq_advance, 1)
+        self.assertEqual(tail.num_pending_prefix_fast_forwards, 1)
+        self.assertEqual(tail.num_protocol_errors, 0)
+        self.assertEqual(tail.num_seqlock_retry_rows, 2)
+        self.assertEqual(tail.num_seqlock_retries, 5)
+        self.assertEqual(tail.max_seqlock_retries, 3)
+
+        reset = self.manager.take_decode_metrics_window().tail_select
+        self.assertEqual(reset.num_select_rows, 0)
+        self.assertEqual(reset.num_select_valid_rows, 0)
+        self.assertEqual(reset.reason_counts, {})
+        self.assertFalse(any(reset.selected_draft_length_histogram.counts))
+        self.assertEqual(reset.num_seqlock_retry_rows, 0)
+        self.assertEqual(reset.num_seqlock_retries, 0)
+        self.assertEqual(reset.max_seqlock_retries, 0)
+
+    def test_tail_debug_is_read_only_after_result_processor_barrier(self):
+        class DeferredDebugRows:
+            ndim = 2
+            shape = (1, 10)
+
+            def __init__(self):
+                self.ready = False
+                self.tolist_calls = 0
+
+            def tolist(self):
+                self.tolist_calls += 1
+                if not self.ready:
+                    raise RuntimeError("async D2H is not complete")
+                return [[8, 1, 1, 0, 0, 0, 1, 0, 0, 0]]
+
+        req = _Req("req", output_tokens=(30,))
+        self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
+        decode_batch = _batch([req], ForwardMode.DECODE)
+        self.manager.prepare_batch(decode_batch)
+        debug_rows = DeferredDebugRows()
+        result = SimpleNamespace(
+            decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
+            decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
+            num_proposed_drafts_per_req_cpu=[0],
+            decoupled_tail_select_debug=debug_rows,
+        )
+        metrics_reporter = MagicMock()
+        self.scheduler.metrics_reporter = metrics_reporter
+
+        self.manager.before_process_batch_result(decode_batch, result)
+
+        self.assertEqual(debug_rows.tolist_calls, 0)
+        metrics_reporter.finish_decoupled_decode_metrics_window.assert_not_called()
+
+        # This transition represents BatchResultProcessor's copy_done barrier.
+        debug_rows.ready = True
+        self.manager.after_process_batch_result(decode_batch, result)
+
+        self.assertEqual(debug_rows.tolist_calls, 1)
+        metrics_reporter.finish_decoupled_decode_metrics_window.assert_called_once_with()
+
+    def test_tail_selector_reason_must_match_row_valid(self):
+        with self.assertRaisesRegex(RuntimeError, "reason disagrees"):
+            self.manager._record_tail_select_result(
+                SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
+                SimpleNamespace(
+                    decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
+                    decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
+                    num_proposed_drafts_per_req_cpu=[0],
+                    decoupled_tail_select_debug=torch.tensor(
+                        [[5, 1, 0, 0, 0, 0, 0]], dtype=torch.int64
+                    ),
+                ),
+            )
+
+    def test_gpu_tail_update_error_fails_fast_with_request_identity(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "request_id=req::draft-epoch::1 error_code=7 error_op_seq=123",
+        ):
+            self.manager._record_tail_select_result(
+                SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
+                SimpleNamespace(
+                    decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
+                    decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
+                    num_proposed_drafts_per_req_cpu=[0],
+                    decoupled_tail_select_debug=torch.tensor(
+                        [[4, 1, 0, 0, 0, 0, 0, 7, 123, 0]], dtype=torch.int64
+                    ),
+                ),
+            )
+
+        self.assertEqual(self.manager._protocol_error_ct, 1)
+
+    def test_transient_selector_row_allows_unavailable_fast_forward_counter(self):
+        self.manager._record_tail_select_result(
+            SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
+            SimpleNamespace(
+                decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
+                decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
+                num_proposed_drafts_per_req_cpu=[0],
+                decoupled_tail_select_debug=torch.tensor(
+                    [[2, -1, -1, -1, -1, -1, -1, 0, -1, -1]],
+                    dtype=torch.int64,
+                ),
+            ),
+        )
+
+        tail = self.manager.take_decode_metrics_window().tail_select
+        self.assertEqual(tail.reason_counts, {"writer_in_progress": 1})
+        self.assertEqual(tail.num_pending_prefix_fast_forwards, 0)
 
     def test_commit_is_emitted_only_after_result_processing(self):
         req = _Req("req", output_tokens=(30,))
@@ -348,6 +543,51 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.assertEqual(commit.request_id, "req::draft-epoch::1")
         self.assertEqual(commit.pre_verify_committed_len, 1)
         self.assertEqual(commit.committed_tokens, [31, 32])
+
+    def test_finished_planned_row_consumes_close_landing_fence(self):
+        req = _Req("req", output_tokens=(30,))
+        result = SimpleNamespace(
+            decoupled_rebase_valid=None,
+            decoupled_selected_draft_lens=None,
+        )
+        finished_batch = _batch([req], ForwardMode.EXTEND)
+        self.manager.prepare_batch(finished_batch)
+        self.manager.before_process_batch_result(finished_batch, result)
+        req._finished = True
+        self.manager.after_process_batch_result(finished_batch, result)
+        self.assertTrue(self.manager._has_pending_lifecycle_landing_fence)
+        self.verify_worker.capture_expected_request_epochs.reset_mock()
+
+        stale_batch = _batch([req], ForwardMode.DECODE)
+        self.manager.prepare_batch(stale_batch)
+
+        self.assertEqual(stale_batch.decoupled_launch_mirror_ids, ["req"])
+        self.assertTrue(stale_batch.decoupled_needs_landing_fence)
+        self.assertFalse(self.manager._has_pending_lifecycle_landing_fence)
+        self.verify_worker.capture_expected_request_epochs.assert_called_once_with(
+            stale_batch
+        )
+
+        next_stale_batch = _batch([req], ForwardMode.DECODE)
+        self.manager.prepare_batch(next_stale_batch)
+        self.assertFalse(next_stale_batch.decoupled_needs_landing_fence)
+
+    def test_non_entry_rank_tolerates_retracted_planned_row_without_fence(self):
+        self.manager.close()
+        self.scheduler.ps.tp_rank = 1
+        self.data_plane_factory.reset_mock()
+        self.verify_worker.reset_mock()
+        self.manager = DecoupledVerifyManager(self.scheduler, self.config)
+        req = _Req("req")
+        req.is_retracted = True
+        batch = _batch([req], ForwardMode.DECODE)
+
+        self.manager.prepare_batch(batch)
+
+        self.data_plane_factory.assert_not_called()
+        self.assertEqual(batch.decoupled_launch_mirror_ids, ["req"])
+        self.assertFalse(batch.decoupled_needs_landing_fence)
+        self.verify_worker.capture_expected_request_epochs.assert_called_once_with(batch)
 
     def test_result_cursor_overrides_mutable_host_output_length(self):
         req = _Req("req", output_tokens=(30,))

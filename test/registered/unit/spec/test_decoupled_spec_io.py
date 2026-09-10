@@ -12,10 +12,9 @@ import unittest
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
-    DraftMeshMessage,
-    DraftMeshMessageType,
     DraftReqKey,
     DraftSync,
+    DraftTailStreamOutput,
     VerifierCommitSegment,
     VerifyCommit,
     build_draft_scheduler_rid,
@@ -78,6 +77,59 @@ class TestVerifyCommitValidation(CustomTestCase):
     def test_valid_commit_passes(self):
         # Should not raise.
         _commit("r", pre=0, tokens=[1, 2]).validate_committed_tokens()
+
+
+class TestDraftTailStreamOutputValidation(CustomTestCase):
+    @staticmethod
+    def _output(
+        *,
+        base_committed_len=0,
+        start_token_pos=0,
+        tokens=(10,),
+        is_commit_echo=False,
+    ):
+        return DraftTailStreamOutput(
+            src_drafter_rank=0,
+            dst_verifier_rank=0,
+            request_id="r",
+            base_committed_len=base_committed_len,
+            start_token_pos=start_token_pos,
+            tokens=tokens,
+            is_commit_echo=is_commit_echo,
+        )
+
+    def test_contiguous_append_span_is_valid(self):
+        self._output(tokens=(10, 11, 12)).validate()
+
+    def test_append_span_must_be_nonempty_tuple(self):
+        with self.assertRaises(ValueError):
+            self._output(tokens=()).validate()
+        with self.assertRaises(TypeError):
+            self._output(tokens=[10]).validate()
+        with self.assertRaises(ValueError):
+            self._output(base_committed_len=2, start_token_pos=1).validate()
+
+    def test_commit_echo_is_singleton_at_cumulative_ack_boundary(self):
+        self._output(
+            base_committed_len=3,
+            start_token_pos=2,
+            tokens=(12,),
+            is_commit_echo=True,
+        ).validate()
+        with self.assertRaises(ValueError):
+            self._output(
+                base_committed_len=3,
+                start_token_pos=2,
+                tokens=(12, 13),
+                is_commit_echo=True,
+            ).validate()
+        with self.assertRaises(ValueError):
+            self._output(
+                base_committed_len=2,
+                start_token_pos=2,
+                tokens=(12,),
+                is_commit_echo=True,
+            ).validate()
 
 
 class TestVerifierCommitSegment(CustomTestCase):
@@ -246,26 +298,6 @@ class TestDraftControlInbox(CustomTestCase):
         seg = inbox.verifier_commit_segments[DraftReqKey(0, "r")]
         self.assertEqual(seg.committed_tokens, [1, 2, 3])
         self.assertEqual(seg.end_committed_len, 3)
-
-
-class TestDraftMeshMessageEnvelope(CustomTestCase):
-    def test_from_control_batch_sets_discriminant_and_slot(self):
-        batch = DraftControlBatch(dst_drafter_rank=0)
-        msg = DraftMeshMessage.from_control_batch(batch)
-        self.assertEqual(msg.message_type, DraftMeshMessageType.CONTROL_BATCH)
-        self.assertIs(msg.control_batch, batch)
-        self.assertIsNone(msg.tail_stream_output_batch)
-
-    def test_from_tail_stream_output_batch_sets_discriminant_and_slot(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
-
-        batch = DraftTailStreamOutputBatch()
-        msg = DraftMeshMessage.from_tail_stream_output_batch(batch)
-        self.assertEqual(
-            msg.message_type, DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
-        )
-        self.assertIs(msg.tail_stream_output_batch, batch)
-        self.assertIsNone(msg.control_batch)
 
 
 if __name__ == "__main__":

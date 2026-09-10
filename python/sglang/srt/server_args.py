@@ -8664,6 +8664,11 @@ class ServerArgs:
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 
+        if self.speculative_algorithm == "DECOUPLED_VERIFY":
+            # The verifier may select a smaller active K, while the drafter,
+            # GPU tail, eager buffers, and request accounting stay sized to Kmax.
+            return self.speculative_num_draft_tokens
+
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,
         )

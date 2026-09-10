@@ -7,7 +7,12 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.load_snapshot import (
+    DecoupledSpecDecodeMetrics,
     DecodeMetricsWindow,
+    DraftTailSelectMetrics,
+    DraftTransportMetrics,
+    IntegerHistogram,
+    LatencyHistogram,
     LoadSnapshot,
     SLOT_LEN_STRUCT,
     SLOT_SIZE,
@@ -63,7 +68,189 @@ def _warmup_zmq(writers, reader, attempts=20, interval=0.05):
     raise RuntimeError(f"warmup failed: expected {expected}, received {received}")
 
 
+def _decoupled_metrics() -> DecoupledSpecDecodeMetrics:
+    empty_latency = LatencyHistogram(
+        count=0,
+        sum_us=0,
+        bucket_upper_bounds_us=[
+            5,
+            10,
+            20,
+            50,
+            100,
+            200,
+            500,
+            1_000,
+            2_000,
+            5_000,
+            10_000,
+            20_000,
+            50_000,
+            100_000,
+            250_000,
+            500_000,
+            1_000_000,
+        ],
+        bucket_counts=[0] * 18,
+    )
+    return DecoupledSpecDecodeMetrics(
+        tail_select=DraftTailSelectMetrics(
+            num_select_rows=320,
+            num_select_valid_rows=160,
+            reason_counts={"direct": 160, "bonus_mismatch": 160},
+            selected_draft_length_histogram=IntegerHistogram(
+                offset=0, counts=[160, 0, 0, 0, 0, 160]
+            ),
+            raw_draft_tail_length_histogram=IntegerHistogram(
+                offset=-1, counts=[0, 0, 0, 0, 0, 0, 320, 0, 0, 0, 0, 0, 0]
+            ),
+            consumable_draft_tail_length_histogram=IntegerHistogram(
+                offset=-1, counts=[0, 0, 0, 0, 0, 0, 320, 0, 0, 0, 0, 0, 0]
+            ),
+            logical_delta_histogram=IntegerHistogram(
+                offset=-11,
+                counts=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 320] + [0] * 11,
+            ),
+            pending_prefix_length_histogram=IntegerHistogram(
+                offset=-1, counts=[0, 320] + [0] * 11
+            ),
+            num_publish_seq_initial=8,
+            num_publish_seq_same=80,
+            num_publish_seq_advance=232,
+            num_seqlock_retry_rows=12,
+            num_seqlock_retries=19,
+            max_seqlock_retries=4,
+        ),
+        transport=DraftTransportMetrics(
+            num_draft_result_frames=0,
+            num_draft_result_tokens=0,
+            draft_receive_to_gpu_publish_enqueue_latency_us=empty_latency,
+            draft_gpu_publish_completion_latency_us=empty_latency,
+            draft_transport_one_way_latency_us=empty_latency,
+            draft_result_ready_to_receive_latency_us=empty_latency,
+            gpu_publish_staging_slots_max=8,
+            clock_sync_valid=False,
+            num_clock_sync_valid_peers=1,
+            num_clock_sync_invalid_peers=1,
+        ),
+        adaptive_verify={
+            "active_verify_steps": 2,
+            "max_verify_steps": 5,
+            "decision_seq": 255,
+            "round_count": 1277,
+            "reevaluation_count": 255,
+            "switch_count": 32,
+            "window_reevaluation_count": 8,
+            "window_switch_count": 2,
+            "step_residency": [0, 0, 1246, 25, 0, 6],
+            "window_step_residency": [0, 0, 40, 0, 0, 0],
+            "last_reason": "keep_current",
+            "last_decision_latency_ms": 0.1,
+            "candidate_scores": [
+                {
+                    "steps": step,
+                    "expected_accept_length": 1.0 + step / 5,
+                    "cost_ms": 7.0 + step / 10,
+                    "modeled_tps": 500.0 + step * 100,
+                    "matched_batch_size": 4,
+                    "matched_context_len": 4096,
+                }
+                for step in range(6)
+            ],
+            "switch_events": [
+                {
+                    "decision_seq": index,
+                    "round_count": index * 5,
+                    "old_steps": 5 - index % 4,
+                    "new_steps": 4 - index % 4,
+                    "batch_size": 4,
+                    "context_len": 4096,
+                    "reason": "score_hysteresis",
+                }
+                for index in range(32)
+            ],
+            "profile_status": "complete",
+            "profile_sha256": "a" * 64,
+            "supply_ema": [0.8] * 5,
+            "conditional_accept_ema": [0.9] * 5,
+            "accept_update_counts": [1200] * 5,
+            "accept_sample_counts": [3000] * 5,
+        },
+    )
+
+
 class TestShmRoundTrip(CustomTestCase):
+    def test_partial_clock_sync_keeps_healthy_peer_latency_samples(self):
+        histogram = {
+            "count": 1,
+            "sum_us": 25,
+            "bucket_upper_bounds_us": [10, 100],
+            "bucket_counts": [0, 1, 0],
+        }
+
+        metrics = DraftTransportMetrics.from_dict(
+            {
+                "num_draft_result_frames": 1,
+                "num_draft_result_tokens": 2,
+                "draft_transport_one_way_latency_us": histogram,
+                "draft_result_ready_to_receive_latency_us": histogram,
+                "clock_sync_valid": False,
+                "clock_error_bound_us": 5.5,
+                "num_clock_sync_valid_peers": 1,
+                "num_clock_sync_invalid_peers": 1,
+            }
+        )
+
+        self.assertFalse(metrics.clock_sync_valid)
+        self.assertEqual(metrics.draft_transport_one_way_latency_us.count, 1)
+        self.assertEqual(metrics.draft_result_ready_to_receive_latency_us.count, 1)
+        self.assertEqual(metrics.num_clock_sync_valid_peers, 1)
+        self.assertEqual(metrics.num_clock_sync_invalid_peers, 1)
+
+    def test_http_dict_keeps_ordinary_decode_window_shape(self):
+        window = DecodeMetricsWindow(
+            window_id=1,
+            end_time=1.0,
+            num_decode_iters=40,
+            iter_latency_ms=1.0,
+        )
+
+        value = LoadSnapshot(decode_metrics_windows=[window]).to_dict()[
+            "decode_metrics_windows"
+        ][0]
+
+        self.assertNotIn("decoupled_spec", value)
+
+    def test_http_dict_omits_transport_fields_owned_by_the_other_role(self):
+        drafter_window = DecodeMetricsWindow(
+            window_id=1,
+            end_time=1.0,
+            num_decode_iters=40,
+            iter_latency_ms=1.0,
+            decoupled_spec=DecoupledSpecDecodeMetrics(
+                transport=DraftTransportMetrics(
+                    num_draft_result_frames=0,
+                    num_draft_result_tokens=0,
+                    draft_send_queue_latency_us=LatencyHistogram(
+                        count=0,
+                        sum_us=0,
+                        bucket_upper_bounds_us=[10],
+                        bucket_counts=[0, 0],
+                    ),
+                    draft_send_queue_depth_max=0,
+                )
+            ),
+        )
+
+        transport = LoadSnapshot(decode_metrics_windows=[drafter_window]).to_dict()[
+            "decode_metrics_windows"
+        ][0]["decoupled_spec"]["transport"]
+
+        self.assertIn("draft_send_queue_latency_us", transport)
+        self.assertNotIn("draft_receive_to_gpu_publish_enqueue_latency_us", transport)
+        self.assertNotIn("num_clock_sync_valid_peers", transport)
+        self.assertNotIn("clock_sync_valid", transport)
+
     def test_full_decode_metrics_history_fits_one_snapshot_slot(self):
         windows = [
             DecodeMetricsWindow(
@@ -80,6 +267,7 @@ class TestShmRoundTrip(CustomTestCase):
                 num_proposed_drafts=480,
                 accept_length=2.0,
                 proposed_draft_length=1.5,
+                decoupled_spec=_decoupled_metrics(),
             )
             for index in range(64)
         ]
@@ -119,6 +307,7 @@ class TestShmRoundTrip(CustomTestCase):
                             num_proposed_drafts=480,
                             accept_length=2.0,
                             proposed_draft_length=1.5,
+                            decoupled_spec=_decoupled_metrics(),
                         )
                     ],
                     speculative=SpeculativeMetrics(
@@ -148,6 +337,23 @@ class TestShmRoundTrip(CustomTestCase):
             )
             self.assertEqual(
                 load.to_dict()["decode_metrics_windows"][0]["accept_length"], 2.0
+            )
+            decoupled = load.to_dict()["decode_metrics_windows"][0]["decoupled_spec"]
+            self.assertEqual(decoupled["tail_select"]["num_select_rows"], 320)
+            self.assertEqual(
+                decoupled["tail_select"]["reason_counts"],
+                {"direct": 160, "bonus_mismatch": 160},
+            )
+            self.assertEqual(
+                decoupled["tail_select"]["num_seqlock_retry_rows"], 12
+            )
+            self.assertEqual(decoupled["tail_select"]["num_seqlock_retries"], 19)
+            self.assertEqual(decoupled["tail_select"]["max_seqlock_retries"], 4)
+            self.assertEqual(
+                decoupled["transport"][
+                    "draft_receive_to_gpu_publish_enqueue_latency_us"
+                ]["bucket_counts"],
+                [0] * 18,
             )
             self.assertEqual(load.speculative.accept_rate, 0.5)
             self.assertEqual(load.speculative.draft_occupancy_rate, 0.25)

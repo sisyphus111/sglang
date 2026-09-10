@@ -1,4 +1,4 @@
-"""CPU tests for decoupled-spec plot artifact loading."""
+"""CPU tests for fixed requests.csv plot loading."""
 
 import sys
 import tempfile
@@ -18,17 +18,20 @@ from plot_utils import load_csv  # noqa: E402
 
 
 class TestDecoupledSpecPlotUtils(CustomTestCase):
-    def test_load_csv_accepts_long_generated_text(self):
+    def test_load_csv_accepts_long_json_array_field(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "request_metrics.csv"
-            generated_text = "x" * 200_000
+            path = Path(directory) / "requests.csv"
+            array_text = "[" + ",".join("1" for _ in range(100_000)) + "]"
             path.write_text(
-                f"request_id,generated_text\nreq-0,{generated_text}\n",
+                "batch_row_index,spec_num_proposed_drafts_by_position\n"
+                f'0,"{array_text}"\n',
                 encoding="utf-8",
             )
             rows = load_csv(path)
-            self.assertEqual(rows[0]["request_id"], "req-0")
-            self.assertEqual(rows[0]["generated_text"], generated_text)
+            self.assertEqual(rows[0]["batch_row_index"], "0")
+            self.assertEqual(
+                rows[0]["spec_num_proposed_drafts_by_position"], array_text
+            )
 
 
 if __name__ == "__main__":

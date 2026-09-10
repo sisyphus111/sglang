@@ -73,3 +73,55 @@ def fused_replay_state_indices(
         BS_UPPER=triton.next_power_of_2(total_bs),
     )
     return out_state_indices[:total_bs]
+
+
+@triton.jit
+def _fused_replay_routed_state_indices_kernel(
+    req_pool_indices_ptr,  # (total_bs,) int64 -- static replay buffer
+    route_src_ptr,  # (valid_bs,) int64 -- drafter checkpoint source slots
+    route_dst_ptr,  # (valid_bs,) int64 -- drafter checkpoint destination slots
+    out_src_ptr,  # (total_bs,) int32 -- captured source state indices
+    out_dst_ptr,  # (total_bs,) int32 -- captured destination state indices
+    valid_bs,
+    total_bs,
+    BS_UPPER: tl.constexpr,
+):
+    offs = tl.arange(0, BS_UPPER)
+    in_range = offs < total_bs
+    valid = offs < valid_bs
+    route_src = tl.load(route_src_ptr + offs, mask=valid, other=-1)
+    route_dst = tl.load(route_dst_ptr + offs, mask=valid, other=-1)
+    tl.store(out_src_ptr + offs, route_src.to(tl.int32), mask=in_range)
+    tl.store(out_dst_ptr + offs, route_dst.to(tl.int32), mask=in_range)
+    zeros = tl.zeros([BS_UPPER], dtype=tl.int64)
+    tl.store(req_pool_indices_ptr + offs, zeros, mask=in_range & (~valid))
+
+
+def fused_replay_routed_state_indices(
+    *,
+    req_pool_indices: torch.Tensor,
+    route_src_indices: torch.Tensor,
+    route_dst_indices: torch.Tensor,
+    out_src_indices: torch.Tensor,
+    out_dst_indices: torch.Tensor,
+    valid_bs: int,
+    total_bs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage decoupled-drafter src/dst routes in one launch.
+
+    Valid rows are cast from the manager's int64 route ring into the int32
+    buffers captured by the Mamba graph. Padded rows receive the ``-1`` state
+    sentinel and zero their captured request-pool indices.
+    """
+
+    _fused_replay_routed_state_indices_kernel[(1,)](
+        req_pool_indices,
+        route_src_indices,
+        route_dst_indices,
+        out_src_indices,
+        out_dst_indices,
+        valid_bs,
+        total_bs,
+        BS_UPPER=triton.next_power_of_2(total_bs),
+    )
+    return out_src_indices[:total_bs], out_dst_indices[:total_bs]

@@ -569,15 +569,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch=batch,
         )
 
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
-    else:
-        locs = seq_lens_gpu.clone()
+    if not batch.defer_decode_kv_binding:
+        # Ordinary decode knows its logical position on the schedule stream.
+        # The decoupled-drafter overlap path only allocates the physical
+        # candidate here; its GPU reconcile transaction performs this binding.
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + seq_lens_gpu
+        else:
+            locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -587,8 +590,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             token_per_req,
         )
 
-    for req in batch.reqs:
-        req.kv.kv_allocated_len += token_per_req
+    if not batch.defer_decode_kv_binding:
+        for req in batch.reqs:
+            req.kv.kv_allocated_len += token_per_req
 
     return out_cache_loc
 

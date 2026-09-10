@@ -15,6 +15,7 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
     DecoupledSpecPeerConfig,
     DraftClose,
+    DraftControlBatch,
     DraftSync,
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
@@ -38,19 +39,23 @@ def _sync(request_id: str = "req") -> DraftSync:
 
 
 def _tail(
-    token_pos: int,
-    token: int,
+    start_token_pos: int,
+    tokens: int | tuple[int, ...],
     *,
     request_id: str = "req",
     base_committed_len: int = 0,
+    is_commit_echo: bool = False,
 ) -> DraftTailStreamOutput:
+    if isinstance(tokens, int):
+        tokens = (tokens,)
     return DraftTailStreamOutput(
         src_drafter_rank=0,
         dst_verifier_rank=0,
         request_id=request_id,
         base_committed_len=base_committed_len,
-        new_token_pos=token_pos,
-        new_token=token,
+        start_token_pos=start_token_pos,
+        tokens=tuple(tokens),
+        is_commit_echo=is_commit_echo,
     )
 
 
@@ -65,6 +70,59 @@ def _wait_for_value(callback, timeout_s: float = 1.0):
 
 
 class TestDraftTailBuffer(CustomTestCase):
+    def test_append_accepts_one_contiguous_token_span(self):
+        buffer = DraftTailBuffer(verifier_rank=0)
+        buffer.open_request(_sync())
+
+        buffer.append_draft_stream_batch(
+            DraftTailStreamOutputBatch(outputs=[_tail(0, (10, 11, 12))])
+        )
+
+        self.assertEqual(buffer.snapshot("req").tail_tokens, (10, 11, 12))
+
+    def test_conflicting_overlap_rejects_entire_span(self):
+        buffer = DraftTailBuffer(verifier_rank=0)
+        buffer.open_request(_sync())
+        buffer.append_draft_stream_batch(
+            DraftTailStreamOutputBatch(outputs=[_tail(0, (10, 11, 12))])
+        )
+
+        with self.assertRaises(RuntimeError):
+            buffer.append_draft_stream_batch(
+                DraftTailStreamOutputBatch(outputs=[_tail(1, (11, 99))])
+            )
+
+        self.assertEqual(buffer.snapshot("req").tail_tokens, (10, 11, 12))
+
+    def test_commit_echo_then_retained_span_apply_in_one_batch(self):
+        buffer = DraftTailBuffer(verifier_rank=0)
+        buffer.open_request(_sync())
+        buffer.append_draft_stream_batch(
+            DraftTailStreamOutputBatch(outputs=[_tail(0, (10, 11))])
+        )
+        buffer.apply_verify_commit(
+            VerifyCommit(
+                request_id="req",
+                src_verifier_rank=0,
+                dst_drafter_rank=0,
+                pre_verify_committed_len=0,
+                committed_tokens=[10, 11, 12],
+            )
+        )
+
+        buffer.append_draft_stream_batch(
+            DraftTailStreamOutputBatch(
+                outputs=[
+                    _tail(2, 12, base_committed_len=3, is_commit_echo=True),
+                    _tail(3, (13, 14), base_committed_len=3),
+                ]
+            )
+        )
+
+        snapshot = buffer.snapshot("req")
+        self.assertEqual(snapshot.committed_len, 3)
+        self.assertEqual(snapshot.tail_tokens, (13, 14))
+
     def test_pending_prefix_state_is_request_local(self):
         buffer = DraftTailBuffer(verifier_rank=0)
         buffer.open_requests([_sync("blocked"), _sync("ready")])
@@ -85,7 +143,7 @@ class TestDraftTailBuffer(CustomTestCase):
         self.assertEqual(buffer.snapshot("blocked").tail_tokens, ())
         self.assertEqual(buffer.snapshot("ready").tail_tokens, (30,))
 
-    def test_short_tail_accepts_matching_continuation_from_old_base(self):
+    def test_mismatching_short_tail_waits_for_cumulative_commit_echo(self):
         buffer = DraftTailBuffer(verifier_rank=0)
         buffer.open_request(_sync())
         buffer.append_draft_stream_batch(
@@ -102,7 +160,17 @@ class TestDraftTailBuffer(CustomTestCase):
         )
 
         buffer.append_draft_stream_batch(
-            DraftTailStreamOutputBatch(outputs=[_tail(1, 11, base_committed_len=0)])
+            DraftTailStreamOutputBatch(
+                outputs=[
+                    _tail(1, 999, base_committed_len=0),
+                    _tail(
+                        1,
+                        11,
+                        base_committed_len=2,
+                        is_commit_echo=True,
+                    ),
+                ]
+            )
         )
 
         snapshot = buffer.snapshot("req")
@@ -203,21 +271,26 @@ class TestDraftTailBuffer(CustomTestCase):
         )
 
         pending_snapshot = buffer.snapshot("req")
-        self.assertEqual(pending_snapshot.committed_len, 1)
+        self.assertEqual(pending_snapshot.committed_len, 2)
         self.assertEqual(pending_snapshot.tail_tokens, ())
 
         # The mismatching stream was based before the rewrite boundary.
         buffer.append_draft_stream_batch(
             DraftTailStreamOutputBatch(outputs=[_tail(1, 11)])
         )
-        self.assertEqual(buffer.snapshot("req").committed_len, 1)
+        self.assertEqual(buffer.snapshot("req").committed_len, 2)
 
         # The aligned drafter confirms the verifier-owned token, then publishes
         # a new tail from the rewritten prefix.
         buffer.append_draft_stream_batch(
             DraftTailStreamOutputBatch(
                 outputs=[
-                    _tail(1, 11, base_committed_len=1),
+                    _tail(
+                        1,
+                        11,
+                        base_committed_len=2,
+                        is_commit_echo=True,
+                    ),
                     _tail(2, 12, base_committed_len=2),
                 ]
             )
@@ -253,8 +326,18 @@ class TestDraftTailBuffer(CustomTestCase):
         buffer.append_draft_stream_batch(
             DraftTailStreamOutputBatch(
                 outputs=[
-                    _tail(1, 21, base_committed_len=1),
-                    _tail(2, 22, base_committed_len=2),
+                    _tail(
+                        1,
+                        21,
+                        base_committed_len=2,
+                        is_commit_echo=True,
+                    ),
+                    _tail(
+                        2,
+                        22,
+                        base_committed_len=3,
+                        is_commit_echo=True,
+                    ),
                     _tail(3, 23, base_committed_len=3),
                 ]
             )
@@ -264,16 +347,7 @@ class TestDraftTailBuffer(CustomTestCase):
         self.assertEqual(snapshot.committed_len, 3)
         self.assertEqual(snapshot.tail_tokens, (23,))
 
-    def test_multiple_pending_tokens_remain_in_the_cpu_reference_queue(self):
-        """Document the case a single pending anchor cannot represent.
-
-        An overlap verifier may keep making target-only progress before the
-        drafter confirms the previous verifier-owned token. The CPU reference
-        retains both tokens in order. The GPU row therefore publishes an empty,
-        non-consumable tail while this queue is non-empty; it does not duplicate
-        pending tokens or multiple rounds on device.
-        """
-
+    def test_cumulative_commit_echo_is_idempotent(self):
         buffer = DraftTailBuffer(verifier_rank=0)
         buffer.open_request(_sync())
         buffer.apply_verify_commit(
@@ -295,17 +369,29 @@ class TestDraftTailBuffer(CustomTestCase):
             )
         )
 
-        # The second token cannot confirm before the first one.
+        # An out-of-order output cannot skip the first pending verifier token.
         buffer.append_draft_stream_batch(
             DraftTailStreamOutputBatch(outputs=[_tail(1, 21, base_committed_len=0)])
         )
-        self.assertEqual(buffer.snapshot("req").committed_len, 0)
+        self.assertEqual(buffer.snapshot("req").committed_len, 2)
 
+        ack_one = _tail(
+            0,
+            20,
+            base_committed_len=1,
+            is_commit_echo=True,
+        )
         buffer.append_draft_stream_batch(
             DraftTailStreamOutputBatch(
                 outputs=[
-                    _tail(0, 20, base_committed_len=0),
-                    _tail(1, 21, base_committed_len=0),
+                    ack_one,
+                    ack_one,
+                    _tail(
+                        1,
+                        21,
+                        base_committed_len=2,
+                        is_commit_echo=True,
+                    ),
                     _tail(2, 22, base_committed_len=2),
                 ]
             )
@@ -313,6 +399,20 @@ class TestDraftTailBuffer(CustomTestCase):
         snapshot = buffer.snapshot("req")
         self.assertEqual(snapshot.committed_len, 2)
         self.assertEqual(snapshot.tail_tokens, (22,))
+
+        with self.assertRaisesRegex(RuntimeError, "ACK is ahead"):
+            buffer.append_draft_stream_batch(
+                DraftTailStreamOutputBatch(
+                    outputs=[
+                        _tail(
+                            2,
+                            22,
+                            base_committed_len=3,
+                            is_commit_echo=True,
+                        )
+                    ]
+                )
+            )
 
     def test_close_and_same_rid_reopen_use_distinct_wire_epochs(self):
         buffer = DraftTailBuffer(verifier_rank=0)
@@ -407,8 +507,8 @@ class TestPythonDecoupledSpecDataPlane(CustomTestCase):
                             dst_verifier_rank=5,
                             request_id="sparse",
                             base_committed_len=0,
-                            new_token_pos=0,
-                            new_token=101,
+                            start_token_pos=0,
+                            tokens=(101,),
                         )
                     ]
                 )
@@ -496,6 +596,62 @@ class TestPythonDecoupledSpecDataPlane(CustomTestCase):
             self.assertFalse(verifier.draft_tail_buffer.has_request("req"))
             close_batches = _wait_for_value(drafter.drain_controls)
             self.assertEqual(close_batches[0].close_messages[0].reason, "finished")
+        finally:
+            drafter.close()
+            verifier.close()
+            context.destroy(linger=0)
+
+    def test_remote_only_verify_commit_does_not_mutate_local_tail(self):
+        context = zmq.Context()
+        suffix = uuid.uuid4().hex
+        verifier_endpoint = f"inproc://decoupled-verifier-{suffix}"
+        drafter_endpoint = f"inproc://decoupled-drafter-{suffix}"
+        verifier = VerifierDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=verifier_endpoint,
+                connect_endpoints=(drafter_endpoint,),
+                rank=0,
+            ),
+            context=context,
+        )
+        drafter = DrafterDecoupledSpecDataPlane(
+            DecoupledSpecIpcConfig(
+                bind_endpoint=drafter_endpoint,
+                connect_endpoints=(verifier_endpoint,),
+                rank=0,
+            ),
+            context=context,
+        )
+
+        try:
+            verifier.start()
+            drafter.start()
+            verifier.open_request(_sync())
+            _wait_for_value(drafter.drain_controls)
+            verifier.draft_tail_buffer.append_draft_stream_batch(
+                DraftTailStreamOutputBatch(outputs=[_tail(0, 101)])
+            )
+            commit = VerifyCommit(
+                request_id="req",
+                src_verifier_rank=0,
+                dst_drafter_rank=0,
+                pre_verify_committed_len=0,
+                committed_tokens=[101],
+            )
+
+            verifier.submit_control_batch(
+                DraftControlBatch(
+                    dst_drafter_rank=0,
+                    verify_commit_messages=[commit],
+                ),
+                apply_local_verify_commits=False,
+            )
+
+            local = verifier.snapshot_one("req")
+            self.assertEqual(local.committed_len, 0)
+            self.assertEqual(local.tail_tokens, (101,))
+            remote = _wait_for_value(drafter.drain_controls)
+            self.assertEqual(remote[0].verify_commit_messages, [commit])
         finally:
             drafter.close()
             verifier.close()

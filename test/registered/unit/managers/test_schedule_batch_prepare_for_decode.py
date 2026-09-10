@@ -81,6 +81,32 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
                 self.assertTrue(torch.equal(prev_seq_lens_cpu, prev_values[1]))
                 self.assertTrue(torch.equal(prev_orig_seq_lens, prev_values[2]))
 
+    def test_deferred_binding_still_allocates_one_physical_candidate(self):
+        batch = _make_decode_batch()
+        batch.defer_decode_kv_binding = True
+        candidate = torch.tensor([61, 62], dtype=torch.int64)
+        server_args = types.SimpleNamespace(
+            enable_mamba_extra_buffer=lambda: False,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=candidate,
+            ) as alloc,
+            patch(
+                "sglang.srt.managers.schedule_batch.get_server_args",
+                return_value=server_args,
+            ),
+        ):
+            batch.prepare_for_decode()
+
+        alloc.assert_called_once_with(batch, token_per_req=1)
+        self.assertIs(batch.out_cache_loc, candidate)
+        self.assertIsNone(batch.seq_lens_cpu)
+        self.assertEqual([req.decode_batch_idx for req in batch.reqs], [1, 1])
+        self.assertEqual([req.kv_committed_len for req in batch.reqs], [3, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

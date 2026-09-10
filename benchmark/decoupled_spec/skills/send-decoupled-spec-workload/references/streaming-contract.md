@@ -25,15 +25,14 @@ failures.
 
 ## Timing
 
-- TTFT: formal batch start to the first event that increases completion tokens
-  for that request.
-- TPOT: `(last_token_time - first_token_time) / (completion_tokens - 1)` when
-  at least two completion tokens are observed.
-- E2E latency: formal batch start to the last token-increase event for that
-  request.
-- `batch_elapsed_s`: formal batch start until the complete SSE stream ends.
-- `output_tokens_per_s`: total completion tokens divided by batch elapsed time.
+- `requests.csv.e2e_latency_s`: formal batch start to the last token-increase
+  event for that request, in seconds.
+- `batch.json.batch_elapsed_latency_s`: maximum request E2E latency.
+- `batch.json.batch_thpt`: total output tokens divided by that maximum E2E
+  latency, in tokens/s.
 
-These are client-observed HTTP streaming timings. They include server-side
-work, transport, buffering, and client receive/parse effects; they are not pure
-GPU or decoupled-IPC durations.
+The full SSE stream bounds remain in `observer/bench_timeline.json` as
+`client_started_wall_time` and `client_finished_wall_time`, but they are not a
+business-result field. The fixed contract has no TTFT or TPOT.
+E2E latency includes server processing, transport, buffering, and client
+receive/parse effects; it is not a pure GPU or Decoupled-Spec IPC duration.

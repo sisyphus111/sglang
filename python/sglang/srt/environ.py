@@ -913,6 +913,11 @@ class Envs:
     SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND = EnvBool(False)
     # Optional absolute libzmq path used by the JIT-loaded native transport.
     SGLANG_DECOUPLED_SPEC_ZMQ_LIB = EnvStr(None)
+    # Complete scheduler-cycle cost profile consumed by the decoupled verifier.
+    SGLANG_DECOUPLED_VERIFY_THROUGHPUT_PROFILE_PATH = EnvStr(None)
+    # Internal job description used only by the offline profiler. Production
+    # serving must consume the complete profile above instead of setting this.
+    SGLANG_DECOUPLED_VERIFY_OFFLINE_PROFILE_SPEC_PATH = EnvStr(None)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

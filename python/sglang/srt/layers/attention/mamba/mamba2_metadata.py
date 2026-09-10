@@ -29,6 +29,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    mamba_cache_src_indices: Optional[torch.Tensor] = None
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
@@ -187,6 +189,8 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_src_indices=forward_metadata.mamba_cache_src_indices,
+            mamba_cache_dst_indices=forward_metadata.mamba_cache_dst_indices,
             mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
@@ -288,6 +292,8 @@ class Mamba2Metadata(ForwardMetadata):
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
+            mamba_cache_src_indices=forward_metadata.mamba_cache_src_indices,
+            mamba_cache_dst_indices=forward_metadata.mamba_cache_dst_indices,
             mamba_track_indices=forward_metadata.mamba_track_indices,
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,

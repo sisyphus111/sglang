@@ -444,6 +444,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Optional logical Mamba slots for read-from-source/write-to-destination
+    # recurrent-state routing. They must be provided together.
+    mamba_cache_src_indices: Optional[torch.Tensor] = None
+    mamba_cache_dst_indices: Optional[torch.Tensor] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -749,14 +753,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
-        seq_lens_cpu = batch.seq_lens_cpu
+        # The GPU-authoritative decoupled drafter may reconcile a mismatch after
+        # scheduling, so its host sequence lengths are only pacing metadata. Its
+        # forward must build attention metadata from the device lengths resolved
+        # at forward entry.
+        gpu_only_seq_lens = bool(batch.defer_decode_kv_binding)
+        seq_lens_cpu = None if gpu_only_seq_lens else batch.seq_lens_cpu
+        seq_lens_sum = None if gpu_only_seq_lens else batch.seq_lens_sum
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
         # tolerated for now despite the init_new-must-not-mutate-SB rule.
-        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
+        if seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
+            seq_lens_sum = batch.seq_lens_sum
 
         ret = cls(
             # Required core inputs
@@ -766,7 +777,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_sum=seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -774,6 +785,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_cache_src_indices=batch.mamba_cache_src_indices,
+            mamba_cache_dst_indices=batch.mamba_cache_dst_indices,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -946,6 +959,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.compute_spec_mrope_positions(
                     model_runner, batch, seq_positions=ret.positions
                 )
+            elif gpu_only_seq_lens:
+                # The decoupled drafter reconciles seq_lens on GPU immediately
+                # before this ForwardBatch is built. Derive MRoPE from those
+                # device positions without restoring a host sequence-length
+                # shadow on the decode critical path.
+                ret.compute_spec_mrope_positions(
+                    model_runner, batch, seq_positions=ret.positions
+                )
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
@@ -1112,9 +1133,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
-            )
+            # Text-only MRoPE has zero delta on all three axes. Keep this as a
+            # broadcast view of the GPU-authoritative positions; the graph
+            # input registry copies the view into its contiguous static buffer.
+            # Materializing zeros + add + repeat here adds three tiny launches
+            # to every decode replay and is especially visible on a TP1 drafter.
+            self.mrope_positions = seq_positions.flatten().unsqueeze(0).expand(3, -1)
+            return
         else:
             mrope_deltas = [
                 (
@@ -1469,6 +1494,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_seqlens is not None:
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
+            )
+        if self.mamba_cache_src_indices is not None:
+            self.mamba_cache_src_indices = self._pad_tensor_to_size(
+                self.mamba_cache_src_indices, bs, value=-1
+            )
+        if self.mamba_cache_dst_indices is not None:
+            self.mamba_cache_dst_indices = self._pad_tensor_to_size(
+                self.mamba_cache_dst_indices, bs, value=-1
             )
 
         if self.mrope_positions is not None:
