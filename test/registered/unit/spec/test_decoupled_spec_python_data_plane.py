@@ -1,4 +1,4 @@
-"""CPU tests for the Python decoupled-spec data plane."""
+"""Python socket transport contracts using the CUDA-built native backend."""
 
 import threading
 import time
@@ -6,26 +6,28 @@ import unittest
 import uuid
 
 import zmq
-
-from sglang.srt.speculative.decoupled_spec_data_plane import (
-    DrafterDecoupledSpecDataPlane,
-    VerifierDecoupledSpecDataPlane,
+from decoupled_spec_test_utils import (
+    PythonDrafterTestPeer as DrafterDecoupledSpecDataPlane,
 )
+from decoupled_spec_test_utils import (
+    PythonVerifierTestPeer as VerifierDecoupledSpecDataPlane,
+)
+from draft_tail_reference import DraftTailBuffer
+
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
     DecoupledSpecPeerConfig,
     DraftClose,
-    DraftControlBatch,
     DraftSync,
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
     VerifyCommit,
 )
-from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+# Python sockets still share the native backend and its CUDA JIT dependency.
+register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
 
 
 def _sync(request_id: str = "req") -> DraftSync:
@@ -579,11 +581,7 @@ class TestPythonDecoupledSpecDataPlane(CustomTestCase):
             locally_committed = verifier.snapshot_one("req")
             self.assertEqual(locally_committed.committed_len, 1)
             self.assertEqual(locally_committed.tail_tokens, (102,))
-            commit_batches = _wait_for_value(drafter.drain_controls)
-            self.assertEqual(
-                commit_batches[0].verify_commit_messages[0].committed_tokens,
-                [101],
-            )
+            drafter.wait_for_commit("req", 1)
 
             verifier.close_request(
                 DraftClose(
@@ -593,65 +591,12 @@ class TestPythonDecoupledSpecDataPlane(CustomTestCase):
                     reason="finished",
                 )
             )
-            self.assertFalse(verifier.draft_tail_buffer.has_request("req"))
+            self.assertFalse(
+                verifier.gpu_tail_buffer.lookup_binding("req", verifier.config.rank)
+                is not None
+            )
             close_batches = _wait_for_value(drafter.drain_controls)
-            self.assertEqual(close_batches[0].close_messages[0].reason, "finished")
-        finally:
-            drafter.close()
-            verifier.close()
-            context.destroy(linger=0)
-
-    def test_remote_only_verify_commit_does_not_mutate_local_tail(self):
-        context = zmq.Context()
-        suffix = uuid.uuid4().hex
-        verifier_endpoint = f"inproc://decoupled-verifier-{suffix}"
-        drafter_endpoint = f"inproc://decoupled-drafter-{suffix}"
-        verifier = VerifierDecoupledSpecDataPlane(
-            DecoupledSpecIpcConfig(
-                bind_endpoint=verifier_endpoint,
-                connect_endpoints=(drafter_endpoint,),
-                rank=0,
-            ),
-            context=context,
-        )
-        drafter = DrafterDecoupledSpecDataPlane(
-            DecoupledSpecIpcConfig(
-                bind_endpoint=drafter_endpoint,
-                connect_endpoints=(verifier_endpoint,),
-                rank=0,
-            ),
-            context=context,
-        )
-
-        try:
-            verifier.start()
-            drafter.start()
-            verifier.open_request(_sync())
-            _wait_for_value(drafter.drain_controls)
-            verifier.draft_tail_buffer.append_draft_stream_batch(
-                DraftTailStreamOutputBatch(outputs=[_tail(0, 101)])
-            )
-            commit = VerifyCommit(
-                request_id="req",
-                src_verifier_rank=0,
-                dst_drafter_rank=0,
-                pre_verify_committed_len=0,
-                committed_tokens=[101],
-            )
-
-            verifier.submit_control_batch(
-                DraftControlBatch(
-                    dst_drafter_rank=0,
-                    verify_commit_messages=[commit],
-                ),
-                apply_local_verify_commits=False,
-            )
-
-            local = verifier.snapshot_one("req")
-            self.assertEqual(local.committed_len, 0)
-            self.assertEqual(local.tail_tokens, (101,))
-            remote = _wait_for_value(drafter.drain_controls)
-            self.assertEqual(remote[0].verify_commit_messages, [commit])
+            self.assertEqual(close_batches[0].close_messages[0].request_id, "req")
         finally:
             drafter.close()
             verifier.close()

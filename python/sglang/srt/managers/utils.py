@@ -102,6 +102,9 @@ class GenerationBatchResult:
     # and copies back only allocator ownership/reclaim metadata. Final prefill
     # additionally returns one lifecycle verdict for ordinary result admission.
     decoupled_draft_gpu_managed: bool = False
+    # For MIXED, only this request prefix needs ordinary prefill admission.
+    # The decode suffix is retired on GPU and has no CPU token transcript.
+    decoupled_draft_num_prefill_reqs: Optional[int] = None
     decoupled_draft_candidate_committed: Optional[torch.Tensor] = None
     # Decode rows: [accepted, owned_bound_position, reclaim_cache_loc].
     decoupled_draft_kv_outcomes: Optional[torch.Tensor] = None
@@ -170,16 +173,17 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         if not self.decoupled_draft_gpu_managed:
-            self.next_token_ids = _async_d2h(self.next_token_ids)
+            tokens = self.next_token_ids
+            if self.decoupled_draft_num_prefill_reqs is not None:
+                tokens = tokens[: self.decoupled_draft_num_prefill_reqs]
+            self.next_token_ids = _async_d2h(tokens)
 
         if self.decoupled_draft_candidate_committed is not None:
             self.decoupled_draft_candidate_committed = _async_d2h(
                 self.decoupled_draft_candidate_committed
             )
-        if self.decoupled_draft_kv_outcomes is not None:
-            self.decoupled_draft_kv_outcomes = _async_d2h(
-                self.decoupled_draft_kv_outcomes
-            )
+        # Drafter allocator outcomes stay on device until the manager's
+        # batched copy. Mixing CPU and GPU outcomes would break that protocol.
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
 

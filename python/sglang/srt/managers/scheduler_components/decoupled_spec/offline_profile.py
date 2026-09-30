@@ -5,15 +5,14 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_verify_profile import (
     DECOUPLED_VERIFY_PROFILE_ABI_VERSION,
-    DECOUPLED_VERIFY_PROFILE_CONTROL_PLANE,
     DECOUPLED_VERIFY_PROFILE_CONTEXT_ANCHOR_MODE,
+    DECOUPLED_VERIFY_PROFILE_CONTROL_PLANE,
     DECOUPLED_VERIFY_PROFILE_COST_ESTIMATOR,
     DECOUPLED_VERIFY_PROFILE_COST_SCOPE,
     DECOUPLED_VERIFY_PROFILE_DRAFT_PROVIDER,
@@ -105,6 +104,7 @@ class DecoupledVerifyOfflineProfiler:
         completion_ns: int,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        pre_output_lens: list[int],
     ) -> None:
         point_index = self._profile_point_index(batch)
         if point_index is None or point_index < self._point_index:
@@ -116,11 +116,7 @@ class DecoupledVerifyOfflineProfiler:
             )
         point = self.points[point_index]
         batch_size = len(batch.reqs)
-        applied_steps = int(
-            getattr(result, "decoupled_verify_steps", None)
-            if getattr(result, "decoupled_verify_steps", None) is not None
-            else int(result.speculative_num_draft_tokens or 1) - 1
-        )
+        applied_steps = int(result.decoupled_verify_steps)
         selected = [
             int(value) for value in (result.num_proposed_drafts_per_req_cpu or [])
         ]
@@ -133,7 +129,7 @@ class DecoupledVerifyOfflineProfiler:
             and len(correct) == batch_size
             and all(int(value) == applied_steps for value in correct)
             and bool(result.can_run_cuda_graph)
-            and not any(getattr(req, "is_retracted", False) for req in batch.reqs)
+            and not any(req.is_retracted for req in batch.reqs)
             and not any(req.finished() for req in batch.reqs)
         )
         if not is_valid:
@@ -158,15 +154,9 @@ class DecoupledVerifyOfflineProfiler:
         if self._num_gaps <= self.warmup_iters:
             return
 
-        pre_output_lens = list(getattr(batch, "decoupled_pre_output_lens", []) or [])
         context_lens = [
-            len(req.origin_input_ids)
-            + (
-                pre_output_lens[row]
-                if row < len(pre_output_lens)
-                else len(req.output_ids)
-            )
-            for row, req in enumerate(batch.reqs)
+            len(req.origin_input_ids) + pre_output_len
+            for req, pre_output_len in zip(batch.reqs, pre_output_lens, strict=True)
         ]
         self._costs_ms.append(gap_ms)
         self._measured_context_lens.append(statistics.fmean(context_lens))

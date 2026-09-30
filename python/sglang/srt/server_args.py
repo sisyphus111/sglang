@@ -2226,7 +2226,7 @@ class ServerArgs:
         "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
         "runs the target/verify half with --speculative-algorithm "
         "DECOUPLED_VERIFY, and 'drafter' runs the plain decode half with no "
-        "speculative algorithm and --disable-overlap-schedule.",
+        "speculative algorithm, with either scheduler mode.",
         NS("disagg"),
     ] = "null"
     spec_trace_dir: A[
@@ -9454,15 +9454,6 @@ class PortArgs:
 
         decoupled_spec_ipc_config = None
         if server_args.decoupled_spec_role != "null":
-            if (
-                server_args.decoupled_spec_bind_endpoint is None
-                or server_args.decoupled_spec_rank is None
-            ):
-                raise ValueError(
-                    "--decoupled-spec-bind-endpoint, "
-                    "--decoupled-spec-rank, and a peer topology are required "
-                    "for decoupled speculative decoding."
-                )
             decoupled_spec_ipc_config = DecoupledSpecIpcConfig.from_raw(
                 bind_endpoint=server_args.decoupled_spec_bind_endpoint,
                 rank=server_args.decoupled_spec_rank,

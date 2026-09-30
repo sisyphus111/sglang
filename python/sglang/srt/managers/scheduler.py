@@ -1463,6 +1463,7 @@ class Scheduler(
             self.copy_stream
         )
 
+        self.result_queue: Deque = deque()
         if not self.enable_overlap:
             return
 
@@ -1727,8 +1728,6 @@ class Scheduler(
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
-            if self.decoupled_spec_manager is not None:
-                plan = self.decoupled_spec_manager.adjust_plan(plan)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -1777,8 +1776,6 @@ class Scheduler(
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
-            if self.decoupled_spec_manager is not None:
-                plan = self.decoupled_spec_manager.adjust_plan(plan)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -3414,11 +3411,13 @@ class Scheduler(
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
+            if self.decoupled_spec_manager is not None:
+                running_batch = self.decoupled_spec_manager.sleep_overrun_requests(
+                    running_batch
+                )
             if not running_batch.is_empty():
                 if self.decoupled_spec_manager is not None:
-                    self.decoupled_spec_manager.prepare_decode_allocation(
-                        running_batch
-                    )
+                    self.decoupled_spec_manager.prepare_decode_allocation(running_batch)
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
@@ -3730,40 +3729,33 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        gpu_managed_draft_result = (
-                            batch_result.decoupled_draft_gpu_managed
-                        )
-                        batch_result.copy_done = (
-                            None
-                            if gpu_managed_draft_result
-                            else self.device_module.Event()
-                        )
-                        if batch_result.delay_sample_func is None:
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.decoupled_draft_gpu_managed:
+                            # The drafter manager already relayed this decode on
+                            # the GPU; its result has no host copy to wait for.
+                            batch_result.copy_done = None
+                        elif batch_result.delay_sample_func is None:
                             if not decoupled_publish_handled:
                                 self._relay_forward_payload(
                                     future_indices, batch_result
                                 )
-                            if not gpu_managed_draft_result:
-                                if _is_hip:
-                                    # Cross-stream sync costs more than the tiny D2H
-                                    # it overlaps.
+                            if _is_hip:
+                                # Cross-stream sync costs more than the tiny D2H it
+                                # overlaps.
+                                batch_result.copy_to_cpu(
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
+                            else:
+                                # Result D2H on copy_stream overlaps the next forward
+                                # instead of serializing on forward_stream; it's a leaf
+                                # gated by copy_done, so nothing on forward_stream waits.
+                                self.copy_stream.wait_stream(self.forward_stream)
+                                with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
-                                else:
-                                    # Result D2H on copy_stream overlaps the next
-                                    # forward instead of serializing on
-                                    # forward_stream; it's a leaf gated by copy_done,
-                                    # so nothing on forward_stream waits.
-                                    self.copy_stream.wait_stream(self.forward_stream)
-                                    with self.copy_stream_ctx:
-                                        batch_result.copy_to_cpu(
-                                            return_logprob=batch.return_logprob,
-                                            return_hidden_states=(
-                                                batch.return_hidden_states
-                                            ),
-                                        )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3810,14 +3802,33 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                if self.decoupled_spec_manager is not None:
+                    self.decoupled_spec_manager.prepare_forward(batch)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if batch_result.has_sampled_token_ids:
-                    # Non-spec: relay via future_map, gathered next iter.
-                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
+                decoupled_publish_handled = (
+                    self.decoupled_spec_manager is not None
+                    and self.decoupled_spec_manager.finish_forward(batch, batch_result)
+                )
+                if decoupled_publish_handled:
+                    # Serial mode keeps the upstream schedule stream. GPU
+                    # decode retirement is owned by the manager; prefill still
+                    # uses ordinary result admission and its completion event.
+                    if not batch_result.decoupled_draft_gpu_managed:
+                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
                     batch.input_ids = None
-                self.update_cache_from_scheduler(batch, batch_result)
+                else:
+                    if batch_result.has_sampled_token_ids:
+                        self._relay_forward_payload(
+                            batch.req_pool_indices, batch_result
+                        )
+                        batch.input_ids = None
+                    self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -3944,16 +3955,12 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
-        decoupled_result_handled = False
-        if self.decoupled_spec_manager is not None:
+        if (
+            self.decoupled_spec_manager is not None
+            and self.decoupled_spec_manager.before_process_batch_result(batch, result)
+        ):
             # The GPU-authoritative drafter consumes compact ownership results
             # without maintaining Req.output_ids as a second token transcript.
-            decoupled_result_handled = (
-                self.decoupled_spec_manager.before_process_batch_result(batch, result)
-                is True
-            )
-
-        if decoupled_result_handled:
             pass
         elif batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

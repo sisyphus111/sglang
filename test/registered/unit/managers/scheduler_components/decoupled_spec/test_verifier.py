@@ -6,16 +6,19 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler_components.decoupled_spec.verifier import (  # noqa: E402
     DecoupledVerifyManager,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    ForwardMode,
+)
 from sglang.srt.speculative.decoupled_spec_io import (  # noqa: E402
     DecoupledSpecIpcConfig,
     DecoupledSpecPeerConfig,
@@ -90,6 +93,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
             ),
             draft_worker=self.verify_worker,
             enable_overlap=True,
+            metrics_reporter=MagicMock(),
         )
         self.config = DecoupledSpecIpcConfig(
             bind_endpoint="ipc:///tmp/unused-verifier",
@@ -99,7 +103,6 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager = DecoupledVerifyManager(self.scheduler, self.config)
         self.data_plane_factory.assert_called_once_with(
             self.config,
-            required_tail_len=0,
             device=torch.device("cpu"),
             num_gpu_seats=17,
             num_draft_tokens=3,
@@ -175,7 +178,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(_batch(reqs, ForwardMode.EXTEND))
 
         assigned_ranks = [
-            self.manager._open_drafter_rank_by_req[req.rid] for req in reqs
+            self.manager._open_requests[req.rid].drafter_rank for req in reqs
         ]
         self.assertEqual(assigned_ranks, [3, 9, 3, 3, 9, 3])
         open_batches = [
@@ -190,7 +193,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(_batch(reqs, ForwardMode.DECODE))
         self.data_plane.open_requests.assert_not_called()
         self.assertEqual(
-            [self.manager._open_drafter_rank_by_req[req.rid] for req in reqs],
+            [self.manager._open_requests[req.rid].drafter_rank for req in reqs],
             assigned_ranks,
         )
 
@@ -205,14 +208,14 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(_batch([req_a, req_b, req_c], ForwardMode.EXTEND))
         self.assertEqual(
             [
-                self.manager._open_drafter_rank_by_req[req.rid]
+                self.manager._open_requests[req.rid].drafter_rank
                 for req in (req_a, req_b, req_c)
             ],
             [3, 9, 3],
         )
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -254,8 +257,8 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         req = _Req("req", output_tokens=(30,))
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
-        self.assertEqual(self.manager._open_drafter_rank_by_req[req.rid], 3)
-        result = SimpleNamespace(
+        self.assertEqual(self.manager._open_requests[req.rid].drafter_rank, 3)
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -358,14 +361,14 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
     def test_tail_selector_metrics_are_fixed_window_counters(self):
         batch = SimpleNamespace(
-            decoupled_result_mirror_ids=[
+            decoupled_launch_mirror_ids=[
                 "req-a::draft-epoch::1",
                 "req-b::draft-epoch::2",
             ]
         )
         self.manager._record_tail_select_result(
             batch,
-            SimpleNamespace(
+            GenerationBatchResult(
                 decoupled_rebase_valid=torch.tensor([1, 0], dtype=torch.int64),
                 decoupled_selected_draft_lens=torch.tensor([3, 0], dtype=torch.int64),
                 num_proposed_drafts_per_req_cpu=[3, 0],
@@ -380,7 +383,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         self.manager._record_tail_select_result(
             batch,
-            SimpleNamespace(
+            GenerationBatchResult(
                 decoupled_rebase_valid=torch.tensor([1, 1], dtype=torch.int64),
                 decoupled_selected_draft_lens=torch.tensor([3, 2], dtype=torch.int64),
                 num_proposed_drafts_per_req_cpu=[3, 2],
@@ -427,7 +430,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
     def test_tail_debug_is_read_only_after_result_processor_barrier(self):
         class DeferredDebugRows:
             ndim = 2
-            shape = (1, 10)
+            shape = (1, 11)
 
             def __init__(self):
                 self.ready = False
@@ -437,14 +440,14 @@ class TestDecoupledVerifyManager(CustomTestCase):
                 self.tolist_calls += 1
                 if not self.ready:
                     raise RuntimeError("async D2H is not complete")
-                return [[8, 1, 1, 0, 0, 0, 1, 0, 0, 0]]
+                return [[8, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0]]
 
         req = _Req("req", output_tokens=(30,))
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
         decode_batch = _batch([req], ForwardMode.DECODE)
         self.manager.prepare_batch(decode_batch)
         debug_rows = DeferredDebugRows()
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
             decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
             num_proposed_drafts_per_req_cpu=[0],
@@ -468,13 +471,13 @@ class TestDecoupledVerifyManager(CustomTestCase):
     def test_tail_selector_reason_must_match_row_valid(self):
         with self.assertRaisesRegex(RuntimeError, "reason disagrees"):
             self.manager._record_tail_select_result(
-                SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
-                SimpleNamespace(
+                SimpleNamespace(decoupled_launch_mirror_ids=["req::draft-epoch::1"]),
+                GenerationBatchResult(
                     decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
                     decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
                     num_proposed_drafts_per_req_cpu=[0],
                     decoupled_tail_select_debug=torch.tensor(
-                        [[5, 1, 0, 0, 0, 0, 0]], dtype=torch.int64
+                        [[5, 1, 0, 0, 0, 0, 0, 0, -1, -1, 0]], dtype=torch.int64
                     ),
                 ),
             )
@@ -485,13 +488,13 @@ class TestDecoupledVerifyManager(CustomTestCase):
             "request_id=req::draft-epoch::1 error_code=7 error_op_seq=123",
         ):
             self.manager._record_tail_select_result(
-                SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
-                SimpleNamespace(
+                SimpleNamespace(decoupled_launch_mirror_ids=["req::draft-epoch::1"]),
+                GenerationBatchResult(
                     decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
                     decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
                     num_proposed_drafts_per_req_cpu=[0],
                     decoupled_tail_select_debug=torch.tensor(
-                        [[4, 1, 0, 0, 0, 0, 0, 7, 123, 0]], dtype=torch.int64
+                        [[4, 1, 0, 0, 0, 0, 0, 7, 123, 0, 0]], dtype=torch.int64
                     ),
                 ),
             )
@@ -500,13 +503,13 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
     def test_transient_selector_row_allows_unavailable_fast_forward_counter(self):
         self.manager._record_tail_select_result(
-            SimpleNamespace(decoupled_result_mirror_ids=["req::draft-epoch::1"]),
-            SimpleNamespace(
+            SimpleNamespace(decoupled_launch_mirror_ids=["req::draft-epoch::1"]),
+            GenerationBatchResult(
                 decoupled_rebase_valid=torch.tensor([0], dtype=torch.int64),
                 decoupled_selected_draft_lens=torch.tensor([0], dtype=torch.int64),
                 num_proposed_drafts_per_req_cpu=[0],
                 decoupled_tail_select_debug=torch.tensor(
-                    [[2, -1, -1, -1, -1, -1, -1, 0, -1, -1]],
+                    [[2, -1, -1, -1, -1, -1, -1, 0, -1, -1, 0]],
                     dtype=torch.int64,
                 ),
             ),
@@ -522,7 +525,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(extend_batch)
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -546,7 +549,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
     def test_finished_planned_row_consumes_close_landing_fence(self):
         req = _Req("req", output_tokens=(30,))
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -587,14 +590,16 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.data_plane_factory.assert_not_called()
         self.assertEqual(batch.decoupled_launch_mirror_ids, ["req"])
         self.assertFalse(batch.decoupled_needs_landing_fence)
-        self.verify_worker.capture_expected_request_epochs.assert_called_once_with(batch)
+        self.verify_worker.capture_expected_request_epochs.assert_called_once_with(
+            batch
+        )
 
     def test_result_cursor_overrides_mutable_host_output_length(self):
         req = _Req("req", output_tokens=(30,))
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
             decoupled_pre_output_lens=torch.tensor([1], dtype=torch.int64),
@@ -619,7 +624,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
             decoupled_pre_output_lens=torch.tensor([-1], dtype=torch.int64),
@@ -661,7 +666,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(old_batch)
         self.manager.before_process_batch_result(
             old_batch,
-            SimpleNamespace(
+            GenerationBatchResult(
                 decoupled_rebase_valid=None,
                 decoupled_selected_draft_lens=None,
             ),
@@ -671,7 +676,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         old_req._finished = True
         self.manager.after_process_batch_result(
             old_batch,
-            SimpleNamespace(
+            GenerationBatchResult(
                 decoupled_rebase_valid=None,
                 decoupled_selected_draft_lens=None,
             ),
@@ -681,7 +686,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
             [message.request_id for message in close_batch.close_messages],
             ["req::draft-epoch::1"],
         )
-        self.assertNotIn(old_req.rid, self.manager._open_mirror_by_req)
+        self.assertNotIn(old_req.rid, self.manager._open_requests)
 
         self.data_plane.reset_mock()
         new_req = _Req("req", output_tokens=(30,), req_pool_idx=7)
@@ -700,7 +705,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.data_plane.reset_mock()
         self.manager.abort_request(old_req)
         self.assertEqual(
-            self.manager._open_mirror_by_req[new_req.rid],
+            self.manager._open_requests[new_req.rid].request_id,
             "req::draft-epoch::2",
         )
         self.data_plane.close_request.assert_not_called()
@@ -713,7 +718,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         )
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -738,15 +743,15 @@ class TestDecoupledVerifyManager(CustomTestCase):
             [message.request_id for message in control_batch.close_messages],
             ["finished::draft-epoch::2"],
         )
-        self.assertIn(continuing_req.rid, self.manager._open_mirror_by_req)
-        self.assertNotIn(finished_req.rid, self.manager._open_mirror_by_req)
+        self.assertIn(continuing_req.rid, self.manager._open_requests)
+        self.assertNotIn(finished_req.rid, self.manager._open_requests)
         self.data_plane.commit.assert_not_called()
         self.data_plane.close_request.assert_not_called()
 
     def test_stale_result_cannot_affect_new_generation(self):
         req = _Req("req", output_tokens=(30,))
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
         )
@@ -761,7 +766,8 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.after_process_batch_result(old_batch, result)
 
         self.assertEqual(
-            self.manager._open_mirror_by_req[req.rid], "req::draft-epoch::2"
+            self.manager._open_requests[req.rid].request_id,
+            "req::draft-epoch::2",
         )
         self.assertEqual(self.data_plane.method_calls, calls_after_reseat)
 
@@ -770,7 +776,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         self.manager.prepare_batch(_batch([req], ForwardMode.EXTEND))
         self.data_plane.reset_mock()
 
-        result = SimpleNamespace(
+        result = GenerationBatchResult(
             decoupled_rebase_valid=None,
             decoupled_selected_draft_lens=None,
             decoupled_pre_output_lens=torch.tensor([1], dtype=torch.int64),
@@ -783,7 +789,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         req.output_ids.append(31)
         self.manager.after_process_batch_result(decode_batch, result)
 
-        self.assertNotIn(req.rid, self.manager._open_mirror_by_req)
+        self.assertNotIn(req.rid, self.manager._open_requests)
         self.data_plane.submit_control_batch.assert_not_called()
         self.data_plane.close_request.assert_called_once()
         self.assertEqual(
@@ -800,7 +806,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
 
         self.manager.retract_request(req)
 
-        self.assertNotIn(req.rid, self.manager._open_mirror_by_req)
+        self.assertNotIn(req.rid, self.manager._open_requests)
         close = self.data_plane.close_request.call_args.args[0]
         self.assertEqual(close.request_id, "req::draft-epoch::1")
         self.assertEqual(close.reason, "retracted")
@@ -827,9 +833,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
                 ("generic-release", None),
             ],
         )
-        self.assertEqual(self.manager._open_mirror_by_req, {})
-        self.assertEqual(self.manager._open_lifecycle_by_req, {})
-        self.assertEqual(self.manager._open_drafter_rank_by_req, {})
+        self.assertEqual(self.manager._open_requests, {})
 
     def test_abort_after_retraction_closes_the_still_owned_old_epoch(self):
         req = _Req("req")
@@ -845,7 +849,7 @@ class TestDecoupledVerifyManager(CustomTestCase):
         close = self.data_plane.close_request.call_args.args[0]
         self.assertEqual(close.request_id, "req::draft-epoch::1")
         self.assertEqual(close.reason, "abort")
-        self.assertNotIn(req.rid, self.manager._open_mirror_by_req)
+        self.assertNotIn(req.rid, self.manager._open_requests)
 
 
 if __name__ == "__main__":

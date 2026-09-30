@@ -3,11 +3,14 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.arg_groups.speculative_hook import _handle_decoupled_spec
 from sglang.srt.environ import envs
-from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.arg_groups.speculative_hook import _handle_decoupled_spec
+from sglang.srt.managers.utils import compute_num_reserved_tokens
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -108,33 +111,25 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
                         )
                     )
 
-    def test_drafter_overlap_rejects_mixed_chunked_prefill(self):
-        with self.assertRaisesRegex(ValueError, "mixed chunked prefill"):
-            _handle_decoupled_spec(
-                self._args(
-                    "drafter",
-                    disable_overlap_schedule=False,
-                    enable_mixed_chunk=True,
-                )
-            )
-
-        args = self._args(
-            "drafter",
-            disable_overlap_schedule=True,
-            enable_mixed_chunk=True,
-        )
-        _handle_decoupled_spec(args)
-        self.assertTrue(args.enable_mixed_chunk)
-
-    def test_drafter_overlap_requires_private_checkpoint_ownership(self):
-        with self.assertRaisesRegex(ValueError, "disable-radix-cache"):
-            _handle_decoupled_spec(
-                self._args(
-                    "drafter",
-                    disable_overlap_schedule=False,
-                    disable_radix_cache=False,
-                )
-            )
+    def test_drafter_allows_radix_and_mixed_in_both_schedules(self):
+        for disable_overlap_schedule in (True, False):
+            for disable_radix_cache in (True, False):
+                with self.subTest(
+                    disable_overlap_schedule=disable_overlap_schedule,
+                    disable_radix_cache=disable_radix_cache,
+                ):
+                    args = self._args(
+                        "drafter",
+                        disable_overlap_schedule=disable_overlap_schedule,
+                        disable_radix_cache=disable_radix_cache,
+                        enable_mixed_chunk=True,
+                    )
+                    _handle_decoupled_spec(args)
+                    self.assertTrue(args.enable_mixed_chunk)
+                    self.assertEqual(args.disable_radix_cache, disable_radix_cache)
+                    self.assertEqual(
+                        args.max_mamba_cache_size, 8 if disable_radix_cache else 11
+                    )
 
     def test_role_algorithm_contract_is_fail_fast(self):
         cases = [
@@ -168,9 +163,7 @@ class TestDecoupledSpecRoleWiring(CustomTestCase):
             with self.subTest(
                 role=role,
                 disable_overlap_schedule=disable_overlap_schedule,
-            ), envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(
-                False
-            ):
+            ), envs.SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND.override(False):
                 _handle_decoupled_spec(
                     self._args(
                         role,

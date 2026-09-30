@@ -7,8 +7,8 @@ import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
-    fused_replay_state_indices,
     fused_replay_routed_state_indices,
+    fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Whether decode honors ForwardMetadata.mamba_cache_src_indices.
+    _implements_state_routing: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -57,9 +60,16 @@ class MambaAttnBackendBase(AttentionBackend):
             is HybridReqToTokenPool.translate_mamba_indices
         )
         self.forward_metadata: ForwardMetadata = None
+        # The decoupled drafter reads recurrent state from rollback slots and
+        # writes it to separate slots (mamba_cache_src_indices).
         self.enable_state_routing = (
             model_runner.server_args.decoupled_spec_role == "drafter"
         )
+        if self.enable_state_routing and not self._implements_state_routing:
+            raise ValueError(
+                "The decoupled drafter needs recurrent-state src/dst routing, "
+                f"which {type(self).__name__} does not implement."
+            )
         # The existing list remains the destination/ordinary in-place buffer so
         # non-decoupled graph replay keeps its single-buffer fast path.
         self.state_indices_list = []
@@ -97,33 +107,24 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        route_src = getattr(forward_batch, "mamba_cache_src_indices", None)
-        route_dst = getattr(forward_batch, "mamba_cache_dst_indices", None)
-        if (route_src is None) != (route_dst is None):
-            raise ValueError(
-                "mamba_cache_src_indices and mamba_cache_dst_indices must be "
-                "provided together"
-            )
-        if route_src is None:
-            mamba_cache_src_indices = self.req_to_token_pool.get_mamba_indices(
+        # The decoupled drafter reads a rollback checkpoint slot and writes the
+        # next position's slot; every other batch updates its state in place.
+        mamba_cache_src_indices = None
+        if forward_batch.mamba_cache_src_indices is None:
+            mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
                 forward_batch.req_pool_indices
             )
-            # Translate virtual->physical before installing padding sentinels.
-            mamba_cache_src_indices = self._translate_mamba_indices(
-                mamba_cache_src_indices
-            )
-            mamba_cache_dst_indices = mamba_cache_src_indices
+            # Translate virtual->physical BEFORE the padding sentinel below, so the
+            # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
+            mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         else:
-            if not self.enable_state_routing:
-                raise RuntimeError(
-                    "recurrent-state src/dst routing is only enabled for the "
-                    "decoupled drafter"
-                )
-            if route_src.ndim != 1 or route_src.shape != route_dst.shape:
-                raise ValueError("Mamba state routing tensors must be matching 1D tensors")
-            mamba_cache_src_indices = self._translate_mamba_indices(route_src)
-            mamba_cache_dst_indices = self._translate_mamba_indices(route_dst)
-        mamba_cache_indices = mamba_cache_dst_indices
+            assert self.enable_state_routing
+            mamba_cache_src_indices = self._translate_mamba_indices(
+                forward_batch.mamba_cache_src_indices
+            )
+            mamba_cache_indices = self._translate_mamba_indices(
+                forward_batch.mamba_cache_dst_indices
+            )
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -135,12 +136,11 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
-            mamba_cache_src_indices = mamba_cache_src_indices.clone()
-            mamba_cache_src_indices[_real_bs:] = -1
-            if mamba_cache_dst_indices is mamba_cache_indices:
-                mamba_cache_dst_indices = mamba_cache_dst_indices.clone()
-                mamba_cache_dst_indices[_real_bs:] = -1
-            mamba_cache_indices = mamba_cache_dst_indices
+            mamba_cache_indices = mamba_cache_indices.clone()
+            mamba_cache_indices[_real_bs:] = -1
+            if mamba_cache_src_indices is not None:
+                mamba_cache_src_indices = mamba_cache_src_indices.clone()
+                mamba_cache_src_indices[_real_bs:] = -1
 
         replayssm_write_pos = None
         replayssm_force_flush = None
@@ -259,7 +259,6 @@ class MambaAttnBackendBase(AttentionBackend):
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
             mamba_cache_src_indices=mamba_cache_src_indices,
-            mamba_cache_dst_indices=mamba_cache_dst_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -292,6 +291,7 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            # Graph views only carry these for the decoupled drafter.
             mamba_cache_src_indices=getattr(
                 forward_batch, "mamba_cache_src_indices", None
             ),
@@ -566,7 +566,8 @@ class MambaAttnBackendBase(AttentionBackend):
         # before copying (no-op for non-unified pool).
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-        capture_src_indices = self.state_indices_list[bs - 1]
+        # The drafter captures a separate source pointer; replay fills its routes.
+        capture_src_indices = None
         if self.state_src_indices_list is not None:
             capture_src_indices = self.state_src_indices_list[bs - 1]
             capture_src_indices[: len(mamba_indices)].copy_(mamba_indices)
@@ -590,7 +591,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_src_indices=capture_src_indices,
-                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -602,7 +602,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_src_indices=capture_src_indices,
-                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -627,27 +626,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        if (mamba_cache_src_indices is None) != (mamba_cache_dst_indices is None):
-            raise ValueError(
-                "mamba_cache_src_indices and mamba_cache_dst_indices must be "
-                "provided together"
-            )
+        static_src = None
         if mamba_cache_src_indices is not None:
-            if not self.enable_state_routing or self.state_src_indices_list is None:
-                raise RuntimeError(
-                    "recurrent-state src/dst routing is only enabled for the "
-                    "decoupled drafter"
-                )
+            # Decoupled drafter: copy per-row src/dst routes into the captured
+            # static buffers (the dst buffer is the ordinary in-place one).
+            assert self.state_src_indices_list is not None
             valid_bs = bs - int(num_padding)
-            if (
-                mamba_cache_src_indices.ndim != 1
-                or mamba_cache_src_indices.shape != mamba_cache_dst_indices.shape
-                or mamba_cache_src_indices.numel() != valid_bs
-            ):
-                raise ValueError(
-                    "Mamba graph state routing tensors must be matching "
-                    "[valid_batch] vectors"
-                )
             static_src = self.state_src_indices_list[bs - 1]
             static_dst = self.state_indices_list[bs - 1]
             if self._fused_state_indices_ok:
@@ -690,15 +674,11 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
-        if self.state_src_indices_list is not None:
+        if static_src is None and self.state_src_indices_list is not None:
+            # Drafter graph capture has no live routes yet: bind the source
+            # buffer, seeded with the in-place ids; replay refreshes it.
             static_src = self.state_src_indices_list[bs - 1]
-            if mamba_cache_src_indices is None:
-                # Graph capture has no live decoupled request routes yet. Capture
-                # the dedicated source pointer and seed it with the in-place ids;
-                # replay will refresh it with the real source slots.
-                static_src.copy_(self.state_indices_list[bs - 1])
-        else:
-            static_src = self.state_indices_list[bs - 1]
+            static_src.copy_(self.state_indices_list[bs - 1])
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
@@ -829,7 +809,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_src_indices=static_src,
-                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
@@ -842,7 +821,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_src_indices=static_src,
-                mamba_cache_dst_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
@@ -1093,6 +1071,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         # wrapper since split backends are wrapped once (#31439); the full-attn
         # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
+
+    @property
+    def supports_decoupled_mixed_prefix(self) -> bool:
+        return (
+            self.full_attn_backend.supports_decoupled_mixed_prefix
+            and self.linear_attn_backend.supports_decoupled_mixed_prefix
+        )
 
     @property
     def supports_ragged_verify_graph(self) -> bool:

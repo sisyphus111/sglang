@@ -1097,6 +1097,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if getattr(forward_batch, "decoupled_draft_num_prefill_reqs", None) is not None:
+            # Captured prefill bodies have no dynamic prefill/decode split or
+            # checkpoint routes. This mixed launch uses eager execution; pure
+            # prefill and decode retain their existing graph eligibility.
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (

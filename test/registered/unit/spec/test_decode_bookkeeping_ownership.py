@@ -47,9 +47,9 @@ _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
-_DECOUPLED_DRAFT_TRUNCATE = (
+_DECOUPLED_DRAFT_CLOSE = (
     "managers/scheduler_components/decoupled_spec/draft.py",
-    "DecoupledDraftManager._truncate_kv",
+    "DecoupledDraftManager._close_request_key",
 )
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
@@ -78,8 +78,8 @@ _OWNER_SITES = {
     (*_RESOLVE, "spec_num_proposed_drafts"): 1,
     # The decoupled drafter owns internal Req rollback and must move both KV
     # watermarks together when verifier feedback rewrites its linear suffix.
-    (*_DECOUPLED_DRAFT_TRUNCATE, "kv_committed_len"): 1,
-    (*_DECOUPLED_DRAFT_TRUNCATE, "kv_allocated_len"): 1,
+    (*_DECOUPLED_DRAFT_CLOSE, "kv_committed_len"): 1,
+    (*_DECOUPLED_DRAFT_CLOSE, "kv_allocated_len"): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (

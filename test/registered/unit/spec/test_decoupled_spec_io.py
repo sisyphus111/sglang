@@ -2,20 +2,15 @@
 
 decoupled_spec_io is the schema-only IPC layer for decoupled speculative
 decoding: protocol message dataclasses, the cross-process request id codec, and
-the drafter-side reconciliation helpers. These tests drive the real logic (id
-round-trip + parse errors, commit validation, segment coalescing / contiguity /
-prefix extraction, and inbox routing) on CPU; there is no GPU or transport here.
+token-span validation. These tests drive the request-id codec and wire-message
+validation on CPU; there is no GPU or transport here.
 """
 
 import unittest
 
 from sglang.srt.speculative.decoupled_spec_io import (
-    DraftClose,
-    DraftControlBatch,
     DraftReqKey,
-    DraftSync,
     DraftTailStreamOutput,
-    VerifierCommitSegment,
     VerifyCommit,
     build_draft_scheduler_rid,
     parse_draft_scheduler_rid,
@@ -33,16 +28,6 @@ def _commit(rid, *, pre, tokens, src_verifier_rank=0, drafter_rank=0) -> VerifyC
         dst_drafter_rank=drafter_rank,
         pre_verify_committed_len=pre,
         committed_tokens=list(tokens),
-    )
-
-
-def _segment(
-    rid, *, pre=0, drafter_rank=0, src_verifier_rank=0
-) -> VerifierCommitSegment:
-    return VerifierCommitSegment(
-        draft_key=DraftReqKey(src_verifier_rank=src_verifier_rank, request_id=rid),
-        dst_drafter_rank=drafter_rank,
-        pre_verify_committed_len=pre,
     )
 
 
@@ -130,174 +115,6 @@ class TestDraftTailStreamOutputValidation(CustomTestCase):
                 tokens=(12,),
                 is_commit_echo=True,
             ).validate()
-
-
-class TestVerifierCommitSegment(CustomTestCase):
-    def test_append_coalesces_contiguous_commits(self):
-        seg = _segment("r", pre=0)
-        seg.append_message(_commit("r", pre=0, tokens=[10, 11]))
-        self.assertEqual(seg.committed_tokens, [10, 11])
-        self.assertEqual(seg.end_committed_len, 2)
-        seg.append_message(_commit("r", pre=2, tokens=[12]))
-        self.assertEqual(seg.committed_tokens, [10, 11, 12])
-        self.assertEqual(seg.end_committed_len, 3)
-
-    def test_append_wrong_request_raises(self):
-        seg = _segment("r", pre=0)
-        with self.assertRaises(RuntimeError):
-            seg.append_message(_commit("other", pre=0, tokens=[1]))
-
-    def test_append_wrong_drafter_rank_raises(self):
-        seg = _segment("r", pre=0, drafter_rank=0)
-        with self.assertRaises(RuntimeError):
-            seg.append_message(_commit("r", pre=0, tokens=[1], drafter_rank=7))
-
-    def test_append_non_contiguous_raises(self):
-        seg = _segment("r", pre=0)
-        seg.append_message(_commit("r", pre=0, tokens=[10]))  # end -> 1
-        with self.assertRaises(RuntimeError):
-            seg.append_message(_commit("r", pre=5, tokens=[11]))  # gap
-
-    def test_append_runs_message_validation(self):
-        seg = _segment("r", pre=0)
-        with self.assertRaises(ValueError):
-            seg.append_message(_commit("r", pre=0, tokens=[]))  # empty -> validate
-
-    def test_extract_prefix_splits_segment(self):
-        seg = _segment("r", pre=0)
-        seg.append_message(_commit("r", pre=0, tokens=[10, 11, 12, 13]))
-        prefix = seg.extract_prefix(2)
-        self.assertEqual(prefix.committed_tokens, [10, 11])
-        self.assertEqual(prefix.pre_verify_committed_len, 0)
-        # Remainder stays in the original segment, with pre advanced by 2.
-        self.assertEqual(seg.committed_tokens, [12, 13])
-        self.assertEqual(seg.pre_verify_committed_len, 2)
-        self.assertEqual(seg.end_committed_len, 4)
-
-    def test_extract_prefix_bounds(self):
-        seg = _segment("r", pre=0)
-        seg.append_message(_commit("r", pre=0, tokens=[10, 11]))
-        with self.assertRaises(ValueError):
-            seg.extract_prefix(0)
-        with self.assertRaises(ValueError):
-            seg.extract_prefix(3)  # exceeds segment length
-
-
-class TestDraftControlInbox(CustomTestCase):
-    def _inbox(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftControlInbox
-
-        return DraftControlInbox()
-
-    def _sync(self, rid, drafter_rank=0):
-        return DraftSync(
-            request_id=rid, src_verifier_rank=0, dst_drafter_rank=drafter_rank
-        )
-
-    def _close(self, rid, drafter_rank=0):
-        return DraftClose(
-            request_id=rid,
-            src_verifier_rank=0,
-            dst_drafter_rank=drafter_rank,
-            reason="x",
-        )
-
-    def test_add_control_batch_routes_each_message_type(self):
-        inbox = self._inbox()
-        inbox.add_control_batch_locked(
-            DraftControlBatch(
-                dst_drafter_rank=0,
-                sync_messages=[self._sync("s")],
-                verify_commit_messages=[_commit("c", pre=0, tokens=[1])],
-                close_messages=[self._close("x")],
-            )
-        )
-        self.assertEqual([m.request_id for m in inbox.sync_messages], ["s"])
-        self.assertIn(DraftReqKey(0, "c"), inbox.verifier_commit_segments)
-        self.assertIn(DraftReqKey(0, "x"), inbox.close_keys)
-
-    def test_close_drops_pending_segment_and_sync(self):
-        inbox = self._inbox()
-        inbox.add_control_batch_locked(
-            DraftControlBatch(
-                dst_drafter_rank=0,
-                sync_messages=[self._sync("r")],
-                verify_commit_messages=[_commit("r", pre=0, tokens=[1])],
-            )
-        )
-        inbox.add_close_key_locked(DraftReqKey(0, "r"))
-        self.assertEqual(inbox.sync_messages, [])
-        self.assertNotIn(DraftReqKey(0, "r"), inbox.verifier_commit_segments)
-        self.assertIn(DraftReqKey(0, "r"), inbox.close_keys)
-
-    def test_verify_commit_for_closed_key_is_ignored(self):
-        inbox = self._inbox()
-        inbox.add_close_key_locked(DraftReqKey(0, "r"))
-        inbox.add_verify_commit_locked(_commit("r", pre=0, tokens=[1]))
-        self.assertNotIn(DraftReqKey(0, "r"), inbox.verifier_commit_segments)
-
-    def test_extract_ready_controls_full_consume(self):
-        inbox = self._inbox()
-        inbox.add_control_batch_locked(
-            DraftControlBatch(
-                dst_drafter_rank=0,
-                sync_messages=[self._sync("s")],
-                verify_commit_messages=[_commit("c", pre=0, tokens=[1, 2])],
-                close_messages=[self._close("x")],
-            )
-        )
-        ready = inbox.extract_ready_controls_locked(
-            lambda seg: len(seg.committed_tokens)
-        )
-        self.assertEqual([m.request_id for m in ready.sync_messages], ["s"])
-        self.assertEqual({k.request_id for k in ready.close_keys}, {"x"})
-        self.assertEqual(len(ready.ready_commit_segments), 1)
-        self.assertEqual(ready.ready_commit_segments[0].committed_tokens, [1, 2])
-        # Fully consumed -> the segment is gone; inbox drained.
-        self.assertTrue(inbox.is_empty())
-
-    def test_extract_ready_controls_zero_consumable_keeps_segment(self):
-        inbox = self._inbox()
-        inbox.add_verify_commit_locked(_commit("c", pre=0, tokens=[1, 2]))
-        ready = inbox.extract_ready_controls_locked(lambda seg: 0)
-        self.assertEqual(ready.ready_commit_segments, [])
-        # Segment is left buffered for a later step.
-        self.assertIn(DraftReqKey(0, "c"), inbox.verifier_commit_segments)
-
-    def test_extract_ready_controls_partial_consume_buffers_remainder(self):
-        inbox = self._inbox()
-        inbox.add_verify_commit_locked(_commit("c", pre=0, tokens=[1, 2, 3]))
-        ready = inbox.extract_ready_controls_locked(lambda seg: 1)
-        self.assertEqual(ready.ready_commit_segments[0].committed_tokens, [1])
-        # Remainder [2, 3] stays buffered with pre advanced to 1.
-        seg = inbox.verifier_commit_segments[DraftReqKey(0, "c")]
-        self.assertEqual(seg.committed_tokens, [2, 3])
-        self.assertEqual(seg.pre_verify_committed_len, 1)
-
-    def test_close_in_same_batch_drops_sync_and_commit(self):
-        # add_control_batch applies close first, so a same-key sync/commit in the
-        # same batch is dropped/ignored: close wins within one batch.
-        inbox = self._inbox()
-        inbox.add_control_batch_locked(
-            DraftControlBatch(
-                dst_drafter_rank=0,
-                sync_messages=[self._sync("r")],
-                verify_commit_messages=[_commit("r", pre=0, tokens=[1])],
-                close_messages=[self._close("r")],
-            )
-        )
-        self.assertEqual(inbox.sync_messages, [])
-        self.assertNotIn(DraftReqKey(0, "r"), inbox.verifier_commit_segments)
-        self.assertEqual({k.request_id for k in inbox.close_keys}, {"r"})
-
-    def test_two_commits_same_key_coalesce_in_inbox(self):
-        # A second commit for an existing key appends to the buffered segment.
-        inbox = self._inbox()
-        inbox.add_verify_commit_locked(_commit("r", pre=0, tokens=[1, 2]))
-        inbox.add_verify_commit_locked(_commit("r", pre=2, tokens=[3]))
-        seg = inbox.verifier_commit_segments[DraftReqKey(0, "r")]
-        self.assertEqual(seg.committed_tokens, [1, 2, 3])
-        self.assertEqual(seg.end_committed_len, 3)
 
 
 if __name__ == "__main__":

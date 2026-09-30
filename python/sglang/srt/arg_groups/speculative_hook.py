@@ -147,7 +147,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_decoupled_spec(server_args: ServerArgs) -> None:
-    """Validate the phase-one 1:1 decoupled verifier/drafter contract.
+    """Validate the decoupled verifier/drafter contract.
 
     The verifier is a builtin speculative algorithm because it participates in
     the standard V2 verify/overlap hierarchy. The drafter remains a plain
@@ -156,8 +156,8 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
     worker.
     """
 
-    role = getattr(server_args, "decoupled_spec_role", "null")
-    algorithm = getattr(server_args, "speculative_algorithm", None)
+    role = server_args.decoupled_spec_role
+    algorithm = server_args.speculative_algorithm
 
     if role == "null":
         if algorithm == "DECOUPLED_VERIFY":
@@ -191,27 +191,10 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
                 "The phase-one decoupled drafter requires page_size == 1 for "
                 "token-granular KV rollback."
             )
-        if getattr(server_args, "enable_linear_replayssm", False):
+        if server_args.enable_linear_replayssm:
             raise ValueError(
                 "The phase-one decoupled drafter requires ReplaySSM disabled "
                 "because rollback routes complete dense GDN states between slots."
-            )
-        if (
-            not server_args.disable_overlap_schedule
-            and not server_args.disable_radix_cache
-        ):
-            raise ValueError(
-                "Decoupled drafter GPU overlap requires --disable-radix-cache; "
-                "its GPU checkpoint ring owns recurrent-state rollback."
-            )
-        if (
-            not server_args.disable_overlap_schedule
-            and getattr(server_args, "enable_mixed_chunk", False)
-        ):
-            raise ValueError(
-                "Decoupled drafter overlap does not support mixed chunked "
-                "prefill because decode KV/state binding is a forward-local "
-                "GPU transaction."
             )
     if server_args.dp_size != 1:
         raise ValueError(
@@ -226,7 +209,7 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
 
     bind_endpoint = server_args.decoupled_spec_bind_endpoint
     connect_endpoints = server_args.decoupled_spec_connect_endpoints
-    peer_configs = getattr(server_args, "decoupled_spec_peer_configs", None)
+    peer_configs = server_args.decoupled_spec_peer_configs
     rank = server_args.decoupled_spec_rank
     if (
         bind_endpoint is None
@@ -274,6 +257,16 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
         required_mamba_slots = int(server_args.max_running_requests) * (
             checkpoint_slots_per_request + 1
         )
+        if not server_args.disable_radix_cache:
+            # The rollback ring borrows the active slot. Keep room for radix
+            # snapshots and the upstream prefill ping-pong tracking buffers;
+            # a donation may allocate its replacement before evicting a node.
+            if server_args.mamba_radix_cache_strategy in (
+                "extra_buffer",
+                "extra_buffer_lazy",
+            ):
+                required_mamba_slots += 2 * int(server_args.max_running_requests)
+            required_mamba_slots += 1
         if server_args.max_mamba_cache_size is None:
             server_args.max_mamba_cache_size = required_mamba_slots
         elif int(server_args.max_mamba_cache_size) < required_mamba_slots:
@@ -926,27 +919,10 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
             resolve_decoupled_verify_candidate_steps,
         )
 
-        if server_args.speculative_num_steps is None:
-            raise ValueError(
-                "Adaptive decoupled verification requires "
-                "--speculative-num-steps as the fixed Kmax."
-            )
-        max_steps = int(server_args.speculative_num_steps)
-        if max_steps <= 0:
-            raise ValueError("Adaptive decoupled verification requires Kmax > 0.")
         resolve_decoupled_verify_candidate_steps(
             server_args.speculative_adaptive_config,
-            max_steps=max_steps,
+            max_steps=server_args.speculative_num_steps,
         )
-        if server_args.speculative_eagle_topk is None:
-            server_args.speculative_eagle_topk = 1
-        if server_args.speculative_num_draft_tokens is None:
-            server_args.speculative_num_draft_tokens = max_steps + 1
-        if int(server_args.speculative_num_draft_tokens) != max_steps + 1:
-            raise ValueError(
-                "Adaptive decoupled verification keeps Kmax allocations fixed and "
-                "requires speculative_num_draft_tokens == Kmax + 1."
-            )
         return
 
     from sglang.srt.speculative.adaptive_spec_params import (

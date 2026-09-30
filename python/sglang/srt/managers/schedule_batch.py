@@ -1087,6 +1087,10 @@ class Req(ReqDllmMixin):
         # Per-request count of draft tokens actually presented to the verifier.
         self.spec_num_proposed_drafts = 0
 
+        # Decoupled drafter: identity of the verifier request lifetime this
+        # mirror drafts for (DraftRequestGeneration); None for ordinary reqs.
+        self.decoupled_draft_generation = None
+
         # Histogram index = number of drafts actually presented in one verify row.
         self.spec_proposed_drafts_histogram: List[int] = []
 
@@ -2021,7 +2025,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    # Decoupled-drafter overlap allocates a physical candidate on the schedule
+    # Decoupled drafter allocates a physical candidate on the schedule
     # stream, then binds it to the authoritative logical position only after
     # the GPU control snapshot at forward entry.
     defer_decode_kv_binding: bool = False
@@ -2086,10 +2090,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # one before reading the persistent tail row.
     decoupled_needs_landing_fence: bool = False
     decoupled_landing_event: Optional[torch.cuda.Event] = None
-    decoupled_rebase_valid: Optional[torch.Tensor] = None
-    decoupled_selected_draft_lens: Optional[torch.Tensor] = None
-    decoupled_tail_select_debug: Optional[torch.Tensor] = None
-    decoupled_pre_verify_output_lens: Optional[torch.Tensor] = None
     # Active verifier K frozen at this launch boundary. Kmax-owned tail state
     # remains outside ScheduleBatch and is never resized by adaptive switching.
     decoupled_verify_steps: Optional[int] = None
@@ -2097,6 +2097,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Drafter-only GPU control transaction. These are forward-local launch
     # identity/snapshot tensors; the persistent transcript lives in the native
     # data plane rather than in ScheduleBatch.
+    # MIXED retains upstream layout: prefill request/token prefixes followed
+    # by one token per decode row. These boundaries are not interchangeable.
+    decoupled_draft_num_prefill_reqs: Optional[int] = None
+    decoupled_draft_num_prefill_tokens: Optional[int] = None
     decoupled_draft_mirror_seats: Optional[torch.Tensor] = None
     decoupled_draft_request_epochs: Optional[torch.Tensor] = None
     decoupled_draft_captured_state_positions: Optional[torch.Tensor] = None
@@ -2717,11 +2721,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        gpu_draft = running_batch.defer_decode_kv_binding
+        if gpu_draft:
+            self.decoupled_draft_num_prefill_reqs = len(self.reqs)
+            self.decoupled_draft_num_prefill_tokens = self.extend_num_tokens
+            # merge_batch clears per-forward tracking. Preserve only prefill
+            # tracking; speculative decode state belongs to the private ring.
+            prefill_tracking = (
+                self.mamba_track_indices,
+                self.mamba_track_mask,
+                self.mamba_track_seqlens,
+            )
 
-        for req in running_batch.reqs:
-            req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+        if not gpu_draft:
+            for req in running_batch.reqs:
+                req._refresh_fill_ids()
+                full_len = len(req.full_untruncated_fill_ids)
+                req.set_extend_range(full_len - 1, full_len)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -2730,15 +2746,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if gpu_draft:
+            self.defer_decode_kv_binding = True
+            for name, value in zip(
+                ("mamba_track_indices", "mamba_track_mask", "mamba_track_seqlens"),
+                prefill_tracking,
+            ):
+                if value is not None:
+                    padding = torch.zeros(
+                        running_bs, dtype=value.dtype, device=value.device
+                    )
+                    setattr(self, name, torch.cat((value, padding)))
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens = self.prefix_lens + [
-            len(r.origin_input_ids) + len(r.output_ids) + delta
-            for r in running_batch.reqs
-        ]
+        self.prefix_lens = self.prefix_lens + (
+            [0] * running_bs
+            if gpu_draft
+            else [
+                len(r.origin_input_ids) + len(r.output_ids) + delta
+                for r in running_batch.reqs
+            ]
+        )
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
@@ -2998,6 +3029,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.decoupled_draft_num_prefill_reqs = None
+        self.decoupled_draft_num_prefill_tokens = None
         server_args = get_server_args()
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
@@ -3058,7 +3091,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if server_args.enable_mamba_extra_buffer():
+        if self.defer_decode_kv_binding:
+            # Only stable prefill prefixes enter radix. Decode positions and
+            # branches are GPU-owned, so host decode counters cannot track them.
+            self.mamba_track_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
+        elif server_args.enable_mamba_extra_buffer():
             mamba_track_interval = get_exec().mamba.mamba_track_interval
 
             if len(self.reqs) == 0:
@@ -3254,11 +3293,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if self.decoupled_launch_mirror_ids is None
                 else list(self.decoupled_launch_mirror_ids)
             ),
-            decoupled_rebase_valid=self.decoupled_rebase_valid,
-            decoupled_selected_draft_lens=self.decoupled_selected_draft_lens,
-            decoupled_tail_select_debug=self.decoupled_tail_select_debug,
-            decoupled_pre_verify_output_lens=self.decoupled_pre_verify_output_lens,
-            decoupled_verify_steps=self.decoupled_verify_steps,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,

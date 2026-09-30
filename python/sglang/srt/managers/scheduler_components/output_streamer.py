@@ -365,7 +365,7 @@ class _GenerationStreamAccumulator:
         # Drafter mirrors are scheduler-internal requests with no
         # TokenizerManager state. Their tokens leave through the decoupled data
         # plane, so do not build or send generic HTTP/detokenizer output.
-        if getattr(req, "decoupled_draft_generation", None) is not None:
+        if req.decoupled_draft_generation is not None:
             return
 
         if req.finished():

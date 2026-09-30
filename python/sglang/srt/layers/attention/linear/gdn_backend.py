@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Optional, Tuple, Union
 
 import torch
@@ -16,9 +17,10 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
@@ -333,9 +335,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
     needs_cpu_seq_lens: bool = False
+    _implements_state_routing: bool = True
+    # Mixed drafter batches split recurrent kernels into prefill/decode views.
+    supports_decoupled_mixed_prefix: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self._decoupled_mixed_forward = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -347,6 +353,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        if self.enable_state_routing and not isinstance(
+            self.kernel_dispatcher.decode_kernel, TritonGDNKernel
+        ):
+            raise ValueError(
+                "The decoupled drafter routes recurrent state between slots, "
+                "which only the Triton GDN decode kernel implements; use "
+                "--linear-attn-decode-backend triton."
+            )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -357,6 +371,93 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        num_prefill_reqs = forward_batch.decoupled_draft_num_prefill_reqs
+        if num_prefill_reqs is not None:
+            num_prefill_tokens = forward_batch.decoupled_draft_num_prefill_tokens
+            # These backend-local views are built once per mixed forward. The
+            # model still processes one packed batch; only recurrent kernels
+            # split, because prefill is in-place while decode preserves its src.
+            prefill_batch = replace(
+                forward_batch,
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=num_prefill_reqs,
+                input_ids=forward_batch.input_ids[:num_prefill_tokens],
+                req_pool_indices=forward_batch.req_pool_indices[:num_prefill_reqs],
+                seq_lens=forward_batch.seq_lens[:num_prefill_reqs],
+                out_cache_loc=forward_batch.out_cache_loc[:num_prefill_tokens],
+                extend_num_tokens=num_prefill_tokens,
+                extend_seq_lens=forward_batch.extend_seq_lens[:num_prefill_reqs],
+                extend_prefix_lens=forward_batch.extend_prefix_lens[:num_prefill_reqs],
+                extend_start_loc=forward_batch.extend_start_loc[:num_prefill_reqs],
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu[
+                    :num_prefill_reqs
+                ],
+                mamba_cache_src_indices=(
+                    forward_batch.mamba_cache_src_indices[:num_prefill_reqs]
+                ),
+                mamba_cache_dst_indices=(
+                    forward_batch.mamba_cache_dst_indices[:num_prefill_reqs]
+                ),
+                mamba_track_mask=(
+                    None
+                    if forward_batch.mamba_track_mask is None
+                    else forward_batch.mamba_track_mask[:num_prefill_reqs]
+                ),
+                mamba_track_indices=(
+                    None
+                    if forward_batch.mamba_track_indices is None
+                    else forward_batch.mamba_track_indices[:num_prefill_reqs]
+                ),
+                mamba_track_seqlens=(
+                    None
+                    if forward_batch.mamba_track_seqlens is None
+                    else forward_batch.mamba_track_seqlens[:num_prefill_reqs]
+                ),
+                decoupled_draft_num_prefill_reqs=None,
+                decoupled_draft_num_prefill_tokens=None,
+            )
+            decode_batch = replace(
+                forward_batch,
+                forward_mode=ForwardMode.DECODE,
+                batch_size=forward_batch.batch_size - num_prefill_reqs,
+                input_ids=forward_batch.input_ids[num_prefill_tokens:],
+                req_pool_indices=forward_batch.req_pool_indices[num_prefill_reqs:],
+                seq_lens=forward_batch.seq_lens[num_prefill_reqs:],
+                out_cache_loc=forward_batch.out_cache_loc[num_prefill_tokens:],
+                extend_num_tokens=None,
+                extend_seq_lens=None,
+                extend_prefix_lens=None,
+                extend_start_loc=None,
+                extend_seq_lens_cpu=None,
+                extend_prefix_lens_cpu=None,
+                mamba_cache_src_indices=(
+                    forward_batch.mamba_cache_src_indices[num_prefill_reqs:]
+                ),
+                mamba_cache_dst_indices=(
+                    forward_batch.mamba_cache_dst_indices[num_prefill_reqs:]
+                ),
+                mamba_track_mask=None,
+                mamba_track_indices=None,
+                mamba_track_seqlens=None,
+                decoupled_draft_num_prefill_reqs=None,
+                decoupled_draft_num_prefill_tokens=None,
+            )
+            self.init_forward_metadata(decode_batch)
+            decode_metadata = self.forward_metadata
+            # Reuse the ordinary prefill initializer, including radix tracking.
+            # The default metadata remains prefill-owned; decode receives its
+            # separate metadata explicitly, without mutating it between layers.
+            self.init_forward_metadata(prefill_batch)
+            self._decoupled_mixed_forward = (
+                prefill_batch,
+                decode_batch,
+                decode_metadata,
+            )
+            return
+        # Replacing the forward metadata ends the previous mixed-view lifetime.
+        # The shallow views otherwise retain that batch's prompt/embedding storage
+        # throughout a potentially long run of ordinary decode iterations.
+        self._decoupled_mixed_forward = None
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
@@ -376,6 +477,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
 
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        # Graph replay also replaces the active batch, without calling the eager
+        # initializer above. Retire the previous mixed views at the same boundary.
+        self._decoupled_mixed_forward = None
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -383,30 +492,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
+        forward_metadata: Optional[ForwardMetadata] = None,
         **kwargs,
     ):
+        if forward_metadata is None:
+            forward_metadata = self.forward_metadata
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_src_indices = (
-            self.forward_metadata.mamba_cache_src_indices
-            if self.forward_metadata.mamba_cache_src_indices is not None
-            else self.forward_metadata.mamba_cache_indices
-        )
-        cache_dst_indices = (
-            self.forward_metadata.mamba_cache_dst_indices
-            if self.forward_metadata.mamba_cache_dst_indices is not None
-            else self.forward_metadata.mamba_cache_indices
-        )
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        # The decoupled drafter reads each row's state from a rollback slot and
+        # writes cache_indices; all other decodes keep the in-place kernel calls.
+        cache_src_indices = forward_metadata.mamba_cache_src_indices
+        if cache_src_indices is None:
+            cache_src_indices = cache_indices
+            conv_state_route = {"conv_state_indices": cache_indices}
+            ssm_state_route = {}
+        else:
+            conv_state_route = {
+                "conv_state_src_indices": cache_src_indices,
+                "conv_state_dst_indices": cache_indices,
+            }
+            ssm_state_route = {"final_state_indices": cache_indices}
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
-        replayssm_write_pos = self.forward_metadata.replayssm_write_pos
+        replayssm_write_pos = forward_metadata.replayssm_write_pos
         # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
         # boundaries (None unless --enable-linear-replayssm). When present the
         # kernel folds the ring into temporal[slot] on the snapshot steps.
-        replayssm_force_flush = self.forward_metadata.replayssm_force_flush
+        replayssm_force_flush = forward_metadata.replayssm_force_flush
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
@@ -418,8 +534,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.conv_weights,
             layer.bias,
             layer.activation,
-            conv_state_src_indices=cache_src_indices,
-            conv_state_dst_indices=cache_dst_indices,
+            **conv_state_route,
         )
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -434,7 +549,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 scale=layer.head_k_dim**-0.5,
                 ssm_states=ssm_states,
                 cache_indices=cache_src_indices,
-                final_state_indices=cache_dst_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 replayssm_d=replayssm_d,
@@ -442,13 +556,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                **ssm_state_route,
             )
             self._track_mamba_state_decode(
-                forward_batch,
-                conv_states,
-                ssm_states,
-                cache_dst_indices,
-                layer.layer_id,
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
             return core_attn_out
 
@@ -473,16 +584,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
             cache_indices=cache_src_indices,
-            final_state_indices=cache_dst_indices,
             query_start_loc=query_start_loc,
+            **ssm_state_route,
         )
 
         self._track_mamba_state_decode(
-            forward_batch,
-            conv_states,
-            ssm_states,
-            cache_dst_indices,
-            layer.layer_id,
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
 
         return core_attn_out
@@ -497,6 +604,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        if forward_batch.decoupled_draft_num_prefill_reqs is not None:
+            prefill_batch, decode_batch, decode_metadata = self._decoupled_mixed_forward
+            num_prefill_tokens = forward_batch.decoupled_draft_num_prefill_tokens
+            prefill_output = self.forward_extend(
+                layer,
+                prefill_batch,
+                mixed_qkv[:num_prefill_tokens],
+                a[:num_prefill_tokens],
+                b[:num_prefill_tokens],
+                **kwargs,
+            )
+            decode_output = self.forward_decode(
+                layer,
+                decode_batch,
+                mixed_qkv[num_prefill_tokens:],
+                a[num_prefill_tokens:],
+                b[num_prefill_tokens:],
+                forward_metadata=decode_metadata,
+                **kwargs,
+            )
+            return torch.cat((prefill_output, decode_output), dim=1)
         seq_len = mixed_qkv.shape[0]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()

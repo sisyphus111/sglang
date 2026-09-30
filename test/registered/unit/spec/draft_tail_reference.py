@@ -301,9 +301,7 @@ class DraftTailBuffer:
                 )
             if base_committed_len < int(state.can_accept_prefix_len):
                 return
-            confirmed_len = state_committed_len - len(
-                state.pending_expected_tokens
-            )
+            confirmed_len = state_committed_len - len(state.pending_expected_tokens)
             output_end = start_token_pos + len(output.tokens)
             if start_token_pos > confirmed_len or output_end <= confirmed_len:
                 return
@@ -313,9 +311,7 @@ class DraftTailBuffer:
             while (
                 confirmed_len + match_len < overlap_end
                 and state.pending_expected_tokens[match_len]
-                == output.tokens[
-                    confirmed_len + match_len - start_token_pos
-                ]
+                == output.tokens[confirmed_len + match_len - start_token_pos]
             ):
                 match_len += 1
             for _ in range(match_len):
@@ -337,9 +333,8 @@ class DraftTailBuffer:
                 f"base_committed_len={base_committed_len} "
                 f"state_committed_len={state_committed_len}"
             )
-        if (
-            not reconciled_pending
-            and base_committed_len < int(state.can_accept_prefix_len)
+        if not reconciled_pending and base_committed_len < int(
+            state.can_accept_prefix_len
         ):
             return
 
@@ -360,9 +355,7 @@ class DraftTailBuffer:
 
         overlap_end = min(output_end, buffer_end_len)
         for token_pos in range(effective_start, overlap_end):
-            existing_token = int(
-                state.tail_tokens[token_pos - state_committed_len]
-            )
+            existing_token = int(state.tail_tokens[token_pos - state_committed_len])
             token = output.tokens[token_pos - start_token_pos]
             if existing_token != token:
                 raise RuntimeError(
@@ -374,9 +367,7 @@ class DraftTailBuffer:
         # Validate the full overlap before mutating state so a malformed span
         # cannot leave a partially appended tail behind.
         if output_end > buffer_end_len:
-            state.tail_tokens.extend(
-                output.tokens[buffer_end_len - start_token_pos :]
-            )
+            state.tail_tokens.extend(output.tokens[buffer_end_len - start_token_pos :])
 
     def snapshot(
         self,
@@ -452,10 +443,7 @@ class DraftTailBuffer:
     ) -> bool:
         for request_id in request_ids:
             state = self._states[request_id]
-            if (
-                state.pending_expected_tokens
-                or len(state.tail_tokens) < min_tail_len
-            ):
+            if state.pending_expected_tokens or len(state.tail_tokens) < min_tail_len:
                 return False
         return True
 

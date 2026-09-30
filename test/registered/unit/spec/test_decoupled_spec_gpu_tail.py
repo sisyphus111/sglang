@@ -9,18 +9,25 @@ import uuid
 
 import torch
 import zmq
+from decoupled_spec_test_utils import (
+    CppDrafterTestPeer as CppDrafterDecoupledSpecDataPlane,
+)
+from decoupled_spec_test_utils import (
+    CppVerifierTestPeer as CppVerifierDecoupledSpecDataPlane,
+)
+from decoupled_spec_test_utils import (
+    PythonDrafterTestPeer as DrafterDecoupledSpecDataPlane,
+)
+from decoupled_spec_test_utils import (
+    PythonVerifierTestPeer as VerifierDecoupledSpecDataPlane,
+)
+from draft_tail_reference import DraftTailBuffer
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.cpp_decoupled_spec import (
-    CppDrafterDecoupledSpecDataPlane,
-    CppGpuDraftTailBuffer,
-    CppVerifierDecoupledSpecDataPlane,
     GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES,
     GPU_DRAFT_TAIL_SELECT_REASON_NAMES,
-)
-from sglang.srt.speculative.decoupled_spec_data_plane import (
-    DrafterDecoupledSpecDataPlane,
-    VerifierDecoupledSpecDataPlane,
+    CppGpuDraftTailBuffer,
 )
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
@@ -31,7 +38,6 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftTailStreamOutputBatch,
     VerifyCommit,
 )
-from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -73,8 +79,11 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         )
         self.verifier.start()
         self.drafter.start()
+        self.raw_tail_socket = self.context.socket(zmq.PUSH)
+        self.raw_tail_socket.connect(self.verifier_endpoint)
 
     def tearDown(self):
+        self.raw_tail_socket.close(linger=0)
         self.drafter.close()
         self.verifier.close()
         self.context.destroy(linger=0)
@@ -901,9 +910,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         self.assertEqual(int(tail.consumable_tail_lens[1].cpu().item()), 1)
         self.assertEqual(int(tail.can_accept_prefix_lens[1].cpu().item()), 2)
         self.assertEqual(int(tail.tail_tokens[1, 0].cpu().item()), 12)
-        self.assertEqual(
-            int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 1
-        )
+        self.assertEqual(int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 1)
 
         debug_out = torch.empty((1, 10), dtype=torch.int64, device="cuda:0")
         compact, cursor = tail.select_snapshot(
@@ -972,9 +979,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         self.assertEqual(int(tail.raw_tail_lens[1].cpu().item()), 0)
         self.assertEqual(int(tail.consumable_tail_lens[1].cpu().item()), 0)
         self.assertEqual(int(tail.pending_expected_tokens[1, 1].cpu().item()), 11)
-        self.assertEqual(
-            int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 0
-        )
+        self.assertEqual(int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 0)
 
     def test_partial_pending_match_recovers_after_corrected_echo_span(self):
         self._open("partial-pending-recovery", request_epoch=16)
@@ -1043,9 +1048,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         self.assertEqual(int(tail.consumable_tail_lens[1].cpu().item()), 1)
         self.assertEqual(int(tail.can_accept_prefix_lens[1].cpu().item()), 3)
         self.assertEqual(int(tail.tail_tokens[1, 0].cpu().item()), 13)
-        self.assertEqual(
-            int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 2
-        )
+        self.assertEqual(int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 2)
         self.assertEqual(int(tail.error_codes[1].cpu().item()), 0)
 
     def test_tail_capacity_is_a_fail_fast_invariant(self):
@@ -1252,9 +1255,7 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
         self.assertEqual(int(tail.raw_tail_lens[1].cpu().item()), 1)
         self.assertEqual(int(tail.consumable_tail_lens[1].cpu().item()), 1)
         self.assertEqual(int(tail.tail_tokens[1, 0].cpu().item()), 108)
-        self.assertEqual(
-            int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 1
-        )
+        self.assertEqual(int(tail.pending_prefix_fast_forward_cts[1].cpu().item()), 1)
 
     def test_publish_sequence_tracks_drafter_arrivals_not_verifier_commits(self):
         self._open("arrival-seq", request_epoch=10)
@@ -1369,16 +1370,10 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
             int(self.verifier.gpu_tail_buffer.committed_lens[1].cpu().item()), 0
         )
         self.assertEqual(
-            self.verifier.gpu_tail_buffer.tail_tokens[1, :1].cpu().tolist(), [100]
+            self.verifier.gpu_tail_buffer.tail_tokens[1, :1].cpu().tolist(),
+            [100],
         )
-        deadline = time.monotonic() + 3.0
-        remote_batches = []
-        while not remote_batches and time.monotonic() < deadline:
-            remote_batches = self.drafter.drain_controls()
-            if not remote_batches:
-                time.sleep(0.001)
-        self.assertTrue(remote_batches, "Remote-only VerifyCommit was not delivered")
-        self.assertEqual(remote_batches[0].verify_commit_messages, [commit])
+        self.drafter.wait_for_commit("remote-only", 1)
 
     def test_open_and_append_have_both_linearized_terminal_states(self):
         observed_raw_lens = []
@@ -1857,19 +1852,12 @@ class TestCppGpuDraftTailBuffer(CustomTestCase):
                 struct.pack("<4sBBqqqq", b"DSC1", 5, 2, frame_seq, 0, 0, 0),
                 struct.pack("<IiiI", 1, 0, 0, len(request_bytes)),
                 request_bytes,
-                struct.pack(
-                    "<qqI", base_committed_len, start_token_pos, len(tokens)
-                ),
+                struct.pack("<qqI", base_committed_len, start_token_pos, len(tokens)),
                 struct.pack(f"<{len(tokens)}i", *tokens),
                 struct.pack("<B", int(is_commit_echo)),
             )
         )
-        socket = self.context.socket(zmq.PUSH)
-        try:
-            socket.connect(self.verifier_endpoint)
-            socket.send(frame)
-        finally:
-            socket.close(linger=0)
+        self.raw_tail_socket.send(frame)
 
     def _send_raw_tail_output(
         self, output: DraftTailStreamOutput, *, frame_seq: int
@@ -1943,7 +1931,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
 
     """Direct CUDA coverage for drafter-side forced-token reconciliation."""
 
-    def setUp(self):
+    def setUp(self, schedule_ahead_limit=None):
         self.context = zmq.Context()
         suffix = uuid.uuid4().hex
         verifier_endpoint = f"inproc://gpu-authoritative-verifier-{suffix}"
@@ -1966,6 +1954,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
             ),
             context=self.context,
             device="cuda:0",
+            schedule_ahead_limit=schedule_ahead_limit,
             num_gpu_seats=1,
             num_draft_tokens=3,
             landing_stream=self.landing_stream,
@@ -2055,6 +2044,45 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
             time.sleep(0.001)
 
         self.assertEqual(observed, ("compact-progress", 0, request_epoch, 6, 0, 6))
+
+    def test_non_overlap_progress_reports_full_tail_and_wakes_after_commit(self):
+        # Keep W-1 runnable: non-overlap has no earlier decode in flight.
+        # The native egress must publish again at W even if it already observed
+        # W-1, rather than using the overlap threshold for both schedulers.
+        capacity = self.tail.tail_capacity
+        self.tearDown()
+        self.setUp(schedule_ahead_limit=capacity)
+        seat, request_epoch = self._open("serial-progress")
+        self._append_prefill(seat, request_epoch, 10)
+        for token in range(11, 10 + capacity - 1):
+            self._forward(seat, request_epoch, sampled_token=token)
+        self._wait_snapshot("serial-progress", committed_len=0, tail_len=capacity - 1)
+        self.drafter.drain_gpu_progress()
+
+        self._forward(seat, request_epoch, sampled_token=10 + capacity - 1)
+
+        def wait_progress(committed_len, raw_tail_len):
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                for row in self.drafter.drain_gpu_progress():
+                    if row[0] == "serial-progress" and row[4:] == (
+                        committed_len,
+                        raw_tail_len,
+                    ):
+                        return row
+                time.sleep(0.001)
+            self.fail("Native drafter did not report the scheduling threshold crossing")
+
+        stopped = wait_progress(0, capacity)
+        self.assertEqual(
+            stopped, ("serial-progress", 0, request_epoch, capacity, 0, capacity)
+        )
+
+        self._commit_batch("serial-progress", [(0, list(range(10, 10 + capacity)))])
+        resumed = wait_progress(capacity, 0)
+        self.assertEqual(
+            resumed, ("serial-progress", 0, request_epoch, capacity, capacity, 0)
+        )
 
     def test_gpu_progress_wakes_for_forced_replay_without_token_shadow(self):
         seat, request_epoch = self._open("forced-progress")
@@ -2309,8 +2337,12 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
                 )
                 self._wait_state(seat, committed_lens=3)
                 self._assert_state(
-                    seat, model_output_lens=2, model_input_tokens=99,
-                    raw_tail_lens=0, pending_expected_lens=1, error_codes=0,
+                    seat,
+                    model_output_lens=2,
+                    model_input_tokens=99,
+                    raw_tail_lens=0,
+                    pending_expected_lens=1,
+                    error_codes=0,
                 )
                 resumed = self._forward(seat, epoch, sampled_token=88)
                 self.assertTrue(resumed["accepted"])
@@ -2341,8 +2373,11 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
         self.assertFalse(result["owned"])
         self.assertEqual(result["reclaim"], int(prepared["candidate"].item()))
         self._assert_state(
-            seat, model_input_tokens=10, model_output_lens=1,
-            raw_tail_lens=1, error_codes=0,
+            seat,
+            model_input_tokens=10,
+            model_output_lens=1,
+            raw_tail_lens=1,
+            error_codes=0,
         )
 
     def test_forced_ring_capacity_plus_one_latches_error(self):
@@ -2407,9 +2442,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
                 error_codes=0,
             )
             self.assertEqual(
-                self.tail.pending_expected_tokens[seat, :num_commits]
-                .cpu()
-                .tolist(),
+                self.tail.pending_expected_tokens[seat, :num_commits].cpu().tolist(),
                 list(range(100, 100 + num_commits)),
             )
         finally:
@@ -2458,9 +2491,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
 
         relays = []
         for sampled_token in (800, 801, 802, 803):
-            result = self._forward(
-                seat, request_epoch, sampled_token=sampled_token
-            )
+            result = self._forward(seat, request_epoch, sampled_token=sampled_token)
             relays.append(result["relay"])
         self.assertEqual(relays, [90, 91, 92, 803])
         # A second sample distinguishes full-tail publication from the old
@@ -2491,8 +2522,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
                 restore_position = 2 + mismatch_index
                 stale_dst_position = int(prepared["state"].item()) + 1
                 self.assertEqual(
-                    (stale_dst_position - restore_position)
-                    % self.tail.tail_capacity,
+                    (stale_dst_position - restore_position) % self.tail.tail_capacity,
                     self.tail.tail_capacity - mismatch_index - 1,
                 )
                 self.assertNotEqual(
@@ -2525,9 +2555,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
                     restore_position,
                 )
 
-                resumed = self._forward(
-                    seat, request_epoch, sampled_token=100
-                )
+                resumed = self._forward(seat, request_epoch, sampled_token=100)
                 self.assertEqual(resumed["input"], 99)
                 self._assert_state(
                     seat,
@@ -2634,9 +2662,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
     def _append_prefill(
         self, seat: int, request_epoch: int, sampled_token: int
     ) -> None:
-        sampled = torch.tensor(
-            [sampled_token], dtype=torch.int32, device="cuda:0"
-        )
+        sampled = torch.tensor([sampled_token], dtype=torch.int32, device="cuda:0")
         accepted = self.tail.append_prefill_sample(
             self._vector(seat), self._vector(request_epoch), sampled
         )
@@ -2652,9 +2678,7 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
         }
         if relay_view:
             tensors["input"] = self.future_output_tokens[seat : seat + 1]
-        tensors["orig_seq_len"] = torch.empty(
-            1, dtype=torch.int32, device="cuda:0"
-        )
+        tensors["orig_seq_len"] = torch.empty(1, dtype=torch.int32, device="cuda:0")
         candidate = torch.tensor(
             [self.next_cache_loc], dtype=torch.int64, device="cuda:0"
         )
@@ -2741,18 +2765,13 @@ class TestCppGpuDrafterAuthoritativeTail(CustomTestCase):
             ):
                 return
             time.sleep(0.001)
-        actual = {
-            name: int(getattr(self.tail, name)[seat].cpu()) for name in expected
-        }
+        actual = {name: int(getattr(self.tail, name)[seat].cpu()) for name in expected}
         self.fail(f"GPU drafter state did not converge: {actual=} {expected=}")
 
     def _assert_state(self, seat: int, **expected: int) -> None:
         torch.cuda.synchronize()
         self.assertEqual(
-            {
-                name: int(getattr(self.tail, name)[seat].cpu())
-                for name in expected
-            },
+            {name: int(getattr(self.tail, name)[seat].cpu()) for name in expected},
             expected,
         )
 
@@ -2809,8 +2828,8 @@ class TestPythonDrafterGpuDrafter(TestCppGpuDrafterAuthoritativeTail):
 class TestDenseGpuDrafterAuthoritativeTail(TestCppGpuDrafterAuthoritativeTail):
     """Reconcile/rollback, stale forwards and KV reclaim without recurrent slots."""
 
-    def setUp(self):
-        super().setUp()
+    def setUp(self, **kwargs):
+        super().setUp(**kwargs)
         self.checkpoint_slots = None
 
 

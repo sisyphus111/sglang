@@ -1,8 +1,9 @@
 """CPU-only contracts for GPU-managed decoupled-drafter results."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -15,6 +16,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput  # noqa: E4
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -71,7 +74,29 @@ class TestDecoupledSpecResultDispatch(CustomTestCase):
 
 
 class TestGenerationBatchResultGpuManagedCopy(CustomTestCase):
-    def test_gpu_managed_decode_copies_only_allocator_metadata(self):
+    def test_mixed_copies_only_prefill_tokens_and_preserves_verifier_copy(self):
+        outcomes = torch.tensor([[1, 7, 11]])
+        tokens = torch.tensor([10, 20, 30])
+        accept_lens = torch.tensor([2])
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            next_token_ids=tokens,
+            copy_done=MagicMock(),
+            decoupled_draft_num_prefill_reqs=2,
+            decoupled_draft_kv_outcomes=outcomes,
+            accept_lens=accept_lens,
+        )
+        with patch(
+            "sglang.srt.managers.utils._async_d2h", side_effect=lambda t: t.clone()
+        ) as copy:
+            result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+        self.assertEqual(result.next_token_ids.tolist(), [10, 20])
+        self.assertIs(result.decoupled_draft_kv_outcomes, outcomes)
+        self.assertIsNot(result.accept_lens, accept_lens)
+        self.assertEqual(result.accept_lens.tolist(), [2])
+        self.assertEqual(copy.call_count, 2)
+
+    def test_gpu_managed_decode_leaves_allocator_copy_to_manager(self):
         next_token_ids = object()
         copy_done = MagicMock()
         kv_outcomes = torch.tensor([[1, 7, 11]])
@@ -88,10 +113,8 @@ class TestGenerationBatchResultGpuManagedCopy(CustomTestCase):
             result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
 
         self.assertIs(result.next_token_ids, next_token_ids)
-        self.assertEqual(
-            async_d2h.call_args_list,
-            [call(kv_outcomes)],
-        )
+        async_d2h.assert_not_called()
+        self.assertIs(result.decoupled_draft_kv_outcomes, kv_outcomes)
         copy_done.record.assert_called_once_with()
 
 
@@ -117,6 +140,80 @@ class TestDecoupledDraftRetractionOrdering(CustomTestCase):
             batch
         )
         batch.retract_decode.assert_not_called()
+
+
+class TestDecoupledDraftForwardScheduling(CustomTestCase):
+    def test_both_schedules_use_the_same_forward_transaction(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap), get_context().override_server_args(
+                model_path="dummy", decoupled_spec_role="drafter"
+            ):
+                events = []
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.enable_overlap = overlap
+                scheduler.enable_pdmux = False
+                scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+                scheduler.forward_ct = 0
+                scheduler.scripted_scheduler_hook = None
+                scheduler.profiler_manager = MagicMock()
+                scheduler.forward_sleep_time = None
+                scheduler.disaggregation_mode = None
+                scheduler.is_generation = True
+                scheduler.future_map = MagicMock()
+                scheduler._confidence_budget_prepare = None
+                scheduler.forward_stream_ctx = nullcontext()
+                scheduler.forward_stream = MagicMock()
+                scheduler.device_module = MagicMock()
+                scheduler.forward_stream.synchronize.side_effect = (
+                    lambda: events.append("retire_forward")
+                )
+                scheduler.schedule_stream = object()
+                scheduler._forward_isolation = MagicMock(return_value=nullcontext())
+                scheduler.enable_unified_memory = False
+                scheduler._maybe_report_active_ranks = MagicMock()
+                scheduler._relay_forward_payload = MagicMock()
+                scheduler.decoupled_spec_manager = MagicMock()
+                manager = scheduler.decoupled_spec_manager
+                manager.prepare_batch.side_effect = lambda _: events.append("batch")
+                manager.prepare_forward.side_effect = lambda _: events.append("prepare")
+                manager.finish_forward.side_effect = (
+                    lambda *_: events.append("finish") or True
+                )
+                result = GenerationBatchResult(
+                    logits_output=LogitsProcessorOutput(next_token_logits=None),
+                    next_token_ids=torch.tensor([11]),
+                    decoupled_draft_gpu_managed=True,
+                )
+                scheduler.model_worker = MagicMock()
+                scheduler.model_worker.forward_batch_generation.side_effect = (
+                    lambda *_, **__: events.append("model") or result
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    req_pool_indices=torch.tensor([1]),
+                    return_logprob=False,
+                    return_hidden_states=False,
+                )
+                with patch(
+                    "sglang.srt.managers.scheduler.resolve_forward_inputs",
+                    side_effect=lambda *_: events.append("resolve"),
+                ):
+                    self.assertIs(scheduler.run_batch(batch), result)
+
+                expected = ["batch", "resolve", "prepare", "model", "finish"]
+                self.assertEqual(events, expected)
+                self.assertIsNone(batch.input_ids)
+                self.assertIsNone(result.copy_done)
+                scheduler._relay_forward_payload.assert_not_called()
+                scheduler.future_map.publish.assert_not_called()
+                scheduler.forward_stream.synchronize.assert_not_called()
+                if overlap:
+                    scheduler.forward_stream.wait_stream.assert_called_once_with(
+                        scheduler.schedule_stream
+                    )
+                else:
+                    scheduler.forward_stream.wait_stream.assert_not_called()
 
 
 if __name__ == "__main__":

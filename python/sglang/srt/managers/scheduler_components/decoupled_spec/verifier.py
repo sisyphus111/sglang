@@ -5,6 +5,8 @@ import statistics
 import time
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
@@ -18,6 +20,7 @@ from sglang.srt.managers.scheduler_components.decoupled_spec.base import (
 )
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.speculative.cpp_decoupled_spec import (
+    GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES,
     GPU_DRAFT_TAIL_SELECT_REASON_NAMES,
 )
 from sglang.srt.speculative.decoupled_spec_data_plane import (
@@ -50,6 +53,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class DraftMirror(msgspec.Struct, frozen=True):
+    """One routed drafter lifetime, tied to the owning Req and retraction epoch."""
+
+    owner: Req
+    retraction_count: int
+    request_id: str
+    drafter_rank: int
+
+
 class DecoupledVerifyManager:
     """Verifier request lifecycle and GPU-tail transport coordinator."""
 
@@ -71,11 +83,12 @@ class DecoupledVerifyManager:
         self._total_drafter_quota = sum(self._drafter_quotas.values())
         self.is_entry_rank = scheduler.ps.tp_rank == 0
         self.num_draft_tokens = int(scheduler.server_args.speculative_num_steps)
-        self._open_mirror_by_req: dict[str, str] = {}
-        self._open_lifecycle_by_req: dict[str, tuple[Req, int]] = {}
-        self._open_drafter_rank_by_req: dict[str, int] = {}
+        self._open_requests: dict[str, DraftMirror] = {}
         self._has_pending_lifecycle_landing_fence = False
         self._next_request_epoch = 1
+        # Per-row output lengths before the batch being processed committed its
+        # tokens; set by before_process_batch_result for after_process.
+        self._pre_output_lens: list[int] = []
         from sglang.srt.managers.scheduler_components.decoupled_spec.offline_profile import (
             DecoupledVerifyOfflineProfiler,
         )
@@ -91,7 +104,7 @@ class DecoupledVerifyManager:
             )
         self.adaptive_controller: DecoupledVerifyThroughputController | None = None
         self._adaptive_config = None
-        self._adaptive_decode_round_count = 0
+        self._adaptive_decode_round_ct = 0
         self.rebase_row_ct = 0
         self.rebase_hit_ct = 0
         self.selected_draft_tokens_ct = 0
@@ -122,7 +135,6 @@ class DecoupledVerifyManager:
         self.data_plane = (
             create_verifier_decoupled_spec_data_plane(
                 config,
-                required_tail_len=0,
                 device=scheduler.device,
                 num_gpu_seats=int(scheduler.req_to_token_pool.req_to_token.shape[0]),
                 num_draft_tokens=self.num_draft_tokens,
@@ -133,11 +145,6 @@ class DecoupledVerifyManager:
             else None
         )
         if self.data_plane is not None:
-            if getattr(self.data_plane, "gpu_tail_buffer", None) is None:
-                raise RuntimeError(
-                    "Decoupled verification requires the GPU draft-tail "
-                    "data plane; the CPU snapshot backend is not a runtime fallback."
-                )
             self.data_plane.start()
 
         verify_worker = scheduler.draft_worker
@@ -202,9 +209,6 @@ class DecoupledVerifyManager:
 
     def on_no_batch(self) -> bool:
         return False
-
-    def adjust_plan(self, plan):
-        return plan
 
     def prepare_decode_allocation(self, batch: ScheduleBatch) -> None:
         return None
@@ -276,15 +280,13 @@ class DecoupledVerifyManager:
         if mirror_request_id is not None:
             return mirror_request_id, False
 
-        if not allow_open and (
-            req.finished() or getattr(req, "is_retracted", False)
-        ):
+        if not allow_open and (req.finished() or req.is_retracted):
             # The overlap plan can retain a row whose prior result already
             # closed and forgot its mirror. This stable identity is never sent
             # on wire; result processing rejects it against the live mapping.
             return str(req.rid), False
 
-        previous = self._open_mirror_by_req.get(req.rid)
+        previous = self._open_requests.get(req.rid)
         if not allow_open:
             raise RuntimeError(
                 "Decoupled verifier decode request has no open draft mirror for "
@@ -292,7 +294,7 @@ class DecoupledVerifyManager:
                 f"request_id={req.rid} retraction_count={req.retraction_count}"
             )
         if previous is not None:
-            self._close_request(req, previous, reason="reseated")
+            self._close_request(req, previous.request_id, reason="reseated")
 
         dst_drafter_rank = self._select_drafter_rank()
         request_epoch = self._next_request_epoch
@@ -318,12 +320,12 @@ class DecoupledVerifyManager:
                     request_epoch,
                 )
             )
-        self._open_mirror_by_req[req.rid] = mirror_request_id
-        self._open_lifecycle_by_req[req.rid] = (
-            req,
-            int(req.retraction_count),
+        self._open_requests[req.rid] = DraftMirror(
+            owner=req,
+            retraction_count=req.retraction_count,
+            request_id=mirror_request_id,
+            drafter_rank=dst_drafter_rank,
         )
-        self._open_drafter_rank_by_req[req.rid] = dst_drafter_rank
         return mirror_request_id, True
 
     def _select_drafter_rank(self) -> int:
@@ -347,34 +349,25 @@ class DecoupledVerifyManager:
         return drafter_rank
 
     def _mirror_for_lifecycle(self, req: Req) -> str | None:
-        mirror_request_id = self._open_mirror_by_req.get(req.rid)
-        lifecycle = self._open_lifecycle_by_req.get(req.rid)
-        drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
-        if not (
-            (mirror_request_id is not None)
-            == (lifecycle is not None)
-            == (drafter_rank is not None)
+        mirror = self._open_requests.get(req.rid)
+        if (
+            mirror is not None
+            and mirror.owner is req
+            and mirror.retraction_count == req.retraction_count
         ):
-            raise RuntimeError(
-                "Decoupled verifier draft-mirror lifecycle maps are inconsistent: "
-                f"request_id={req.rid}"
-            )
-        if lifecycle is None:
-            return None
-        owner, retraction_count = lifecycle
-        if owner is req and retraction_count == int(req.retraction_count):
-            return mirror_request_id
+            return mirror.request_id
         return None
 
     def before_process_batch_result(
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-    ) -> None:
-        if not (batch.forward_mode.is_extend() or batch.forward_mode.is_decode()):
-            return
-        batch.decoupled_pre_output_lens = [len(req.output_ids) for req in batch.reqs]
-        batch.decoupled_result_mirror_ids = list(batch.decoupled_launch_mirror_ids)
+    ) -> bool:
+        if batch.forward_mode.is_extend() or batch.forward_mode.is_decode():
+            # Result processing appends this round's tokens; after_process
+            # commits the suffix beyond these lengths to the drafter.
+            self._pre_output_lens = [len(req.output_ids) for req in batch.reqs]
+        return False
 
     def after_process_batch_result(
         self,
@@ -399,12 +392,13 @@ class DecoupledVerifyManager:
                 self.rebase_hit_ct / max(self.rebase_row_ct, 1),
                 self.selected_draft_tokens_ct,
             )
-        result_pre_output_lens = getattr(result, "decoupled_pre_output_lens", None)
         gpu_pre_output_lens = (
-            None if result_pre_output_lens is None else result_pre_output_lens.tolist()
+            None
+            if result.decoupled_pre_output_lens is None
+            else result.decoupled_pre_output_lens.tolist()
         )
-        host_pre_output_lens = batch.decoupled_pre_output_lens
-        mirror_request_ids = batch.decoupled_result_mirror_ids
+        host_pre_output_lens = self._pre_output_lens
+        mirror_request_ids = batch.decoupled_launch_mirror_ids
         control_batches: dict[int, DraftControlBatch] = {}
         finished_lifecycles: list[tuple[str, str]] = []
         for row_index, (req, mirror_request_id) in enumerate(
@@ -419,15 +413,11 @@ class DecoupledVerifyManager:
             # The launch identity is immutable, while the live mapping changes
             # on abort, finish, or retraction/reseat. Only the lifecycle that
             # still owns the request may commit a delayed overlap result.
-            if self._open_mirror_by_req.get(req.rid) != mirror_request_id:
+            mirror = self._open_requests.get(req.rid)
+            if mirror is None or mirror.request_id != mirror_request_id:
                 continue
-            dst_drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
-            if dst_drafter_rank is None:
-                raise RuntimeError(
-                    "Decoupled verifier live mirror has no drafter route: "
-                    f"request_id={req.rid} mirror_request_id={mirror_request_id}"
-                )
-            if getattr(req, "is_retracted", False):
+            dst_drafter_rank = mirror.drafter_rank
+            if req.is_retracted:
                 continue
             if req.finished():
                 if self.is_entry_rank:
@@ -475,9 +465,7 @@ class DecoupledVerifyManager:
                     self._has_pending_lifecycle_landing_fence = True
         for request_id, mirror_request_id in finished_lifecycles:
             self._forget_open_request(request_id, mirror_request_id)
-        metrics_reporter = getattr(self.scheduler, "metrics_reporter", None)
-        if metrics_reporter is not None:
-            metrics_reporter.finish_decoupled_decode_metrics_window()
+        self.scheduler.metrics_reporter.finish_decoupled_decode_metrics_window()
         if batch.forward_mode.is_decode():
             self._observe_adaptive_verify(batch, result)
             if self.offline_profiler is not None:
@@ -485,6 +473,7 @@ class DecoupledVerifyManager:
                     completion_ns=time.perf_counter_ns(),
                     batch=batch,
                     result=result,
+                    pre_output_lens=self._pre_output_lens,
                 )
 
     def _observe_adaptive_verify(
@@ -499,12 +488,8 @@ class DecoupledVerifyManager:
             for req in batch.reqs
         ):
             return
-        self._adaptive_decode_round_count += 1
-        applied_steps = int(
-            batch.decoupled_verify_steps
-            if batch.decoupled_verify_steps is not None
-            else int(result.speculative_num_draft_tokens or 1) - 1
-        )
+        self._adaptive_decode_round_ct += 1
+        applied_steps = int(result.decoupled_verify_steps)
         correct_drafts = [
             int(value) for value in (result.num_correct_drafts_per_req_cpu or [])
         ]
@@ -530,17 +515,13 @@ class DecoupledVerifyManager:
             )
 
         interval = max(1, int(self._adaptive_config["update_interval_rounds"]))
-        if self._adaptive_decode_round_count % interval != 0:
+        if self._adaptive_decode_round_ct % interval != 0:
             return
-        pre_output_lens = list(batch.decoupled_pre_output_lens or [])
         context_lens = [
-            len(req.origin_input_ids)
-            + (
-                int(pre_output_lens[row])
-                if row < len(pre_output_lens)
-                else len(req.output_ids)
+            len(req.origin_input_ids) + pre_output_len
+            for req, pre_output_len in zip(
+                batch.reqs, self._pre_output_lens, strict=True
             )
-            for row, req in enumerate(batch.reqs)
         ]
         payload = None
         if self.is_entry_rank:
@@ -604,10 +585,10 @@ class DecoupledVerifyManager:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ) -> None:
-        row_valid = getattr(result, "decoupled_rebase_valid", None)
+        row_valid = result.decoupled_rebase_valid
         row_valid_cpu = None if row_valid is None else row_valid.tolist()
-        selected_lens = getattr(result, "decoupled_selected_draft_lens", None)
-        selected_lens_cpu = getattr(result, "num_proposed_drafts_per_req_cpu", None)
+        selected_lens = result.decoupled_selected_draft_lens
+        selected_lens_cpu = result.num_proposed_drafts_per_req_cpu
         if row_valid_cpu is not None:
             self.rebase_row_ct += len(row_valid_cpu)
             self.rebase_hit_ct += sum(int(value) for value in row_valid_cpu)
@@ -618,7 +599,7 @@ class DecoupledVerifyManager:
                 )
             self.selected_draft_tokens_ct += sum(selected_lens_cpu)
 
-        debug_rows = getattr(result, "decoupled_tail_select_debug", None)
+        debug_rows = result.decoupled_tail_select_debug
         if debug_rows is None:
             return
         if not self.is_entry_rank:
@@ -630,12 +611,14 @@ class DecoupledVerifyManager:
                 "Decoupled tail-selector debug requires row-valid and "
                 "selected-length tensors."
             )
-        if debug_rows.ndim != 2 or debug_rows.shape[1] < 7:
+        if debug_rows.ndim != 2 or debug_rows.shape[1] != len(
+            GPU_DRAFT_TAIL_DEBUG_FIELD_NAMES
+        ):
             raise RuntimeError(
                 "Decoupled tail-selector debug tensor has an invalid shape: "
                 f"shape={tuple(debug_rows.shape)}"
             )
-        mirror_request_ids = batch.decoupled_result_mirror_ids
+        mirror_request_ids = batch.decoupled_launch_mirror_ids
         if debug_rows.shape[0] != len(mirror_request_ids):
             raise RuntimeError(
                 "Decoupled tail-selector debug rows do not match launch identities: "
@@ -655,10 +638,10 @@ class DecoupledVerifyManager:
             raw_draft_tail_length = int(debug[3])
             consumable_draft_tail_length = int(debug[4])
             pending_prefix_length = int(debug[5])
-            update_error = int(debug[7]) if len(debug) >= 8 else 0
-            update_error_op_seq = int(debug[8]) if len(debug) >= 9 else -1
-            pending_prefix_fast_forward_ct = int(debug[9]) if len(debug) >= 10 else None
-            seqlock_retries = int(debug[10]) if len(debug) >= 11 else 0
+            update_error = int(debug[7])
+            update_error_op_seq = int(debug[8])
+            pending_prefix_fast_forward_ct = int(debug[9])
+            seqlock_retries = int(debug[10])
             selected_len = int(selected_len)
             valid = int(valid)
 
@@ -704,10 +687,7 @@ class DecoupledVerifyManager:
                 "bonus_mismatch",
                 "rebased",
             )
-            if (
-                pending_prefix_fast_forward_ct is not None
-                and fast_forward_counter_is_stable
-            ):
+            if fast_forward_counter_is_stable:
                 if pending_prefix_fast_forward_ct < -1:
                     raise RuntimeError(
                         "GPU pending-prefix fast-forward counter is negative: "
@@ -746,9 +726,7 @@ class DecoupledVerifyManager:
             self._tail_select_reason_ct[reason] += 1
             self._seqlock_retry_row_ct += int(seqlock_retries > 0)
             self._seqlock_retry_ct += seqlock_retries
-            self._max_seqlock_retries = max(
-                self._max_seqlock_retries, seqlock_retries
-            )
+            self._max_seqlock_retries = max(self._max_seqlock_retries, seqlock_retries)
             self._selected_draft_length_ct[selected_len] += 1
             self._record_integer_histogram(
                 self._raw_draft_tail_length_ct,
@@ -818,10 +796,7 @@ class DecoupledVerifyManager:
             self._seqlock_retry_row_ct > self._tail_select_row_ct
             or self._seqlock_retry_ct < self._seqlock_retry_row_ct
             or self._max_seqlock_retries > self._seqlock_retry_ct
-            or (
-                self._seqlock_retry_row_ct > 0
-                and self._max_seqlock_retries == 0
-            )
+            or (self._seqlock_retry_row_ct > 0 and self._max_seqlock_retries == 0)
             or (
                 self._seqlock_retry_row_ct == 0
                 and (self._seqlock_retry_ct or self._max_seqlock_retries)
@@ -890,24 +865,13 @@ class DecoupledVerifyManager:
         )
 
     def abort_request(self, req: Req, reason: str = "abort") -> None:
-        mirror_request_id = self._open_mirror_by_req.get(req.rid)
-        lifecycle = self._open_lifecycle_by_req.get(req.rid)
-        drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
-        if not (
-            (mirror_request_id is not None)
-            == (lifecycle is not None)
-            == (drafter_rank is not None)
-        ):
-            raise RuntimeError(
-                "Decoupled verifier draft-mirror lifecycle maps are inconsistent: "
-                f"request_id={req.rid}"
-            )
+        mirror = self._open_requests.get(req.rid)
         # A retracted request increments retraction_count before it is reseated.
         # It still owns the previous mirror until the next extend opens a new
         # epoch, so abort must key on Req ownership rather than the exact count.
-        if lifecycle is None or lifecycle[0] is not req:
+        if mirror is None or mirror.owner is not req:
             return
-        self._close_request(req, mirror_request_id, reason=reason)
+        self._close_request(req, mirror.request_id, reason=reason)
 
     def retract_request(self, req: Req) -> None:
         """Close the old mirror before the verifier request is recomputed."""
@@ -941,12 +905,7 @@ class DecoupledVerifyManager:
         *,
         reason: str,
     ) -> None:
-        dst_drafter_rank = self._open_drafter_rank_by_req.get(req.rid)
-        if dst_drafter_rank is None:
-            raise RuntimeError(
-                "Decoupled verifier live mirror has no drafter route: "
-                f"request_id={req.rid} mirror_request_id={mirror_request_id}"
-            )
+        dst_drafter_rank = self._open_requests[req.rid].drafter_rank
         if self.data_plane is not None:
             self.data_plane.close_request(
                 DraftClose(
@@ -964,11 +923,10 @@ class DecoupledVerifyManager:
         request_id: str,
         mirror_request_id: str,
     ) -> None:
-        if self._open_mirror_by_req.get(request_id) == mirror_request_id:
+        mirror = self._open_requests.get(request_id)
+        if mirror is not None and mirror.request_id == mirror_request_id:
             self._last_publish_seq_by_mirror.pop(mirror_request_id, None)
             self._last_pending_prefix_fast_forward_ct_by_mirror.pop(
                 mirror_request_id, None
             )
-            self._open_mirror_by_req.pop(request_id, None)
-            self._open_lifecycle_by_req.pop(request_id, None)
-            self._open_drafter_rank_by_req.pop(request_id, None)
+            del self._open_requests[request_id]

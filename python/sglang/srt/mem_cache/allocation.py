@@ -571,7 +571,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     if not batch.defer_decode_kv_binding:
         # Ordinary decode knows its logical position on the schedule stream.
-        # The decoupled-drafter overlap path only allocates the physical
+        # The decoupled drafter only allocates the physical
         # candidate here; its GPU reconcile transaction performs this binding.
         if batch.model_config.is_encoder_decoder:
             locs = batch.encoder_lens + seq_lens_gpu

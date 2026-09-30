@@ -79,8 +79,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
             decode kernel output layout.
         """
         B = mixed_qkv.shape[0]
-        if final_state_indices is None:
-            final_state_indices = cache_indices
         # Packed kernel expects output shape [B, 1, HV, V]
         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
 
@@ -102,12 +100,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
-            if final_state_indices is not cache_indices and not torch.equal(
-                final_state_indices, cache_indices
-            ):
-                raise NotImplementedError(
-                    "ReplaySSM decode does not support distinct state src/dst slots"
-                )
+            assert final_state_indices is None, "ReplaySSM decode is in place"
             fused_recurrent_gdn_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -161,19 +154,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
         final_state_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
-        if final_state_indices is None:
-            final_state_indices = cache_indices
-        if is_npu() or is_cpu():
-            if final_state_indices is not cache_indices and not torch.equal(
-                final_state_indices, cache_indices
-            ):
-                raise NotImplementedError(
-                    "GDN state routing with different src/dst slots is only "
-                    "supported by CUDA Triton decode"
-                )
-            state_route_kwargs = {}
-        else:
-            state_route_kwargs = {"final_state_indices": final_state_indices}
+        # Only the decoupled drafter (CUDA) writes to slots other than it reads.
+        state_route = (
+            {}
+            if final_state_indices is None
+            else {"final_state_indices": final_state_indices}
+        )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -188,7 +174,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
-            **state_route_kwargs,
+            **state_route,
         )
 
     def extend(

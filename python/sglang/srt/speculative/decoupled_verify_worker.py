@@ -6,7 +6,9 @@ import time
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_uniform_func
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_uniform_func,
+)
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -402,18 +404,11 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             )
         )
         batch.decoupled_landing_event = None
-        if (
-            batch.decoupled_has_new_lifecycle
-            or batch.decoupled_needs_landing_fence
-        ):
+        if batch.decoupled_has_new_lifecycle or batch.decoupled_needs_landing_fence:
             if self._gpu_tail_landing_events is None:
                 raise RuntimeError("Decoupled verifier TP0 has no landing event ring.")
-            batch.decoupled_landing_event = self._gpu_tail_landing_events[
-                snapshot_slot
-            ]
-            batch.decoupled_landing_event.record(
-                self.gpu_tail_buffer.landing_stream
-            )
+            batch.decoupled_landing_event = self._gpu_tail_landing_events[snapshot_slot]
+            batch.decoupled_landing_event.record(self.gpu_tail_buffer.landing_stream)
 
     @property
     def war_fastpath_runner(self):
@@ -565,18 +560,23 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             f"Activated decoupled verifier target state: steps {old_steps} -> {steps}.",
         )
 
-    def _build_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        applied_steps = int(
-            self.active_verify_steps
-            if batch.decoupled_verify_steps is None
-            else batch.decoupled_verify_steps
-        )
+    def _build_verify_input(
+        self, batch: ScheduleBatch, applied_steps: int
+    ) -> tuple[EagleVerifyInput, tuple | None]:
+        """Select the GPU draft tail and build the chain verify input.
+
+        Also returns the selector outputs consumed by manager observability:
+        (row_valid, selected_lens, tail_select_debug, logical_committed_lens).
+        """
         if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                applied_steps,
-                applied_steps + 1,
-                self.device,
+            return (
+                EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    applied_steps,
+                    applied_steps + 1,
+                    self.device,
+                ),
+                None,
             )
 
         draft_input = batch.spec_info
@@ -589,9 +589,7 @@ class DecoupledVerifyWorker(BaseSpecWorker):
         snapshot_slot = int(batch.forward_iter) % 2
         batch_size = int(batch.seq_lens.shape[0])
         if batch.decoupled_landing_event is not None:
-            self.gpu_tail_buffer.wait_for_landing_event(
-                batch.decoupled_landing_event
-            )
+            self.gpu_tail_buffer.wait_for_landing_event(batch.decoupled_landing_event)
         (
             selected_draft_tokens,
             selected_lens,
@@ -646,13 +644,12 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             verify_input.retrieve_next_token.scatter_(1, selected_lens.unsqueeze(1), -1)
             verify_input.capture_hidden_mode = CaptureHiddenMode.NULL
 
-        # These tensors are consumed by manager-side observability after D2H.
-        batch.decoupled_rebase_valid = row_valid
-        batch.decoupled_selected_draft_lens = selected_lens
-        batch.decoupled_tail_select_debug = tail_select_debug
-        batch.decoupled_pre_verify_output_lens = logical_committed_lens
-        batch.decoupled_verify_steps = applied_steps
-        return verify_input
+        return verify_input, (
+            row_valid,
+            selected_lens,
+            tail_select_debug,
+            logical_committed_lens,
+        )
 
     def forward_batch_generation(
         self,
@@ -681,8 +678,7 @@ class DecoupledVerifyWorker(BaseSpecWorker):
                             batch.decoupled_landing_event
                         )
                     commit_rows = [
-                        not req.finished()
-                        and not req.is_retracted
+                        not req.finished() and not req.is_retracted
                         # The previous chunk's CPU result can still be in flight.
                         # Only the current batch identifies a non-final row.
                         and req is not batch.chunked_req
@@ -715,8 +711,12 @@ class DecoupledVerifyWorker(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
 
-        verify_input = self._build_verify_input(batch)
-        applied_steps = int(batch.decoupled_verify_steps)
+        applied_steps = int(
+            self.active_verify_steps
+            if batch.decoupled_verify_steps is None
+            else batch.decoupled_verify_steps
+        )
+        verify_input, tail_select = self._build_verify_input(batch, applied_steps)
         batch.spec_info = verify_input
         with operations_nvtx_range("sglang.decoupled_spec.target_verify"):
             batch_output = run_eagle_verify(
@@ -758,10 +758,14 @@ class DecoupledVerifyWorker(BaseSpecWorker):
             batch_output.next_draft_input.bonus_tokens,
             topk=self.topk,
         )
-        batch_output.decoupled_rebase_valid = batch.decoupled_rebase_valid
-        batch_output.decoupled_selected_draft_lens = batch.decoupled_selected_draft_lens
-        batch_output.decoupled_tail_select_debug = batch.decoupled_tail_select_debug
-        batch_output.decoupled_pre_output_lens = batch.decoupled_pre_verify_output_lens
+        if tail_select is not None:
+            # Consumed by manager-side observability after the result D2H.
+            (
+                batch_output.decoupled_rebase_valid,
+                batch_output.decoupled_selected_draft_lens,
+                batch_output.decoupled_tail_select_debug,
+                batch_output.decoupled_pre_output_lens,
+            ) = tail_select
         batch_output.decoupled_verify_steps = applied_steps
         batch_output.speculative_num_draft_tokens = applied_steps + 1
         if on_publish is not None:

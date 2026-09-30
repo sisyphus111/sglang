@@ -46,6 +46,8 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Can build prefix metadata on device for a decoupled drafter MIXED batch.
+    supports_decoupled_mixed_prefix: bool = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.

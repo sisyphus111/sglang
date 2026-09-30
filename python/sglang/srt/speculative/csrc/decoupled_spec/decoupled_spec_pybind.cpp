@@ -518,13 +518,6 @@ struct ClockCalibrationReplyCpp {
   int64_t calibration_epoch = 0;
 };
 
-struct ExtractDecisionCpp {
-  DraftReqKeyCpp key;
-  int32_t dst_drafter_rank = 0;
-  int64_t pre_verify_committed_len = 0;
-  int64_t consumable_len = 0;
-};
-
 DraftControlBatchCpp parse_control_batch(const std::string& frame) {
   BinaryReader reader(frame);
   reader.expect_kind(kKindControlBatch);
@@ -878,431 +871,9 @@ DraftTailStreamOutputBatchCpp build_tail_stream_batch_native(
   return batch;
 }
 
-std::vector<ExtractDecisionCpp> build_extract_decisions_native(
-    const py::sequence& rows) {
-  std::vector<ExtractDecisionCpp> out;
-  out.reserve(py::len(rows));
-  for (const auto& item : rows) {
-    py::sequence row = py::reinterpret_borrow<py::sequence>(item);
-    if (py::len(row) != 5) {
-      throw std::runtime_error("ExtractDecision native row must have 5 fields");
-    }
-    ExtractDecisionCpp decision;
-    decision.key.request_id = row[0].cast<std::string>();
-    decision.key.src_verifier_rank = static_cast<int32_t>(row[1].cast<int64_t>());
-    decision.dst_drafter_rank = static_cast<int32_t>(row[2].cast<int64_t>());
-    decision.pre_verify_committed_len = row[3].cast<int64_t>();
-    decision.consumable_len = row[4].cast<int64_t>();
-    out.push_back(std::move(decision));
-  }
-  return out;
-}
-
-struct VerifierCommitSegmentCpp {
-  DraftReqKeyCpp draft_key;
-  int32_t dst_drafter_rank = 0;
-  int64_t pre_verify_committed_len = 0;
-  std::vector<int32_t> committed_tokens;
-
-  int64_t end_committed_len() const {
-    return pre_verify_committed_len + static_cast<int64_t>(committed_tokens.size());
-  }
-
-  void append_message(const VerifyCommitCpp& message) {
-    if (message.draft_key().map_key() != draft_key.map_key()) {
-      throw std::runtime_error("Verifier commit segment received a commit for a different request");
-    }
-    if (message.dst_drafter_rank != dst_drafter_rank) {
-      throw std::runtime_error("Verifier commit segment received a commit for a different drafter rank");
-    }
-    message.validate();
-    if (message.pre_verify_committed_len != end_committed_len()) {
-      throw std::runtime_error("Verifier commit segment requires contiguous VerifyCommit messages");
-    }
-    committed_tokens.insert(
-        committed_tokens.end(), message.committed_tokens.begin(), message.committed_tokens.end());
-  }
-
-  VerifierCommitSegmentCpp extract_prefix(int64_t num_tokens) {
-    if (num_tokens <= 0 || num_tokens > static_cast<int64_t>(committed_tokens.size())) {
-      throw std::runtime_error("Invalid verifier commit segment prefix length");
-    }
-    VerifierCommitSegmentCpp prefix;
-    prefix.draft_key = draft_key;
-    prefix.dst_drafter_rank = dst_drafter_rank;
-    prefix.pre_verify_committed_len = pre_verify_committed_len;
-    prefix.committed_tokens.assign(committed_tokens.begin(), committed_tokens.begin() + num_tokens);
-    committed_tokens.erase(committed_tokens.begin(), committed_tokens.begin() + num_tokens);
-    pre_verify_committed_len += num_tokens;
-    return prefix;
-  }
-
-  void discard_prefix(int64_t num_tokens) {
-    if (num_tokens <= 0 || num_tokens > static_cast<int64_t>(committed_tokens.size())) {
-      throw std::runtime_error("Invalid verifier commit segment prefix length");
-    }
-    committed_tokens.erase(
-        committed_tokens.begin(), committed_tokens.begin() + num_tokens);
-    pre_verify_committed_len += num_tokens;
-  }
-};
-
-// Compact model-side action produced after comparing one verifier commit
-// segment with the locally mirrored drafter transcript. Matching tokens are
-// already present in the Python Req and therefore do not need to cross the
-// boundary again; only their count and an optional divergent verifier token
-// are required.
-struct DraftCommitActionCpp {
-  DraftReqKeyCpp draft_key;
-  int32_t dst_drafter_rank = 0;
-  int64_t pre_verify_committed_len = 0;
-  int64_t expected_output_len = 0;
-  int64_t matched_prefix_len = 0;
-  int64_t new_committed_len = 0;
-  int64_t rewrite_pos = -1;
-  int32_t rewrite_token = -1;
-  int64_t echo_pos = -1;
-  int32_t echo_token = 0;
-
-  int64_t committed_token_count() const {
-    return new_committed_len - pre_verify_committed_len;
-  }
-
-  bool rewrites_suffix() const { return rewrite_pos >= 0; }
-};
-
-struct DraftCommitProbeCpp {
-  bool ready = false;
-  int64_t matched_prefix_len = 0;
-  bool has_replacement_token = false;
-  int32_t replacement_token_id = 0;
-
-  int64_t consumable_len() const {
-    if (!ready) return 0;
-    return matched_prefix_len + (has_replacement_token ? 1 : 0);
-  }
-};
-
-// Protocol-side mirror used only by the non-overlap CPU reconciliation path.
-// The GPU-authoritative drafter never opens or appends this mirror. For the
-// CPU path, the verifier-committed prefix is represented only by its length;
-// the deque stores the bounded materialized speculative suffix.
-class DraftTranscriptMirror {
- public:
-  bool contains(const DraftReqKeyCpp& key) const {
-    return transcripts_.count(key.map_key()) != 0;
-  }
-
-  int64_t output_len(const DraftReqKeyCpp& key) const {
-    auto it = transcripts_.find(key.map_key());
-    if (it == transcripts_.end()) return -1;
-    return it->second.committed_len +
-        static_cast<int64_t>(it->second.draft_suffix.size());
-  }
-
-  void open(const DraftSyncCpp& sync) {
-    Transcript state;
-    state.dst_drafter_rank = sync.dst_drafter_rank;
-    state.committed_len = static_cast<int64_t>(sync.committed_outputs.size());
-    transcripts_.insert_or_assign(sync.draft_key().map_key(), std::move(state));
-  }
-
-  void close(const DraftReqKeyCpp& key) { transcripts_.erase(key.map_key()); }
-
-  void append_draft_outputs(
-      const DraftTailStreamOutputBatchCpp& batch,
-      bool strict_local_contract = false) {
-    for (const auto& output : batch.outputs) {
-      append_draft_output(output, strict_local_contract);
-    }
-  }
-
-  DraftCommitProbeCpp probe(const VerifierCommitSegmentCpp& segment) const {
-    auto it = transcripts_.find(segment.draft_key.map_key());
-    if (it == transcripts_.end()) return {};
-
-    const auto& state = it->second;
-    if (segment.dst_drafter_rank != state.dst_drafter_rank) {
-      throw std::runtime_error(
-          "Verifier commit segment targets a different drafter transcript");
-    }
-    if (segment.pre_verify_committed_len != state.committed_len) {
-      throw std::runtime_error(
-          "Verifier commit segment does not match mirrored committed prefix");
-    }
-    if (segment.committed_tokens.empty() || state.draft_suffix.empty()) {
-      return {};
-    }
-
-    DraftCommitProbeCpp probe;
-    int64_t max_match = std::min<int64_t>(
-        static_cast<int64_t>(segment.committed_tokens.size()),
-        static_cast<int64_t>(state.draft_suffix.size()));
-    while (probe.matched_prefix_len < max_match &&
-           state.draft_suffix[static_cast<size_t>(probe.matched_prefix_len)] ==
-               segment.committed_tokens[static_cast<size_t>(probe.matched_prefix_len)]) {
-      ++probe.matched_prefix_len;
-    }
-
-    if (probe.matched_prefix_len ==
-        static_cast<int64_t>(segment.committed_tokens.size())) {
-      probe.ready = true;
-      return probe;
-    }
-    if (probe.matched_prefix_len < max_match) {
-      probe.ready = true;
-      probe.has_replacement_token = true;
-      probe.replacement_token_id =
-          segment.committed_tokens[static_cast<size_t>(probe.matched_prefix_len)];
-      return probe;
-    }
-
-    // The available suffix is a strict matching prefix of the verifier
-    // segment. Commit what is materialized now and leave the remainder queued.
-    probe.ready = probe.matched_prefix_len > 0;
-    return probe;
-  }
-
-  DraftCommitActionCpp consume(
-      const VerifierCommitSegmentCpp& segment,
-      const DraftCommitProbeCpp& probe) {
-    if (!probe.ready || probe.consumable_len() <= 0) {
-      throw std::runtime_error("Cannot consume a non-ready verifier commit probe");
-    }
-    auto it = transcripts_.find(segment.draft_key.map_key());
-    if (it == transcripts_.end()) {
-      throw std::runtime_error("Missing mirrored drafter transcript");
-    }
-    auto& state = it->second;
-    if (segment.pre_verify_committed_len != state.committed_len) {
-      throw std::runtime_error(
-          "Verifier commit consume does not match mirrored committed prefix");
-    }
-    if (probe.matched_prefix_len > static_cast<int64_t>(state.draft_suffix.size())) {
-      throw std::runtime_error("Verifier commit probe exceeds mirrored draft suffix");
-    }
-
-    DraftCommitActionCpp action;
-    action.draft_key = segment.draft_key;
-    action.dst_drafter_rank = segment.dst_drafter_rank;
-    action.pre_verify_committed_len = segment.pre_verify_committed_len;
-    action.expected_output_len =
-        state.committed_len + static_cast<int64_t>(state.draft_suffix.size());
-    action.matched_prefix_len = probe.matched_prefix_len;
-    action.new_committed_len =
-        action.pre_verify_committed_len + probe.consumable_len();
-    if (probe.has_replacement_token) {
-      action.rewrite_pos =
-          action.pre_verify_committed_len + action.matched_prefix_len;
-      action.rewrite_token = probe.replacement_token_id;
-    }
-    action.echo_pos = action.new_committed_len - 1;
-    action.echo_token = segment.committed_tokens[
-        static_cast<size_t>(probe.consumable_len() - 1)];
-
-    for (int64_t i = 0; i < probe.matched_prefix_len; ++i) {
-      state.draft_suffix.pop_front();
-    }
-    if (probe.has_replacement_token) {
-      if (state.draft_suffix.empty()) {
-        throw std::runtime_error(
-            "Verifier replacement token has no materialized draft token");
-      }
-      if (state.draft_suffix.front() == probe.replacement_token_id) {
-        throw std::runtime_error(
-            "Verifier replacement token unexpectedly matches mirrored draft token");
-      }
-      // Python will truncate the complete mismatching suffix and install the
-      // verifier token at the first divergent position. That token immediately
-      // belongs to the committed prefix, so no speculative suffix remains.
-      state.draft_suffix.clear();
-    }
-    state.committed_len = action.new_committed_len;
-    return action;
-  }
-
-  // Keep the callback-driven API fail-closed while the scheduler is migrated
-  // to compact actions. Python and the native mirror must make the same
-  // decision; silently clearing the suffix would hide the first divergence and
-  // make the next draft publication appear to skip transcript positions.
-  void consume_legacy(
-      const VerifierCommitSegmentCpp& segment,
-      int64_t consumable_len) {
-    if (consumable_len <= 0 ||
-        consumable_len > static_cast<int64_t>(segment.committed_tokens.size())) {
-      throw std::runtime_error("Invalid legacy verifier commit consume length");
-    }
-    auto it = transcripts_.find(segment.draft_key.map_key());
-    if (it == transcripts_.end()) {
-      throw std::runtime_error(
-          "Legacy verifier commit has no mirrored drafter transcript");
-    }
-    auto& state = it->second;
-    if (segment.pre_verify_committed_len != state.committed_len) {
-      throw std::runtime_error(
-          "Legacy verifier commit does not match mirrored committed prefix");
-    }
-    auto current_probe = probe(segment);
-    if (!current_probe.ready ||
-        current_probe.consumable_len() != consumable_len) {
-      throw std::runtime_error(
-          "Python/native verifier commit decisions diverged: request_id=" +
-          segment.draft_key.request_id + " committed_len=" +
-          std::to_string(state.committed_len) + " suffix_len=" +
-          std::to_string(state.draft_suffix.size()) + " python_consume_len=" +
-          std::to_string(consumable_len) + " native_consume_len=" +
-          std::to_string(current_probe.consumable_len()));
-    }
-    consume(segment, current_probe);
-  }
-
- private:
-  struct Transcript {
-    int32_t dst_drafter_rank = 0;
-    int64_t committed_len = 0;
-    std::deque<int32_t> draft_suffix;
-  };
-
-  void append_draft_output(
-      const DraftTailStreamOutputCpp& output,
-      bool strict_local_contract) {
-    output.validate();
-    DraftReqKeyCpp key{output.dst_verifier_rank, output.request_id};
-    auto it = transcripts_.find(key.map_key());
-    if (it == transcripts_.end()) {
-      if (strict_local_contract) {
-        throw std::runtime_error(
-            "Draft result has no mirrored drafter transcript");
-      }
-      return;
-    }
-
-    auto& state = it->second;
-    const int64_t start_token_pos = output.start_token_pos;
-    if (output.is_commit_echo) {
-      if (start_token_pos >= state.committed_len) {
-        throw std::runtime_error(
-            "Draft commit echo must refer to an already committed token");
-      }
-      return;
-    }
-    if (strict_local_contract) {
-      if (output.base_committed_len != state.committed_len) {
-        throw std::runtime_error(
-            "Draft result base does not match mirrored committed prefix");
-      }
-      int64_t expected_pos =
-          state.committed_len + static_cast<int64_t>(state.draft_suffix.size());
-      if (start_token_pos != expected_pos) {
-        throw std::runtime_error(
-            "Draft result publication must be contiguous with mirrored suffix");
-      }
-      state.draft_suffix.insert(
-          state.draft_suffix.end(), output.tokens.begin(), output.tokens.end());
-      return;
-    }
-    const int64_t end_token_pos =
-        start_token_pos + static_cast<int64_t>(output.tokens.size());
-    if (end_token_pos <= state.committed_len) {
-      // Commit echoes and results produced from an older scheduler view are
-      // protocol-idempotent once their position is committed.
-      return;
-    }
-    if (output.base_committed_len < state.committed_len) return;
-    if (output.base_committed_len > state.committed_len) {
-      throw std::runtime_error(
-          "Draft output base is ahead of mirrored committed prefix");
-    }
-
-    const int64_t materialized_len =
-        state.committed_len + static_cast<int64_t>(state.draft_suffix.size());
-    int64_t virtual_materialized_len = materialized_len;
-    size_t append_begin = output.tokens.size();
-    for (size_t index = 0; index < output.tokens.size(); ++index) {
-      const int64_t token_pos = start_token_pos + static_cast<int64_t>(index);
-      if (token_pos < state.committed_len) continue;
-      if (token_pos < materialized_len) {
-        int32_t existing = state.draft_suffix[static_cast<size_t>(
-            token_pos - state.committed_len)];
-        if (existing != output.tokens[index]) {
-          throw std::runtime_error(
-              "Draft output conflicts with mirrored transcript suffix");
-        }
-        continue;
-      }
-      if (token_pos > virtual_materialized_len) {
-        throw std::runtime_error(
-            "Draft output skips mirrored transcript suffix: request_id=" +
-            output.request_id + " committed_len=" +
-            std::to_string(state.committed_len) + " suffix_len=" +
-            std::to_string(state.draft_suffix.size()) + " token_pos=" +
-            std::to_string(token_pos) + " base_committed_len=" +
-            std::to_string(output.base_committed_len));
-      }
-      if (append_begin == output.tokens.size()) append_begin = index;
-      ++virtual_materialized_len;
-    }
-    if (append_begin < output.tokens.size()) {
-      state.draft_suffix.insert(
-          state.draft_suffix.end(),
-          output.tokens.begin() + static_cast<std::ptrdiff_t>(append_begin),
-          output.tokens.end());
-    }
-  }
-
-  std::unordered_map<std::string, Transcript> transcripts_;
-};
-
 struct ReadyDraftControlsCpp {
   std::vector<DraftSyncCpp> sync_messages;
   std::vector<DraftReqKeyCpp> close_keys;
-  std::vector<VerifierCommitSegmentCpp> ready_commit_segments;
-};
-
-struct ReadyDrafterActionsCpp {
-  std::vector<DraftSyncCpp> sync_messages;
-  std::vector<DraftReqKeyCpp> close_keys;
-  std::vector<DraftCommitActionCpp> commit_actions;
-};
-
-struct DraftControlProbeCpp {
-  uint64_t probe_id = 0;
-  std::vector<DraftSyncCpp> sync_messages;
-  std::vector<DraftReqKeyCpp> close_keys;
-  std::vector<VerifierCommitSegmentCpp> verifier_commit_segments;
-  std::vector<int64_t> expected_output_lens;
-};
-
-struct RequestDraftTailStateCpp {
-  int32_t drafter_rank = 0;
-  int64_t prompt_len = 0;
-  int64_t committed_len = 0;
-  int64_t can_accept_prefix_len = 0;
-  std::vector<int32_t> tail_tokens;
-  std::deque<int32_t> pending_expected_tokens;
-
-  std::vector<int32_t> consumable_tail_tokens() const {
-    if (!pending_expected_tokens.empty()) return {};
-    return tail_tokens;
-  }
-
-  int64_t consumable_tail_len() const {
-    if (!pending_expected_tokens.empty()) return 0;
-    return static_cast<int64_t>(tail_tokens.size());
-  }
-};
-
-struct DraftTailSnapshotCpp {
-  std::string request_id;
-  int64_t committed_len = 0;
-  std::vector<int32_t> tail_tokens;
-  int64_t num_consumable_drafts = 0;
-  int64_t raw_tail_len = 0;
-};
-
-struct DraftTailSnapshotBatchCpp {
-  std::vector<DraftTailSnapshotCpp> snapshots;
-  int64_t wait_ns = 0;
 };
 
 py::tuple draft_key_row(const DraftReqKeyCpp& key) {
@@ -1319,469 +890,22 @@ py::tuple sync_row(const DraftSyncCpp& msg) {
       msg.committed_outputs);
 }
 
-py::tuple commit_row(const VerifyCommitCpp& msg) {
-  return py::make_tuple(
-      msg.request_id,
-      msg.src_verifier_rank,
-      msg.dst_drafter_rank,
-      msg.pre_verify_committed_len,
-      msg.committed_tokens);
-}
-
-py::tuple close_row(const DraftCloseCpp& msg) {
-  return py::make_tuple(
-      msg.request_id,
-      msg.src_verifier_rank,
-      msg.dst_drafter_rank,
-      msg.reason);
-}
-
-py::tuple control_batch_native_rows(const DraftControlBatchCpp& batch) {
-  py::list sync_rows;
-  py::list commit_rows;
-  py::list close_rows;
-  for (const auto& msg : batch.sync_messages) sync_rows.append(sync_row(msg));
-  for (const auto& msg : batch.verify_commit_messages) {
-    commit_rows.append(commit_row(msg));
-  }
-  for (const auto& msg : batch.close_messages) close_rows.append(close_row(msg));
-  return py::make_tuple(
-      batch.dst_drafter_rank, sync_rows, commit_rows, close_rows);
-}
-
-py::tuple segment_row(const VerifierCommitSegmentCpp& segment) {
-  return py::make_tuple(
-      segment.draft_key.request_id,
-      segment.draft_key.src_verifier_rank,
-      segment.dst_drafter_rank,
-      segment.pre_verify_committed_len,
-      segment.committed_tokens);
-}
 
 py::tuple ready_controls_native_rows(const ReadyDraftControlsCpp& ready) {
   py::list sync_rows;
   py::list close_rows;
-  py::list segment_rows;
   for (const auto& msg : ready.sync_messages) sync_rows.append(sync_row(msg));
   for (const auto& key : ready.close_keys) close_rows.append(draft_key_row(key));
-  for (const auto& segment : ready.ready_commit_segments) {
-    segment_rows.append(segment_row(segment));
-  }
-  return py::make_tuple(sync_rows, close_rows, segment_rows);
+  return py::make_tuple(sync_rows, close_rows);
 }
 
-py::tuple control_probe_native_rows(const DraftControlProbeCpp& probe) {
-  if (probe.expected_output_lens.size() !=
-      probe.verifier_commit_segments.size()) {
-    throw std::runtime_error(
-        "Drafter control probe transcript lengths are not aligned");
-  }
-  py::list rows;
-  for (size_t index = 0; index < probe.verifier_commit_segments.size(); ++index) {
-    const auto& segment = probe.verifier_commit_segments[index];
-    rows.append(py::make_tuple(
-        segment.draft_key.request_id,
-        segment.draft_key.src_verifier_rank,
-        segment.dst_drafter_rank,
-        probe.expected_output_lens[index]));
-  }
-  return py::make_tuple(probe.probe_id, rows);
-}
-
-py::tuple ready_actions_native_rows(const ReadyDrafterActionsCpp& ready) {
-  py::list sync_rows;
-  py::list close_rows;
-  py::list action_rows;
-  for (const auto& message : ready.sync_messages) {
-    sync_rows.append(sync_row(message));
-  }
-  for (const auto& key : ready.close_keys) {
-    close_rows.append(draft_key_row(key));
-  }
-  for (const auto& action : ready.commit_actions) {
-    action_rows.append(py::make_tuple(
-        action.draft_key.request_id,
-        action.draft_key.src_verifier_rank,
-        action.dst_drafter_rank,
-        action.expected_output_len,
-        action.pre_verify_committed_len,
-        action.new_committed_len,
-        action.rewrite_pos,
-        action.rewrite_token,
-        action.echo_pos,
-        action.echo_token));
-  }
-  return py::make_tuple(sync_rows, close_rows, action_rows);
-}
-
-class DraftTailBufferCore {
- public:
-  DraftTailBufferCore(int64_t verifier_rank, int64_t required_tail_len)
-      : verifier_rank_(checked_transport_rank(verifier_rank, "Verifier rank")),
-        required_tail_len_(std::max<int64_t>(0, required_tail_len)) {}
-
-  void close() {
-    std::lock_guard<std::mutex> guard(mu_);
-    closed_ = true;
-    states_.clear();
-    cv_.notify_all();
-  }
-
-  bool has_request(const std::string& request_id) {
-    std::lock_guard<std::mutex> guard(mu_);
-    return states_.count(request_id) != 0;
-  }
-
-  int64_t get_committed_len(const std::string& request_id) {
-    std::lock_guard<std::mutex> guard(mu_);
-    auto it = states_.find(request_id);
-    return it == states_.end() ? -1 : it->second.committed_len;
-  }
-
-  void apply_control_batch_native(const DraftControlBatchCpp& batch) {
-    {
-      std::lock_guard<std::mutex> guard(mu_);
-      ensure_open_locked();
-      for (const auto& msg : batch.sync_messages) open_request_locked(msg);
-      for (const auto& msg : batch.verify_commit_messages) apply_commit_locked(msg);
-      for (const auto& msg : batch.close_messages) close_request_locked(msg);
-      cv_.notify_all();
-    }
-  }
-
-  void open_request_rows_native(std::vector<DraftSyncOpenCpp> rows) {
-    std::lock_guard<std::mutex> guard(mu_);
-    ensure_open_locked();
-    states_.reserve(states_.size() + rows.size());
-    for (auto& row : rows) {
-      RequestDraftTailStateCpp state;
-      state.drafter_rank = row.dst_drafter_rank;
-      state.prompt_len = row.prompt_len;
-      state.committed_len = row.committed_len;
-      state.can_accept_prefix_len = state.committed_len;
-      states_.insert_or_assign(std::move(row.request_id), std::move(state));
-    }
-    cv_.notify_all();
-  }
-
-  void append_draft_stream_batch_native(const DraftTailStreamOutputBatchCpp& batch) {
-    if (batch.outputs.empty()) return;
-    {
-      std::lock_guard<std::mutex> guard(mu_);
-      ensure_open_locked();
-      for (const auto& output : batch.outputs) push_output_locked(output);
-      cv_.notify_all();
-    }
-  }
-
-  void wait_for_draft_tokens(const std::vector<std::string>& rids, int64_t min_draft_tokens) {
-    min_draft_tokens = std::max<int64_t>(0, min_draft_tokens);
-    if (min_draft_tokens <= 0) return;
-    std::unique_lock<std::mutex> lock(mu_);
-    ensure_open_locked();
-    cv_.wait(lock, [&] { return closed_ || has_min_draft_tokens_locked(rids, min_draft_tokens); });
-    if (closed_) {
-      throw std::runtime_error("DraftTailBuffer closed while waiting for draft tail tokens.");
-    }
-  }
-
-  DraftTailSnapshotBatchCpp get_draft_snapshots_native(
-      const std::vector<std::string>& rids,
-      bool allow_partial,
-      int64_t max_tail_len) {
-    int64_t tail_cap = std::max<int64_t>(-1, max_tail_len);
-    std::unique_lock<std::mutex> lock(mu_);
-    ensure_open_locked();
-    int64_t wait_ns = 0;
-    if (!allow_partial) {
-      int64_t required_tail_len = required_tail_len_;
-      if (tail_cap >= 0) {
-        required_tail_len = std::min<int64_t>(required_tail_len, tail_cap);
-      }
-      int64_t min_raw_tail_len =
-          std::max<int64_t>(tail_cap == 0 ? 0 : 1, required_tail_len);
-      while (!closed_ && !has_min_draft_tokens_locked(rids, min_raw_tail_len)) {
-        int64_t wait_start_ns = now_ns();
-        cv_.wait(lock);
-        wait_ns += now_ns() - wait_start_ns;
-      }
-      if (closed_) {
-        throw std::runtime_error("DraftTailBuffer closed while waiting for draft tail tokens.");
-      }
-    }
-
-    std::vector<DraftTailSnapshotCpp> snapshots;
-    snapshots.reserve(rids.size());
-    for (const auto& rid : rids) {
-      auto it = states_.find(rid);
-      if (it == states_.end()) {
-        throw std::runtime_error("unexpected request_id=" + rid);
-      }
-      const auto& state = it->second;
-      DraftTailSnapshotCpp snapshot;
-      snapshot.request_id = rid;
-      snapshot.committed_len = state.committed_len;
-      snapshot.tail_tokens = state.consumable_tail_tokens();
-      snapshot.num_consumable_drafts =
-          static_cast<int64_t>(snapshot.tail_tokens.size());
-      if (tail_cap >= 0 && static_cast<int64_t>(snapshot.tail_tokens.size()) > tail_cap) {
-        snapshot.tail_tokens.resize(static_cast<size_t>(tail_cap));
-      }
-      snapshot.raw_tail_len = static_cast<int64_t>(state.tail_tokens.size());
-      snapshots.push_back(std::move(snapshot));
-    }
-    return {std::move(snapshots), wait_ns};
-  }
-
- private:
-  void open_request_locked(const DraftSyncCpp& message) {
-    if (message.src_verifier_rank != verifier_rank_) {
-      throw std::runtime_error(
-          "DraftSync belongs to a different verifier");
-    }
-    RequestDraftTailStateCpp state;
-    state.drafter_rank = message.dst_drafter_rank;
-    state.prompt_len = static_cast<int64_t>(message.prompt_token_ids.size());
-    state.committed_len = static_cast<int64_t>(message.committed_outputs.size());
-    state.can_accept_prefix_len = state.committed_len;
-    states_[message.request_id] = std::move(state);
-  }
-
-  void apply_commit_locked(const VerifyCommitCpp& message) {
-    message.validate();
-
-    if (message.src_verifier_rank != verifier_rank_) {
-      throw std::runtime_error(
-          "VerifyCommit belongs to a different verifier");
-    }
-
-    auto it = states_.find(message.request_id);
-    if (it == states_.end()) return;
-    auto& state = it->second;
-    if (message.dst_drafter_rank != state.drafter_rank) {
-      throw std::runtime_error(
-          "VerifyCommit targets a different drafter");
-    }
-    if (message.pre_verify_committed_len != state.committed_len) {
-      throw std::runtime_error(
-          "VerifyCommit pre-verify prefix does not match verifier committed cursor");
-    }
-
-    int64_t raw_tail_len_before = static_cast<int64_t>(state.tail_tokens.size());
-    const int64_t old_committed_len = state.committed_len;
-
-    if (!state.pending_expected_tokens.empty()) {
-      if (!state.tail_tokens.empty()) {
-        throw std::runtime_error("Draft tail tokens must be empty while expected prefix tokens are pending");
-      }
-      state.committed_len +=
-          static_cast<int64_t>(message.committed_tokens.size());
-      for (int32_t token : message.committed_tokens) {
-        state.pending_expected_tokens.push_back(token);
-      }
-      return;
-    }
-
-    int64_t matched_tail_len = 0;
-    int64_t max_possible_match_len =
-        std::min<int64_t>(static_cast<int64_t>(message.committed_tokens.size()), raw_tail_len_before);
-    while (matched_tail_len < max_possible_match_len &&
-           state.tail_tokens[matched_tail_len] == message.committed_tokens[matched_tail_len]) {
-      ++matched_tail_len;
-    }
-    if (matched_tail_len) {
-      state.tail_tokens.erase(state.tail_tokens.begin(), state.tail_tokens.begin() + matched_tail_len);
-    }
-
-    state.committed_len +=
-        static_cast<int64_t>(message.committed_tokens.size());
-
-    if (matched_tail_len < static_cast<int64_t>(message.committed_tokens.size())) {
-      if (matched_tail_len < raw_tail_len_before) {
-        state.can_accept_prefix_len = std::max(
-            state.can_accept_prefix_len,
-            old_committed_len + matched_tail_len + 1);
-      }
-      state.tail_tokens.clear();
-      for (size_t index = static_cast<size_t>(matched_tail_len);
-           index < message.committed_tokens.size(); ++index) {
-        state.pending_expected_tokens.push_back(
-            message.committed_tokens[index]);
-      }
-    }
-  }
-
-  void close_request_locked(const DraftCloseCpp& message) {
-    if (message.src_verifier_rank != verifier_rank_) {
-      throw std::runtime_error("DraftClose belongs to a different verifier");
-    }
-    auto it = states_.find(message.request_id);
-    if (it != states_.end() &&
-        message.dst_drafter_rank != it->second.drafter_rank) {
-      throw std::runtime_error("DraftClose targets a different drafter");
-    }
-    states_.erase(message.request_id);
-  }
-
-  void push_output_locked(const DraftTailStreamOutputCpp& output) {
-    output.validate();
-    const auto& request_id = output.request_id;
-    int64_t base_committed_len = output.base_committed_len;
-    int64_t start_token_pos = output.start_token_pos;
-    int32_t src_drafter_rank = output.src_drafter_rank;
-    int32_t dst_verifier_rank = output.dst_verifier_rank;
-
-    if (dst_verifier_rank != verifier_rank_) {
-      throw std::runtime_error("Draft stream output targets the wrong verifier");
-    }
-    auto it = states_.find(request_id);
-    if (it == states_.end()) return;
-
-    auto& state = it->second;
-    int64_t state_committed_len = state.committed_len;
-    int64_t can_accept_prefix_len = state.can_accept_prefix_len;
-    int64_t tail_len_before = static_cast<int64_t>(state.tail_tokens.size());
-    int64_t buffer_end_len = state_committed_len + tail_len_before;
-
-    if (src_drafter_rank != state.drafter_rank) {
-      throw std::runtime_error("Unexpected draft stream drafter rank");
-    }
-
-    if (output.is_commit_echo) {
-      const int64_t pending_len = static_cast<int64_t>(
-          state.pending_expected_tokens.size());
-      const int64_t confirmed_len =
-          state_committed_len - pending_len;
-      const int64_t ack_len = start_token_pos + 1;
-      if (ack_len <= confirmed_len) return;
-      if (ack_len > state_committed_len) {
-        throw std::runtime_error(
-            "Draft commit ACK is ahead of verifier committed cursor");
-      }
-      for (int64_t index = confirmed_len; index < ack_len; ++index) {
-        state.pending_expected_tokens.pop_front();
-      }
-      if (state.pending_expected_tokens.empty()) {
-        state.can_accept_prefix_len = state_committed_len;
-      }
-      return;
-    }
-
-    bool reconciled_pending = false;
-    if (!state.pending_expected_tokens.empty()) {
-      if (!state.tail_tokens.empty()) {
-        throw std::runtime_error("Draft tail tokens must be empty while expected prefix tokens are pending");
-      }
-      if (base_committed_len > state_committed_len) {
-        throw std::runtime_error("Draft stream base is ahead of verifier state");
-      }
-      if (base_committed_len < state.can_accept_prefix_len) return;
-      const int64_t confirmed_len = state_committed_len -
-          static_cast<int64_t>(state.pending_expected_tokens.size());
-      const int64_t output_end = start_token_pos +
-          static_cast<int64_t>(output.tokens.size());
-      if (start_token_pos > confirmed_len || output_end <= confirmed_len) {
-        return;
-      }
-
-      const int64_t overlap_end = std::min(output_end, state_committed_len);
-      int64_t match_len = 0;
-      while (confirmed_len + match_len < overlap_end &&
-             state.pending_expected_tokens[static_cast<size_t>(match_len)] ==
-                 output.tokens[static_cast<size_t>(
-                     confirmed_len + match_len - start_token_pos)]) {
-        ++match_len;
-      }
-      for (int64_t index = 0; index < match_len; ++index) {
-        state.pending_expected_tokens.pop_front();
-      }
-      if (confirmed_len + match_len < overlap_end) {
-        state.can_accept_prefix_len = std::max(
-            state.can_accept_prefix_len,
-            confirmed_len + match_len + 1);
-      }
-      if (!state.pending_expected_tokens.empty()) return;
-      state.can_accept_prefix_len = state_committed_len;
-      reconciled_pending = true;
-    }
-
-    if (base_committed_len > state_committed_len) {
-      throw std::runtime_error("Draft stream base is ahead of verifier state");
-    }
-    if (!reconciled_pending && base_committed_len < can_accept_prefix_len) return;
-
-    int64_t virtual_buffer_end_len = buffer_end_len;
-    size_t append_begin = output.tokens.size();
-    for (size_t index = 0; index < output.tokens.size(); ++index) {
-      const int64_t token_pos =
-          start_token_pos + static_cast<int64_t>(index);
-      if (token_pos < state_committed_len) continue;
-      if (token_pos < buffer_end_len) {
-        int32_t existing_token = state.tail_tokens[static_cast<size_t>(
-            token_pos - state_committed_len)];
-        if (existing_token != output.tokens[index]) {
-          throw std::runtime_error(
-              "Draft stream token conflicts with buffered tail");
-        }
-        continue;
-      }
-      if (token_pos > virtual_buffer_end_len) {
-        if (base_committed_len == state_committed_len) {
-          throw std::runtime_error("Draft stream token skips buffered tail");
-        }
-        return;
-      }
-      if (append_begin == output.tokens.size()) append_begin = index;
-      ++virtual_buffer_end_len;
-    }
-    if (append_begin < output.tokens.size()) {
-      state.tail_tokens.insert(
-          state.tail_tokens.end(),
-          output.tokens.begin() + static_cast<std::ptrdiff_t>(append_begin),
-          output.tokens.end());
-    }
-  }
-
-  bool has_min_draft_tokens_locked(const std::vector<std::string>& rids, int64_t min_draft_tokens) const {
-    for (const auto& rid : rids) {
-      auto it = states_.find(rid);
-      if (it == states_.end()) {
-        throw std::runtime_error("unexpected request_id=" + rid);
-      }
-      if (!it->second.pending_expected_tokens.empty()) return false;
-      if (static_cast<int64_t>(it->second.tail_tokens.size()) < min_draft_tokens) return false;
-    }
-    return true;
-  }
-
-  void ensure_open_locked() const {
-    if (closed_) {
-      throw std::runtime_error("DraftTailBuffer is closed");
-    }
-  }
-
-  int32_t verifier_rank_;
-  int64_t required_tail_len_;
-  std::mutex mu_;
-  std::condition_variable cv_;
-  bool closed_ = false;
-  std::unordered_map<std::string, RequestDraftTailStateCpp> states_;
-};
-
-// Drafter-side protocol owner. Network ingress, the mirrored local transcript,
-// pending verifier commits, and ready-action extraction all share one lock so
-// probe/consume is atomic with respect to newly arriving controls and locally
-// published draft tokens.
+// Host lifecycle queue. Verifier commits are consumed by the GPU state machine;
+// only OPEN/CLOSE and scheduling wakeups cross into the scheduler.
 class DrafterDataPlaneCore {
  public:
-  bool is_empty() {
-    std::lock_guard<std::mutex> guard(mu_);
-    return sync_messages_.empty() && verifier_commit_segments_.empty() && close_keys_.empty();
-  }
-
   int64_t pending_control_count() {
     std::lock_guard<std::mutex> guard(mu_);
-    return static_cast<int64_t>(sync_messages_.size() + verifier_commit_segments_.size() + close_keys_.size());
+    return static_cast<int64_t>(sync_messages_.size() + close_keys_.size());
   }
 
   bool wait_for_pending_control(int64_t timeout_us) {
@@ -1790,8 +914,7 @@ class DrafterDataPlaneCore {
     }
     std::unique_lock<std::mutex> lock(mu_);
     auto ready = [&] {
-      return !sync_messages_.empty() || !verifier_commit_segments_.empty() ||
-          !close_keys_.empty() || external_wake_pending_;
+      return !sync_messages_.empty() || !close_keys_.empty() || external_wake_pending_;
     };
     bool woke = ready() || control_cv_.wait_for(
         lock, std::chrono::microseconds(timeout_us), ready);
@@ -1812,297 +935,41 @@ class DrafterDataPlaneCore {
       std::lock_guard<std::mutex> guard(mu_);
       close_keys_.reserve(close_keys_.size() + batch.close_messages.size());
       sync_messages_.reserve(sync_messages_.size() + batch.sync_messages.size());
-      verifier_commit_segments_.reserve(
-          verifier_commit_segments_.size() + batch.verify_commit_messages.size());
       for (const auto& msg : batch.close_messages) {
-        add_close_key_locked(msg.draft_key());
+        auto key = msg.draft_key();
+        close_keys_[key.map_key()] = key;
+        sync_messages_.erase(
+            std::remove_if(
+                sync_messages_.begin(), sync_messages_.end(),
+                [&](const DraftSyncCpp& sync) {
+                  return sync.draft_key().map_key() == key.map_key();
+                }),
+            sync_messages_.end());
       }
       for (const auto& msg : batch.sync_messages) {
         if (close_keys_.count(msg.draft_key().map_key()) == 0) {
           sync_messages_.push_back(msg);
         }
       }
-      for (const auto& msg : batch.verify_commit_messages) {
-        add_verify_commit_locked(msg);
-      }
     }
     control_cv_.notify_all();
-  }
-
-  void append_draft_outputs(
-      const DraftTailStreamOutputBatchCpp& batch,
-      bool strict_local_contract = false) {
-    if (batch.outputs.empty()) return;
-    std::lock_guard<std::mutex> guard(mu_);
-    transcript_.append_draft_outputs(batch, strict_local_contract);
-  }
-
-  DraftControlProbeCpp probe_pending_controls() {
-    std::lock_guard<std::mutex> guard(mu_);
-    if (outstanding_probe_) {
-      throw std::runtime_error(
-          "Drafter data plane already has an outstanding control probe");
-    }
-    if (next_probe_id_ == 0) {
-      throw std::runtime_error("Drafter control probe id exhausted");
-    }
-
-    DraftControlProbeCpp probe;
-    probe.probe_id = next_probe_id_++;
-    probe.sync_messages = sync_messages_;
-    probe.close_keys.reserve(close_keys_.size());
-    for (const auto& kv : close_keys_) probe.close_keys.push_back(kv.second);
-    probe.verifier_commit_segments.reserve(verifier_commit_segments_.size());
-    probe.expected_output_lens.reserve(verifier_commit_segments_.size());
-    for (const auto& map_key : commit_key_order_) {
-      auto it = verifier_commit_segments_.find(map_key);
-      if (it != verifier_commit_segments_.end()) {
-        probe.verifier_commit_segments.push_back(it->second);
-        probe.expected_output_lens.push_back(
-            transcript_.output_len(it->second.draft_key));
-      }
-    }
-    outstanding_probe_ = std::make_unique<DraftControlProbeCpp>(probe);
-    return probe;
-  }
-
-  ReadyDrafterActionsCpp consume_ready_controls(
-      uint64_t probe_id,
-      const std::string& eligibility_mask) {
-    std::lock_guard<std::mutex> guard(mu_);
-    if (!outstanding_probe_ || outstanding_probe_->probe_id != probe_id) {
-      throw std::runtime_error("Drafter control probe id mismatch");
-    }
-    const auto& control_probe = *outstanding_probe_;
-    ReadyDrafterActionsCpp ready;
-    if (eligibility_mask.size() !=
-        control_probe.verifier_commit_segments.size()) {
-      throw std::runtime_error(
-          "Drafter control eligibility mask length does not match probe rows");
-    }
-    for (char value : eligibility_mask) {
-      if (value != 0 && value != 1) {
-        throw std::runtime_error(
-            "Drafter control eligibility mask values must be 0 or 1");
-      }
-    }
-
-    std::unordered_map<std::string, bool> probed_close_keys;
-    probed_close_keys.reserve(control_probe.close_keys.size());
-    for (const auto& key : control_probe.close_keys) {
-      probed_close_keys.emplace(key.map_key(), true);
-      ready.close_keys.push_back(key);
-    }
-
-    // A close received after probe cancels same-request work visible in that
-    // probe, but the new close itself remains pending for the next round.
-    std::unordered_map<std::string, bool> cancelled_keys;
-    for (const auto& kv : close_keys_) {
-      if (probed_close_keys.count(kv.first) == 0) {
-        cancelled_keys.emplace(kv.first, true);
-      }
-    }
-
-    for (const auto& sync : control_probe.sync_messages) {
-      auto map_key = sync.draft_key().map_key();
-      if (cancelled_keys.count(map_key) != 0) continue;
-      if (transcript_.contains(sync.draft_key())) {
-        throw std::runtime_error(
-            "DraftSync received for an existing mirrored transcript");
-      }
-      ready.sync_messages.push_back(sync);
-    }
-
-    struct PlannedCommit {
-      std::string map_key;
-      VerifierCommitSegmentCpp segment;
-      DraftCommitProbeCpp probe;
-    };
-    std::vector<PlannedCommit> planned;
-    planned.reserve(control_probe.verifier_commit_segments.size());
-    for (size_t probe_index = 0;
-         probe_index < control_probe.verifier_commit_segments.size();
-         ++probe_index) {
-      const auto& segment =
-          control_probe.verifier_commit_segments[probe_index];
-      auto map_key = segment.draft_key.map_key();
-      if (close_keys_.count(map_key) != 0 ||
-          eligibility_mask[probe_index] == 0 ||
-          !transcript_.contains(segment.draft_key)) {
-        continue;
-      }
-      auto commit_probe = transcript_.probe(segment);
-      if (!commit_probe.ready) continue;
-
-      auto live_it = verifier_commit_segments_.find(map_key);
-      if (live_it == verifier_commit_segments_.end()) {
-        throw std::runtime_error(
-            "Probed verifier commit segment disappeared before consume");
-      }
-      const auto& live = live_it->second;
-      if (live.pre_verify_committed_len != segment.pre_verify_committed_len ||
-          live.dst_drafter_rank != segment.dst_drafter_rank ||
-          live.committed_tokens.size() < segment.committed_tokens.size() ||
-          !std::equal(
-              segment.committed_tokens.begin(),
-              segment.committed_tokens.end(),
-              live.committed_tokens.begin())) {
-        throw std::runtime_error(
-            "Probed verifier commit segment changed before consume");
-      }
-      planned.push_back(PlannedCommit{map_key, segment, commit_probe});
-    }
-
-    // Remove only sync messages visible to this probe. Later arrivals remain
-    // queued for the next probe.
-    for (const auto& probed_sync : control_probe.sync_messages) {
-      auto target_key = probed_sync.draft_key().map_key();
-      auto it = std::find_if(
-          sync_messages_.begin(), sync_messages_.end(),
-          [&](const DraftSyncCpp& live) {
-            return live.draft_key().map_key() == target_key;
-          });
-      if (it != sync_messages_.end()) sync_messages_.erase(it);
-    }
-    for (const auto& key : control_probe.close_keys) {
-      close_keys_.erase(key.map_key());
-      transcript_.close(key);
-    }
-    for (const auto& sync : ready.sync_messages) transcript_.open(sync);
-
-    for (const auto& item : planned) {
-      auto live_it = verifier_commit_segments_.find(item.map_key);
-      if (live_it == verifier_commit_segments_.end()) {
-        throw std::runtime_error(
-            "Verifier commit segment disappeared during consume");
-      }
-      auto action = transcript_.consume(item.segment, item.probe);
-      int64_t consumed = action.committed_token_count();
-      live_it->second.discard_prefix(consumed);
-      ready.commit_actions.push_back(std::move(action));
-      if (live_it->second.committed_tokens.empty()) {
-        erase_commit_segment_locked(item.map_key);
-      }
-    }
-
-    outstanding_probe_.reset();
-    return ready;
-  }
-
-  std::vector<VerifierCommitSegmentCpp> snapshot_pending_commit_segments_native() {
-    std::lock_guard<std::mutex> guard(mu_);
-    if (outstanding_probe_) {
-      throw std::runtime_error(
-          "Cannot use legacy control snapshot with an outstanding probe");
-    }
-    std::vector<VerifierCommitSegmentCpp> out;
-    out.reserve(verifier_commit_segments_.size());
-    for (const auto& map_key : commit_key_order_) {
-      auto it = verifier_commit_segments_.find(map_key);
-      if (it != verifier_commit_segments_.end()) out.push_back(it->second);
-    }
-    return out;
   }
 
   ReadyDraftControlsCpp extract_lifecycle_controls() {
     ReadyDraftControlsCpp ready;
     std::lock_guard<std::mutex> guard(mu_);
-    if (outstanding_probe_) {
-      throw std::runtime_error(
-          "Cannot extract lifecycle controls with an outstanding probe");
-    }
-
-    // This extraction is the GPU-authoritative path: CPU owns OPEN/CLOSE
-    // request lifecycle only. Do not open, close, or otherwise maintain the
-    // non-overlap DraftTranscriptMirror here.
-    for (const auto& kv : close_keys_) {
-      ready.close_keys.push_back(kv.second);
-    }
+    for (const auto& kv : close_keys_) ready.close_keys.push_back(kv.second);
     close_keys_.clear();
     ready.sync_messages = std::move(sync_messages_);
     sync_messages_.clear();
-    return ready;
-  }
-
-  ReadyDraftControlsCpp extract_ready_controls_native(const std::vector<ExtractDecisionCpp>& decisions) {
-    ReadyDraftControlsCpp ready;
-    std::lock_guard<std::mutex> guard(mu_);
-    if (outstanding_probe_) {
-      throw std::runtime_error(
-          "Cannot use legacy control extraction with an outstanding probe");
-    }
-    for (const auto& kv : close_keys_) {
-      ready.close_keys.push_back(kv.second);
-      transcript_.close(kv.second);
-    }
-    close_keys_.clear();
-    ready.sync_messages = std::move(sync_messages_);
-    sync_messages_.clear();
-    for (const auto& sync : ready.sync_messages) transcript_.open(sync);
-
-    for (const auto& decision : decisions) {
-      if (decision.consumable_len <= 0) continue;
-      auto it = verifier_commit_segments_.find(decision.key.map_key());
-      if (it == verifier_commit_segments_.end()) continue;
-      auto& segment = it->second;
-      if (segment.pre_verify_committed_len != decision.pre_verify_committed_len ||
-          segment.dst_drafter_rank != decision.dst_drafter_rank) {
-        continue;
-      }
-      transcript_.consume_legacy(segment, decision.consumable_len);
-      ready.ready_commit_segments.push_back(segment.extract_prefix(decision.consumable_len));
-      if (segment.committed_tokens.empty()) {
-        erase_commit_segment_locked(decision.key.map_key());
-      }
-    }
     return ready;
   }
 
  private:
-  void add_close_key_locked(const DraftReqKeyCpp& key) {
-    close_keys_[key.map_key()] = key;
-    erase_commit_segment_locked(key.map_key());
-    sync_messages_.erase(
-        std::remove_if(
-            sync_messages_.begin(), sync_messages_.end(),
-            [&](const DraftSyncCpp& msg) { return msg.draft_key().map_key() == key.map_key(); }),
-        sync_messages_.end());
-  }
-
-  void add_verify_commit_locked(const VerifyCommitCpp& message) {
-    auto key = message.draft_key();
-    if (close_keys_.count(key.map_key())) return;
-    auto it = verifier_commit_segments_.find(key.map_key());
-    if (it == verifier_commit_segments_.end()) {
-      VerifierCommitSegmentCpp segment;
-      segment.draft_key = key;
-      segment.dst_drafter_rank = message.dst_drafter_rank;
-      segment.pre_verify_committed_len = message.pre_verify_committed_len;
-      segment.append_message(message);
-      verifier_commit_segments_[key.map_key()] = std::move(segment);
-      commit_key_order_.push_back(key.map_key());
-      return;
-    }
-    it->second.append_message(message);
-  }
-
-  void erase_commit_segment_locked(const std::string& map_key) {
-    verifier_commit_segments_.erase(map_key);
-    commit_key_order_.erase(
-        std::remove(
-            commit_key_order_.begin(), commit_key_order_.end(), map_key),
-        commit_key_order_.end());
-  }
-
   std::mutex mu_;
   std::condition_variable control_cv_;
-  DraftTranscriptMirror transcript_;
   std::vector<DraftSyncCpp> sync_messages_;
-  std::unordered_map<std::string, VerifierCommitSegmentCpp> verifier_commit_segments_;
-  std::vector<std::string> commit_key_order_;
   std::unordered_map<std::string, DraftReqKeyCpp> close_keys_;
-  uint64_t next_probe_id_ = 1;
-  std::unique_ptr<DraftControlProbeCpp> outstanding_probe_;
   bool external_wake_pending_ = false;
 };
 
@@ -3865,87 +2732,12 @@ void ensure_outbound_queue_capacity(
 
 }  // namespace
 
-class DecoupledSpecDraftTailBuffer {
- public:
-  DecoupledSpecDraftTailBuffer(int64_t verifier_rank, int64_t required_tail_len)
-      : core_(std::make_shared<DraftTailBufferCore>(verifier_rank, required_tail_len)) {}
-
-  void close() { core_->close(); }
-  bool has_request(const std::string& request_id) { return core_->has_request(request_id); }
-  int64_t get_committed_len(const std::string& request_id) { return core_->get_committed_len(request_id); }
-
-  void apply_control_batch_native(
-      int64_t dst_drafter_rank,
-      const py::sequence& sync_rows,
-      const py::sequence& commit_rows,
-      const py::sequence& close_rows) {
-    if (py::len(sync_rows) > 0 && py::len(commit_rows) == 0 && py::len(close_rows) == 0) {
-      auto rows = build_sync_open_rows_native(sync_rows);
-      {
-        py::gil_scoped_release release;
-        core_->open_request_rows_native(std::move(rows));
-      }
-      return;
-    }
-    auto batch = build_control_batch_native(dst_drafter_rank, sync_rows, commit_rows, close_rows);
-    {
-      py::gil_scoped_release release;
-      core_->apply_control_batch_native(batch);
-    }
-  }
-
-  void append_draft_stream_batch_native(const py::sequence& rows) {
-    auto batch = build_tail_stream_batch_native(rows);
-    {
-      py::gil_scoped_release release;
-      core_->append_draft_stream_batch_native(batch);
-    }
-  }
-
-  void wait_for_draft_tokens_native(const py::sequence& rids, int64_t min_draft_tokens) {
-    auto rid_vec = py_string_vector(rids);
-    py::gil_scoped_release release;
-    core_->wait_for_draft_tokens(rid_vec, min_draft_tokens);
-  }
-
-  py::tuple get_draft_snapshots_native(
-      const py::sequence& rids,
-      bool allow_partial,
-      int64_t max_tail_len) {
-    auto rid_vec = py_string_vector(rids);
-    DraftTailSnapshotBatchCpp snapshot_batch;
-    {
-      py::gil_scoped_release release;
-      snapshot_batch = core_->get_draft_snapshots_native(
-          rid_vec,
-          allow_partial,
-          max_tail_len);
-    }
-    py::list out;
-    for (const auto& snapshot : snapshot_batch.snapshots) {
-      out.append(py::make_tuple(
-          snapshot.request_id,
-          snapshot.committed_len,
-          snapshot.tail_tokens,
-          snapshot.raw_tail_len,
-          snapshot.num_consumable_drafts));
-    }
-    return py::make_tuple(out, snapshot_batch.wait_ns);
-  }
-
-  std::shared_ptr<DraftTailBufferCore> core() { return core_; }
-
- private:
-  std::shared_ptr<DraftTailBufferCore> core_;
-};
-
 class DecoupledSpecDraftProxyThread {
  public:
   DecoupledSpecDraftProxyThread(
       int64_t verifier_rank,
       const std::string& bind_endpoint,
       const py::sequence& drafter_peer_rows,
-      std::shared_ptr<DecoupledSpecDraftTailBuffer> draft_tail_buffer_ref,
       std::shared_ptr<GpuDraftTailBufferCore> gpu_tail_buffer,
       uintptr_t external_context = 0,
       bool mock_profile = false,
@@ -3954,10 +2746,8 @@ class DecoupledSpecDraftProxyThread {
         verifier_rank_(checked_transport_rank(verifier_rank, "Verifier rank")),
         zmq_(python_transport ? nullptr : std::make_unique<ZmqContextOwner>(external_context)),
         mock_profile_(mock_profile) {
-    if ((draft_tail_buffer_ref == nullptr) == (gpu_tail_buffer == nullptr)) {
-      throw std::runtime_error(
-          "CppDraftProxyThread requires exactly one CPU reference or GPU "
-          "draft-tail owner");
+    if (gpu_tail_buffer == nullptr) {
+      throw std::runtime_error("Draft proxy requires a GPU draft-tail owner");
     }
     if (bind_endpoint.rfind("tcp://", 0) != 0 &&
         bind_endpoint.rfind("ipc://", 0) != 0 &&
@@ -3974,17 +2764,12 @@ class DecoupledSpecDraftProxyThread {
         }
       }
     }
-    draft_tail_buffer_ref_ = std::move(draft_tail_buffer_ref);
     gpu_tail_buffer_ = std::move(gpu_tail_buffer);
-    if (draft_tail_buffer_ref_ != nullptr) {
-      draft_tail_buffer_ = draft_tail_buffer_ref_->core();
-    }
     if (!python_transport_) {
       result_recv_socket_ = zmq_->api().socket(zmq_->ctx(), kZmqPull);
       zmq_->api().configure_socket(result_recv_socket_, kZmqPull);
       zmq_->api().bind(result_recv_socket_, bind_endpoint);
     }
-    result_bind_endpoint_ = bind_endpoint;
     for (const auto& peer : drafter_peers) {
       void* socket = nullptr;
       if (!python_transport_) {
@@ -4001,8 +2786,6 @@ class DecoupledSpecDraftProxyThread {
   }
 
   ~DecoupledSpecDraftProxyThread() { close(); }
-
-  std::string result_bind_endpoint() const { return result_bind_endpoint_; }
 
   py::dict take_transport_metrics() {
     std::lock_guard<std::mutex> metrics_guard(transport_metrics_mu_);
@@ -4080,16 +2863,6 @@ class DecoupledSpecDraftProxyThread {
     return out;
   }
 
-  void bind_gpu_request_native(
-      const std::string& request_id,
-      int64_t gpu_seat,
-      int64_t request_epoch) {
-    if (gpu_tail_buffer_ == nullptr) {
-      throw std::runtime_error(
-          "Verifier data plane has no attached GPU draft-tail buffer");
-    }
-    gpu_tail_buffer_->bind_request(request_id, gpu_seat, request_epoch);
-  }
 
   void start() {
     check_thread_error();
@@ -4223,7 +2996,7 @@ class DecoupledSpecDraftProxyThread {
           1,
           frame.size(),
           "Verifier control");
-      if (!mock_profile_ && gpu_tail_buffer_ != nullptr) {
+      if (!mock_profile_) {
         std::lock_guard<std::mutex> update_guard(gpu_update_mu_);
         if (apply_local_verify_commits) {
           gpu_tail_buffer_->apply_control_batch(*batch_owner);
@@ -4236,20 +3009,6 @@ class DecoupledSpecDraftProxyThread {
           if (!local_batch.sync_messages.empty() ||
               !local_batch.close_messages.empty()) {
             gpu_tail_buffer_->apply_control_batch(local_batch);
-          }
-        }
-      } else if (!mock_profile_) {
-        if (apply_local_verify_commits) {
-          draft_tail_buffer_->apply_control_batch_native(*batch_owner);
-        } else {
-          DraftControlBatchCpp local_batch;
-          local_batch.wire_metadata = batch_owner->wire_metadata;
-          local_batch.dst_drafter_rank = batch_owner->dst_drafter_rank;
-          local_batch.sync_messages = batch_owner->sync_messages;
-          local_batch.close_messages = batch_owner->close_messages;
-          if (!local_batch.sync_messages.empty() ||
-              !local_batch.close_messages.empty()) {
-            draft_tail_buffer_->apply_control_batch_native(local_batch);
           }
         }
       }
@@ -4378,24 +3137,21 @@ class DecoupledSpecDraftProxyThread {
         throw std::runtime_error("Draft proxy received a tail stream batch for the wrong verifier");
       }
     }
-    if (gpu_tail_buffer_ != nullptr) {
+    {
       std::lock_guard<std::mutex> update_guard(gpu_update_mu_);
       RECORD_USER_SCOPE(
           "sglang.decoupled_spec.verifier_daemon.gpu_publish_enqueue");
       NvtxScopedRange gpu_enqueue_nvtx_range(
           "sglang.decoupled_spec.verifier_daemon.gpu_publish_enqueue");
       gpu_tail_buffer_->append_draft_stream_batch(batch);
-    } else {
-      draft_tail_buffer_->append_draft_stream_batch_native(batch);
     }
     {
       std::lock_guard<std::mutex> metrics_guard(transport_metrics_mu_);
-      if (gpu_tail_buffer_ != nullptr) {
-        receive_to_publish_enqueue_latency_.record_ns(now_ns() - receive_ns);
-        gpu_publish_staging_slots_max_ = std::max<uint64_t>(
-            gpu_publish_staging_slots_max_,
-            gpu_tail_buffer_->staging_slot_count());
-      }
+      receive_to_publish_enqueue_latency_.record_ns(now_ns() - receive_ns);
+      gpu_publish_staging_slots_max_ = std::max<uint64_t>(
+          gpu_publish_staging_slots_max_,
+          gpu_tail_buffer_->staging_slot_count());
+
       ++num_result_frames_;
       for (const auto& output : batch.outputs) {
         if (!output.is_commit_echo) {
@@ -4587,11 +3343,8 @@ class DecoupledSpecDraftProxyThread {
   const bool python_transport_;
   int32_t verifier_rank_;
   std::unique_ptr<ZmqContextOwner> zmq_;
-  std::shared_ptr<DecoupledSpecDraftTailBuffer> draft_tail_buffer_ref_;
-  std::shared_ptr<DraftTailBufferCore> draft_tail_buffer_;
   std::shared_ptr<GpuDraftTailBufferCore> gpu_tail_buffer_;
   void* result_recv_socket_ = nullptr;
-  std::string result_bind_endpoint_;
   std::map<int32_t, void*> control_send_sockets_;
   std::map<int32_t, std::string> control_peer_endpoints_;
   std::deque<QueuedFrame> send_queue_;
@@ -4630,11 +3383,23 @@ class DecoupledSpecTokenSyncThread {
       const py::sequence& verifier_peer_rows,
       uintptr_t external_context = 0,
       std::shared_ptr<GpuDraftTailBufferCore> gpu_tail_buffer = nullptr,
-      bool python_transport = false)
+      bool python_transport = false,
+      int64_t schedule_ahead_limit = -1)
       : python_transport_(python_transport),
         drafter_rank_(checked_transport_rank(drafter_rank, "Drafter rank")),
         zmq_(python_transport ? nullptr : std::make_unique<ZmqContextOwner>(external_context)),
-        gpu_tail_buffer_(std::move(gpu_tail_buffer)) {
+        gpu_tail_buffer_(std::move(gpu_tail_buffer)),
+        schedule_ahead_limit_(schedule_ahead_limit) {
+    if (gpu_tail_buffer_ == nullptr) {
+      throw std::runtime_error("Drafter requires a GPU tail buffer");
+    }
+    const int64_t capacity = gpu_tail_buffer_->tail_capacity();
+    if (schedule_ahead_limit_ == -1) schedule_ahead_limit_ = capacity - 1;
+    if (schedule_ahead_limit_ <= 0 || schedule_ahead_limit_ > capacity) {
+      throw std::runtime_error(
+          "Drafter scheduling limit must be within its tail capacity");
+    }
+
     if (bind_endpoint.rfind("tcp://", 0) != 0 &&
         bind_endpoint.rfind("ipc://", 0) != 0 &&
         (external_context == 0 || bind_endpoint.rfind("inproc://", 0) != 0)) {
@@ -4655,7 +3420,6 @@ class DecoupledSpecTokenSyncThread {
       zmq_->api().configure_socket(control_recv_socket_, kZmqPull);
       zmq_->api().bind(control_recv_socket_, bind_endpoint);
     }
-    control_bind_endpoint_ = bind_endpoint;
     for (const auto& peer : verifier_peers) {
       void* socket = nullptr;
       if (!python_transport_) {
@@ -4665,27 +3429,23 @@ class DecoupledSpecTokenSyncThread {
       result_send_sockets_[peer.rank] = socket;
       result_peer_endpoints_[peer.rank] = peer.endpoint;
     }
-    if (gpu_tail_buffer_ != nullptr) {
-      // The buffer can be called by a forward thread while transport teardown
-      // clears this callback. Capture shared wake state rather than a raw
-      // TokenSyncThread pointer so an already-copied callback cannot race the
-      // owner's destructor.
-      auto wake_state = egress_wake_state_;
-      gpu_tail_buffer_->set_egress_notifier([wake_state = std::move(wake_state)] {
-        wake_state->notify_seq.fetch_add(1, std::memory_order_release);
-        wake_state->queue_cv.notify_one();
-      });
-    }
+    // The buffer can be called by a forward thread while transport teardown
+    // clears this callback. Capture shared wake state rather than a raw
+    // TokenSyncThread pointer so an already-copied callback cannot race the
+    // owner's destructor.
+    auto wake_state = egress_wake_state_;
+    gpu_tail_buffer_->set_egress_notifier([wake_state = std::move(wake_state)] {
+      wake_state->notify_seq.fetch_add(1, std::memory_order_release);
+      wake_state->queue_cv.notify_one();
+    });
+
   }
 
   ~DecoupledSpecTokenSyncThread() { close(); }
 
-  std::string control_bind_endpoint() const { return control_bind_endpoint_; }
-
   py::tuple lookup_gpu_binding(
       const std::string& request_id,
       int64_t src_verifier_rank) {
-    if (gpu_tail_buffer_ == nullptr) return py::make_tuple(-1, -1);
     return gpu_tail_buffer_->lookup_binding(request_id, src_verifier_rank);
   }
 
@@ -4725,9 +3485,8 @@ class DecoupledSpecTokenSyncThread {
   }
 
   void close() {
-    if (gpu_tail_buffer_ != nullptr) {
-      gpu_tail_buffer_->clear_egress_notifier();
-    }
+    gpu_tail_buffer_->clear_egress_notifier();
+
     closed_.store(true);
     egress_wake_state_->queue_cv.notify_all();
     if (thread_.joinable()) thread_.join();
@@ -4748,31 +3507,8 @@ class DecoupledSpecTokenSyncThread {
     if (batch.outputs.empty()) return;
     {
       py::gil_scoped_release release;
-      submit_draft_results_batch(std::move(batch), false);
+      submit_draft_results_batch(std::move(batch));
     }
-  }
-
-  py::tuple probe_pending_controls_native() {
-    check_thread_error();
-    DraftControlProbeCpp probe;
-    {
-      py::gil_scoped_release release;
-      probe = data_plane_.probe_pending_controls();
-    }
-    return control_probe_native_rows(probe);
-  }
-
-  py::tuple consume_ready_actions_native(
-      uint64_t probe_id,
-      const py::bytes& eligibility_mask_bytes) {
-    check_thread_error();
-    std::string eligibility_mask = eligibility_mask_bytes.cast<std::string>();
-    ReadyDrafterActionsCpp ready;
-    {
-      py::gil_scoped_release release;
-      ready = data_plane_.consume_ready_controls(probe_id, eligibility_mask);
-    }
-    return ready_actions_native_rows(ready);
   }
 
   int64_t pending_control_count() {
@@ -4783,64 +3519,6 @@ class DecoupledSpecTokenSyncThread {
   bool wait_for_pending_control(int64_t timeout_us) {
     check_thread_error();
     return data_plane_.wait_for_pending_control(timeout_us);
-  }
-
-  int64_t pending_control_batch_count() {
-    check_thread_error();
-    std::lock_guard<std::mutex> guard(pending_control_mu_);
-    return static_cast<int64_t>(pending_control_batches_.size());
-  }
-
-  py::list drain_control_batches_native(int64_t max_batches) {
-    check_thread_error();
-    if (max_batches < -1) {
-      throw std::runtime_error(
-          "max_batches must be non-negative or -1 for no limit");
-    }
-    std::vector<DraftControlBatchCpp> batches;
-    {
-      std::lock_guard<std::mutex> guard(pending_control_mu_);
-      size_t limit = max_batches < 0
-          ? pending_control_batches_.size()
-          : std::min<size_t>(
-                pending_control_batches_.size(),
-                static_cast<size_t>(max_batches));
-      batches.reserve(limit);
-      for (size_t i = 0; i < limit; ++i) {
-        batches.push_back(std::move(pending_control_batches_.front()));
-        pending_control_batches_.pop_front();
-      }
-    }
-    py::list rows;
-    for (const auto& batch : batches) {
-      rows.append(control_batch_native_rows(batch));
-    }
-    return rows;
-  }
-
-  py::list snapshot_pending_commit_segments_native() {
-    check_thread_error();
-    std::vector<VerifierCommitSegmentCpp> segments;
-    {
-      py::gil_scoped_release release;
-      segments = data_plane_.snapshot_pending_commit_segments_native();
-    }
-    py::list out;
-    for (const auto& segment : segments) {
-      out.append(segment_row(segment));
-    }
-    return out;
-  }
-
-  py::tuple extract_ready_controls_native(const py::sequence& rows) {
-    check_thread_error();
-    auto decisions = build_extract_decisions_native(rows);
-    ReadyDraftControlsCpp ready;
-    {
-      py::gil_scoped_release release;
-      ready = data_plane_.extract_ready_controls_native(decisions);
-    }
-    return ready_controls_native_rows(ready);
   }
 
   py::tuple extract_lifecycle_controls_native() {
@@ -4931,10 +3609,7 @@ class DecoupledSpecTokenSyncThread {
   }
 
  private:
-  void submit_draft_results_batch(
-      DraftTailStreamOutputBatchCpp batch,
-      bool strict_local_contract,
-      bool update_cpu_transcript = true) {
+  void submit_draft_results_batch(DraftTailStreamOutputBatchCpp batch) {
     if (batch.outputs.empty()) return;
     const int64_t result_ready_ns = now_ns();
     std::map<int32_t, DraftTailStreamOutputBatchCpp> by_verifier;
@@ -4976,9 +3651,6 @@ class DecoupledSpecTokenSyncThread {
           frames.size(),
           frame_bytes,
           "Drafter tail");
-      if (update_cpu_transcript) {
-        data_plane_.append_draft_outputs(batch, strict_local_contract);
-      }
       for (auto& frame : frames) {
         frame.enqueue_ns = now_ns();
         pending_result_bytes_ += frame.frame.size();
@@ -5034,8 +3706,7 @@ class DecoupledSpecTokenSyncThread {
       did_work = drain_control_socket() || did_work;
       if (!did_work) {
         std::unique_lock<std::mutex> lock(queue_mu_);
-        const bool gpu_pending = gpu_tail_buffer_ != nullptr &&
-            gpu_tail_buffer_->has_pending_egress_work();
+        const bool gpu_pending = gpu_tail_buffer_->has_pending_egress_work();
         const bool result_backpressured = !outgoing_results_.empty();
         const auto poll_interval =
             std::chrono::microseconds(
@@ -5051,8 +3722,7 @@ class DecoupledSpecTokenSyncThread {
   }
 
   bool drain_gpu_egress() {
-    if (gpu_tail_buffer_ == nullptr ||
-        !gpu_tail_buffer_->has_pending_egress_work()) {
+    if (!gpu_tail_buffer_->has_pending_egress_work()) {
       return false;
     }
     RECORD_USER_SCOPE(
@@ -5178,8 +3848,8 @@ class DecoupledSpecTokenSyncThread {
 
       publication.last_egress_seq = snapshot.egress_seq;
       publication.last_committed_len = snapshot.ack_ready_len;
-      const bool can_schedule =
-          snapshot.raw_tail_len < gpu_tail_buffer_->tail_capacity() - 1;
+      // Match the scheduler's in-flight reservation in either scheduling mode.
+      const bool can_schedule = snapshot.raw_tail_len < schedule_ahead_limit_;
       if (!publication.pacing_initialized ||
           publication.last_can_schedule != can_schedule) {
         publication.pacing_initialized = true;
@@ -5201,8 +3871,7 @@ class DecoupledSpecTokenSyncThread {
           "sglang.decoupled_spec.drafter_daemon.gpu_egress_encode");
       NvtxScopedRange encode_nvtx_range(
           "sglang.decoupled_spec.drafter_daemon.gpu_egress_encode");
-      submit_draft_results_batch(
-          std::move(output_batch), false, false);
+      submit_draft_results_batch(std::move(output_batch));
     }
     // Publication/progress cursors become visible only after every required
     // wire frame was admitted to the bounded FIFO.
@@ -5298,39 +3967,22 @@ class DecoupledSpecTokenSyncThread {
       throw std::runtime_error(
           "Draft control batch targets a different drafter");
     }
-    if (gpu_tail_buffer_ != nullptr) {
-      // Network ingress publishes controls directly to the authoritative
-      // GPU transcript. The CPU inbox below owns lifecycle only; verifier
-      // commit tokens never enter a production token shadow.
-      gpu_tail_buffer_->apply_control_batch(batch, true);
-      if (!batch.verify_commit_messages.empty()) {
-        data_plane_.notify_external_progress();
-      }
+    // Network ingress publishes controls directly to the authoritative
+    // GPU transcript. The CPU inbox below owns lifecycle only; verifier
+    // commit tokens never enter a production token shadow.
+    gpu_tail_buffer_->apply_control_batch(batch, true);
+    if (!batch.verify_commit_messages.empty()) {
+      data_plane_.notify_external_progress();
     }
-    DraftControlBatchCpp cpu_batch;
-    if (gpu_tail_buffer_ != nullptr) {
-      cpu_batch.wire_metadata = batch.wire_metadata;
-      cpu_batch.dst_drafter_rank = batch.dst_drafter_rank;
-      cpu_batch.sync_messages = batch.sync_messages;
-      cpu_batch.close_messages = batch.close_messages;
+
+    {
       std::lock_guard<std::mutex> progress_guard(gpu_progress_mu_);
       for (const auto& close : batch.close_messages) {
         pending_gpu_progress_.erase(close.draft_key().map_key());
       }
-    } else {
-      cpu_batch = std::move(batch);
     }
-    if (!cpu_batch.sync_messages.empty() ||
-        !cpu_batch.close_messages.empty() ||
-        !cpu_batch.verify_commit_messages.empty()) {
-      if (gpu_tail_buffer_ == nullptr) {
-        // The raw batch queue is a compatibility surface for the legacy
-        // non-GPU consumer. Authoritative GPU mode has a single lifecycle
-        // owner in DrafterDataPlaneCore and must not duplicate Sync/Close.
-        std::lock_guard<std::mutex> guard(pending_control_mu_);
-        pending_control_batches_.push_back(cpu_batch);
-      }
-      data_plane_.add_control_batch(cpu_batch);
+    if (!batch.sync_messages.empty() || !batch.close_messages.empty()) {
+      data_plane_.add_control_batch(batch);
     }
   }
 
@@ -5365,13 +4017,11 @@ class DecoupledSpecTokenSyncThread {
   int32_t drafter_rank_;
   std::unique_ptr<ZmqContextOwner> zmq_;
   void* control_recv_socket_ = nullptr;
-  std::string control_bind_endpoint_;
   std::map<int32_t, void*> result_send_sockets_;
   std::map<int32_t, std::string> result_peer_endpoints_;
   std::shared_ptr<GpuDraftTailBufferCore> gpu_tail_buffer_;
+  int64_t schedule_ahead_limit_;
   DrafterDataPlaneCore data_plane_;
-  std::deque<DraftControlBatchCpp> pending_control_batches_;
-  std::mutex pending_control_mu_;
   std::deque<QueuedFrame> outgoing_results_;
   size_t pending_result_bytes_ = 0;
   std::mutex queue_mu_;
@@ -5584,43 +4234,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "max_staging_slots",
           &GpuDraftTailBufferCore::max_staging_slots);
 
-  py::class_<DecoupledSpecDraftTailBuffer, std::shared_ptr<DecoupledSpecDraftTailBuffer>>(m, "DraftTailBuffer")
-      .def(py::init<int64_t, int64_t>(), py::arg("verifier_rank"), py::arg("required_tail_len"))
-      .def("close", &DecoupledSpecDraftTailBuffer::close, py::call_guard<py::gil_scoped_release>())
-      .def("has_request", &DecoupledSpecDraftTailBuffer::has_request, py::arg("request_id"))
-      .def("get_committed_len", &DecoupledSpecDraftTailBuffer::get_committed_len, py::arg("request_id"))
-      .def(
-          "apply_control_batch_native",
-          &DecoupledSpecDraftTailBuffer::apply_control_batch_native,
-          py::arg("dst_drafter_rank"),
-          py::arg("sync_rows"),
-          py::arg("commit_rows"),
-          py::arg("close_rows"))
-      .def(
-          "append_draft_stream_batch_native",
-          &DecoupledSpecDraftTailBuffer::append_draft_stream_batch_native,
-          py::arg("rows"))
-      .def(
-          "wait_for_draft_tokens_native",
-          &DecoupledSpecDraftTailBuffer::wait_for_draft_tokens_native,
-          py::arg("rids"),
-          py::arg("min_draft_tokens"))
-      .def(
-          "get_draft_snapshots_native",
-          &DecoupledSpecDraftTailBuffer::get_draft_snapshots_native,
-          py::arg("rids"),
-          py::arg("allow_partial"),
-          py::arg("max_tail_len"))
-
-;
-
   py::class_<DecoupledSpecDraftProxyThread>(m, "DraftProxyThread")
       .def(
           py::init<
               int64_t,
               const std::string&,
               const py::sequence&,
-              std::shared_ptr<DecoupledSpecDraftTailBuffer>,
               std::shared_ptr<GpuDraftTailBufferCore>,
               uintptr_t,
               bool,
@@ -5628,7 +4247,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("verifier_rank"),
           py::arg("bind_endpoint"),
           py::arg("drafter_peers"),
-          py::arg("draft_tail_buffer"),
           py::arg("gpu_tail_buffer"),
           py::arg("external_context") = 0,
           py::arg("mock_profile") = false,
@@ -5636,16 +4254,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("send_pending", &DecoupledSpecDraftProxyThread::send_pending)
       .def("receive_frame", &DecoupledSpecDraftProxyThread::receive_frame)
       .def("send_clock_probe", &DecoupledSpecDraftProxyThread::send_clock_probe)
-      .def("result_bind_endpoint", &DecoupledSpecDraftProxyThread::result_bind_endpoint)
       .def(
           "take_transport_metrics",
           &DecoupledSpecDraftProxyThread::take_transport_metrics)
-      .def(
-          "bind_gpu_request_native",
-          &DecoupledSpecDraftProxyThread::bind_gpu_request_native,
-          py::arg("request_id"),
-          py::arg("gpu_seat"),
-          py::arg("request_epoch"))
       .def("start", &DecoupledSpecDraftProxyThread::start, py::call_guard<py::gil_scoped_release>())
       .def("close", &DecoupledSpecDraftProxyThread::close, py::call_guard<py::gil_scoped_release>())
       .def(
@@ -5666,17 +4277,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               const py::sequence&,
               uintptr_t,
               std::shared_ptr<GpuDraftTailBufferCore>,
-              bool>(),
+              bool,
+              int64_t>(),
           py::arg("drafter_rank"),
           py::arg("bind_endpoint"),
           py::arg("verifier_peers"),
           py::arg("external_context") = 0,
           py::arg("gpu_tail_buffer") = nullptr,
-          py::arg("python_transport") = false)
+          py::arg("python_transport") = false,
+          py::arg("schedule_ahead_limit") = -1)
       .def("send_pending", &DecoupledSpecTokenSyncThread::send_pending)
       .def("receive_frame", &DecoupledSpecTokenSyncThread::receive_frame)
       .def("poll_gpu_egress", &DecoupledSpecTokenSyncThread::poll_gpu_egress)
-      .def("control_bind_endpoint", &DecoupledSpecTokenSyncThread::control_bind_endpoint)
       .def(
           "lookup_gpu_binding_native",
           &DecoupledSpecTokenSyncThread::lookup_gpu_binding,
@@ -5691,33 +4303,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "submit_draft_results_native",
           &DecoupledSpecTokenSyncThread::submit_draft_results_native,
           py::arg("rows"))
-      .def(
-          "probe_pending_controls_native",
-          &DecoupledSpecTokenSyncThread::probe_pending_controls_native)
-      .def(
-          "consume_ready_actions_native",
-          &DecoupledSpecTokenSyncThread::consume_ready_actions_native,
-          py::arg("probe_id"),
-          py::arg("eligibility_mask"))
       .def("pending_control_count", &DecoupledSpecTokenSyncThread::pending_control_count)
       .def(
           "wait_for_pending_control",
           &DecoupledSpecTokenSyncThread::wait_for_pending_control,
           py::call_guard<py::gil_scoped_release>())
-      .def(
-          "pending_control_batch_count",
-          &DecoupledSpecTokenSyncThread::pending_control_batch_count)
-      .def(
-          "drain_control_batches_native",
-          &DecoupledSpecTokenSyncThread::drain_control_batches_native,
-          py::arg("max_batches"))
-      .def(
-          "snapshot_pending_commit_segments_native",
-          &DecoupledSpecTokenSyncThread::snapshot_pending_commit_segments_native)
-      .def(
-          "extract_ready_controls_native",
-          &DecoupledSpecTokenSyncThread::extract_ready_controls_native,
-          py::arg("rows"))
       .def(
           "extract_lifecycle_controls_native",
           &DecoupledSpecTokenSyncThread::extract_lifecycle_controls_native)

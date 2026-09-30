@@ -233,7 +233,11 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            prefill_reqs = batch.reqs
+            num_prefill_reqs = result.decoupled_draft_num_prefill_reqs
+            if num_prefill_reqs is not None:
+                prefill_reqs = prefill_reqs[:num_prefill_reqs]
+            for i, (req, next_token_id) in enumerate(zip(prefill_reqs, next_token_ids)):
                 if (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
@@ -666,9 +670,7 @@ class SchedulerBatchResultProcessor:
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
         max_proposed_drafts = max(int(stride) - 1, 0)
-        decoupled_selected_draft_lens = getattr(
-            result, "decoupled_selected_draft_lens", None
-        )
+        decoupled_selected_draft_lens = result.decoupled_selected_draft_lens
         if decoupled_selected_draft_lens is not None:
             assert decoupled_selected_draft_lens.is_cpu
             proposed_drafts_per_req = [

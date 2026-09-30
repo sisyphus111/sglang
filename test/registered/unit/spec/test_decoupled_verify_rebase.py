@@ -108,15 +108,23 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
 
         verify_input = SimpleNamespace()
 
-        def build_verify_input(batch):
+        pre_verify_output_lens = torch.tensor([7, 9], dtype=torch.int64)
+        tail_select = (
+            torch.ones(2, dtype=torch.int64),
+            torch.tensor([1, 2]),
+            torch.zeros((2, 11), dtype=torch.int64),
+            pre_verify_output_lens,
+        )
+
+        def build_verify_input(batch, applied_steps):
             events.append("select")
-            return verify_input
+            self.assertEqual(applied_steps, 3)
+            return verify_input, tail_select
 
         worker._build_verify_input = build_verify_input
         gpu_seats = torch.tensor([1, 2], dtype=torch.int64)
         expected_request_epochs = torch.tensor([5, 6], dtype=torch.int64)
         seq_lens = torch.tensor([10, 12], dtype=torch.int64)
-        pre_verify_output_lens = torch.tensor([7, 9], dtype=torch.int64)
         accept_tokens = torch.tensor([11, 12, 0, 0, 21, 22, 23, 0], dtype=torch.int32)
         accept_lens = torch.tensor([2, 3], dtype=torch.int32)
         batch_output = SimpleNamespace(
@@ -136,10 +144,6 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
             decoupled_has_new_lifecycle=False,
             decoupled_landing_event=None,
             seq_lens=seq_lens,
-            decoupled_pre_verify_output_lens=pre_verify_output_lens,
-            decoupled_rebase_valid=torch.ones(2, dtype=torch.int64),
-            decoupled_selected_draft_lens=torch.tensor([1, 2]),
-            decoupled_tail_select_debug=torch.zeros((2, 10), dtype=torch.int64),
             spec_info=None,
         )
 
@@ -161,6 +165,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
 
         self.assertIs(actual, batch_output)
         self.assertEqual(events, ["select", "commit", "publish"])
+        self.assertIs(actual.decoupled_pre_output_lens, pre_verify_output_lens)
         self.assertIs(commit_call["gpu_seats"], gpu_seats)
         self.assertIs(commit_call["expected_request_epochs"], expected_request_epochs)
         self.assertIs(commit_call["pre_verify_seq_lens"], seq_lens)
@@ -239,9 +244,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
                     req_pool_indices=gpu_seats,
                     decoupled_expected_request_epochs=expected_request_epochs,
                     decoupled_has_new_lifecycle=has_new_lifecycle,
-                    decoupled_landing_event=(
-                        object() if has_new_lifecycle else None
-                    ),
+                    decoupled_landing_event=(object() if has_new_lifecycle else None),
                     seq_lens=seq_lens,
                 )
 
@@ -445,9 +448,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
             batch.decoupled_expected_request_epochs.data_ptr(),
             worker._gpu_tail_expected_epoch_buffers[1, :2].data_ptr(),
         )
-        self.assertIs(
-            batch.decoupled_landing_event, worker._gpu_tail_landing_events[1]
-        )
+        self.assertIs(batch.decoupled_landing_event, worker._gpu_tail_landing_events[1])
 
         lifecycle_fence_batch = SimpleNamespace(
             forward_iter=2,
@@ -611,9 +612,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
         landing_order = []
         landing_event = object()
         worker.gpu_tail_buffer = SimpleNamespace(
-            wait_for_landing_event=lambda event: landing_order.append(
-                ("wait", event)
-            )
+            wait_for_landing_event=lambda event: landing_order.append(("wait", event))
         )
         worker._gpu_tail_snapshot_buffers = torch.empty(
             (2, batch_size, num_draft_tokens + 2), dtype=torch.int64
@@ -659,7 +658,7 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
         )
         selected_tokens = torch.zeros((batch_size, num_draft_tokens), dtype=torch.int64)
         row_valid = torch.ones(batch_size, dtype=torch.int64)
-        tail_select_debug = torch.zeros((batch_size, 10), dtype=torch.int64)
+        tail_select_debug = torch.zeros((batch_size, 11), dtype=torch.int64)
         logical_committed_lens = torch.arange(batch_size, dtype=torch.int64)
 
         def select_snapshot(**kwargs):
@@ -690,11 +689,11 @@ class TestDecoupledVerifyGpuSnapshot(CustomTestCase):
                 return_value=verify_input,
             ),
         ):
-            actual = worker._build_verify_input(batch)
+            actual, tail_select = worker._build_verify_input(batch, num_draft_tokens)
 
         self.assertIs(actual, verify_input)
         self.assertEqual(landing_order, [("wait", landing_event), ("select", None)])
-        self.assertIs(batch.decoupled_tail_select_debug, tail_select_debug)
+        self.assertIs(tail_select[2], tail_select_debug)
         self.assertTrue(torch.equal(actual.retrieve_next_token, expected))
         for row, terminal_index in enumerate(selected_lens.tolist()):
             self.assertEqual(actual.retrieve_next_token[row, terminal_index].item(), -1)

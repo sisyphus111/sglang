@@ -136,6 +136,7 @@ class FlashAttentionBackend(AttentionBackend):
     """
 
     needs_cpu_seq_lens: bool = False
+    supports_decoupled_mixed_prefix: bool = True
     supports_ragged_verify_graph: bool = True
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
@@ -967,6 +968,21 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif (
+                getattr(forward_batch, "decoupled_draft_num_prefill_reqs", None)
+                is not None
+            ):
+                if self.fa_impl_ver not in (3, 4):
+                    raise ValueError("Decoupled mixed prefill requires FA3 or FA4")
+                # Prefix positions are GPU-authoritative; query lengths are fixed
+                # by the scheduled chunks and one token per decode suffix row.
+                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(
+                        forward_batch.extend_seq_lens, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
                 )
             elif any(forward_batch.extend_prefix_lens_cpu):
                 extend_seq_lens = forward_batch.extend_seq_lens

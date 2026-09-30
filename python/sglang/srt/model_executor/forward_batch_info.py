@@ -444,8 +444,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
-    # Optional logical Mamba slots for read-from-source/write-to-destination
-    # recurrent-state routing. They must be provided together.
+    # Decoupled drafter decode: logical Mamba slots each row's recurrent state
+    # is read from / written to (rollback checkpoints). Set together or None.
     mamba_cache_src_indices: Optional[torch.Tensor] = None
     mamba_cache_dst_indices: Optional[torch.Tensor] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
@@ -472,6 +472,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
+    # Decoupled MIXED uses the ordinary prefill-prefix/decode-suffix layout.
+    # Request and token boundaries differ when a prefill row has multiple tokens.
+    decoupled_draft_num_prefill_reqs: Optional[int] = None
+    decoupled_draft_num_prefill_tokens: Optional[int] = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)
@@ -757,7 +761,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # scheduling, so its host sequence lengths are only pacing metadata. Its
         # forward must build attention metadata from the device lengths resolved
         # at forward entry.
-        gpu_only_seq_lens = bool(batch.defer_decode_kv_binding)
+        num_prefill_reqs = batch.decoupled_draft_num_prefill_reqs
+        num_prefill_tokens = batch.decoupled_draft_num_prefill_tokens
+        if num_prefill_reqs is not None:
+            if (
+                not batch.forward_mode.is_mixed()
+                or not 0 < num_prefill_reqs < len(batch.reqs)
+                or not isinstance(extend_seq_lens, list)
+                or sum(extend_seq_lens[:num_prefill_reqs]) != num_prefill_tokens
+                or any(length != 1 for length in extend_seq_lens[num_prefill_reqs:])
+                or sum(extend_seq_lens) != batch.input_ids.numel()
+            ):
+                raise ValueError(
+                    "Invalid decoupled prefill-prefix/decode-suffix layout"
+                )
+        gpu_only_seq_lens = bool(
+            batch.defer_decode_kv_binding or num_prefill_reqs is not None
+        )
         seq_lens_cpu = None if gpu_only_seq_lens else batch.seq_lens_cpu
         seq_lens_sum = None if gpu_only_seq_lens else batch.seq_lens_sum
 
@@ -803,6 +823,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
+            decoupled_draft_num_prefill_reqs=num_prefill_reqs,
+            decoupled_draft_num_prefill_tokens=num_prefill_tokens,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
@@ -922,10 +944,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = torch.tensor(
                     extend_seq_lens, dtype=torch.int32
                 ).to(device, non_blocking=True)
-                ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32
-                ).to(device, non_blocking=True)
-                ret.extend_prefix_lens_cpu = extend_prefix_lens
+                if num_prefill_reqs is not None:
+                    # Decode positions may have been rewound by a verifier commit
+                    # after scheduling. Only query lengths remain CPU-authoritative.
+                    ret.extend_prefix_lens = (ret.seq_lens - ret.extend_seq_lens).to(
+                        torch.int32
+                    )
+                else:
+                    ret.extend_prefix_lens = torch.tensor(
+                        extend_prefix_lens, dtype=torch.int32
+                    ).to(device, non_blocking=True)
+                    ret.extend_prefix_lens_cpu = extend_prefix_lens
                 ret.extend_seq_lens_cpu = extend_seq_lens
             else:
                 # gpu_only: device tensors handed in directly; leave *_cpu unset.
@@ -960,13 +989,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     model_runner, batch, seq_positions=ret.positions
                 )
             elif gpu_only_seq_lens:
-                # The decoupled drafter reconciles seq_lens on GPU immediately
-                # before this ForwardBatch is built. Derive MRoPE from those
-                # device positions without restoring a host sequence-length
-                # shadow on the decode critical path.
-                ret.compute_spec_mrope_positions(
-                    model_runner, batch, seq_positions=ret.positions
-                )
+                # The decoupled drafter reconciles seq_lens on GPU right before
+                # this, and its mirrors are token-only: text MRoPE repeats the
+                # device positions on all three axes (graph replay copies it).
+                ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
@@ -1133,13 +1159,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            # Text-only MRoPE has zero delta on all three axes. Keep this as a
-            # broadcast view of the GPU-authoritative positions; the graph
-            # input registry copies the view into its contiguous static buffer.
-            # Materializing zeros + add + repeat here adds three tiny launches
-            # to every decode replay and is especially visible on a TP1 drafter.
-            self.mrope_positions = seq_positions.flatten().unsqueeze(0).expand(3, -1)
-            return
+            mrope_delta_tensor = torch.zeros(
+                (batch_size, 1), dtype=torch.int64, device=device
+            )
         else:
             mrope_deltas = [
                 (
@@ -1494,14 +1516,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_seqlens is not None:
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
-            )
-        if self.mamba_cache_src_indices is not None:
-            self.mamba_cache_src_indices = self._pad_tensor_to_size(
-                self.mamba_cache_src_indices, bs, value=-1
-            )
-        if self.mamba_cache_dst_indices is not None:
-            self.mamba_cache_dst_indices = self._pad_tensor_to_size(
-                self.mamba_cache_dst_indices, bs, value=-1
             )
 
         if self.mrope_positions is not None:
