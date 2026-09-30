@@ -2789,11 +2789,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             meta_info["spec_accept_length"] = (
                 recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
             )
-            meta_info["spec_draft_occupancy_rate"] = (
-                num_proposed_drafts / nominal_proposed_drafts
-                if nominal_proposed_drafts > 0
-                else None
-            )
             meta_info["spec_num_correct_drafts"] = num_correct_drafts
             meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
             meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
@@ -2836,7 +2831,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         f"by_position={correct_by_position} "
                         f"total={num_correct_drafts}"
                     )
-                meta_info["spec_proposed_drafts_histogram"] = proposed_histogram
                 meta_info["spec_num_proposed_drafts_by_position"] = proposed_by_position
                 meta_info["spec_num_correct_drafts_by_position"] = correct_by_position
                 meta_info["spec_accept_rate_by_position"] = [

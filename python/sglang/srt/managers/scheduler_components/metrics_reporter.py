@@ -401,12 +401,7 @@ class SchedulerMetricsReporter:
         """Freeze one CPU-only decode window for load-snapshot consumers."""
         if elapsed_s <= 0 or num_decode_iters <= 0:
             return
-        scheduler = getattr(self, "scheduler", None)
-        manager = (
-            None
-            if scheduler is None
-            else getattr(scheduler, "decoupled_spec_manager", None)
-        )
+        manager = self.scheduler.decoupled_spec_manager
         self.decode_metrics_window_id += 1
         window = DecodeMetricsWindow(
             window_id=self.decode_metrics_window_id,
@@ -434,7 +429,7 @@ class SchedulerMetricsReporter:
         if manager is None:
             self.decode_metrics_windows.append(window)
             return
-        if getattr(self, "_pending_decoupled_decode_metrics_window", None) is not None:
+        if self._pending_decoupled_decode_metrics_window is not None:
             raise RuntimeError(
                 "A decoupled-spec decode metrics window crossed two boundaries "
                 "without result finalization."
@@ -446,14 +441,10 @@ class SchedulerMetricsReporter:
     def finish_decoupled_decode_metrics_window(self) -> None:
         """Finalize a pending window after the standard result-copy barrier."""
 
-        window = getattr(self, "_pending_decoupled_decode_metrics_window", None)
+        window = self._pending_decoupled_decode_metrics_window
         if window is None:
             return
-        manager = getattr(self.scheduler, "decoupled_spec_manager", None)
-        if manager is None:
-            raise RuntimeError(
-                "A pending decoupled-spec metrics window lost its manager."
-            )
+        manager = self.scheduler.decoupled_spec_manager
         decoupled_spec = manager.take_decode_metrics_window()
         tail_select = None if decoupled_spec is None else decoupled_spec.tail_select
         if (
@@ -637,12 +628,7 @@ class SchedulerMetricsReporter:
         self.spec_num_cap_tokens = 0
         self.decode_window_num_rows = 0
         self.decode_window_sum_context_lens = 0
-        scheduler = getattr(self, "scheduler", None)
-        manager = (
-            None
-            if scheduler is None
-            else getattr(scheduler, "decoupled_spec_manager", None)
-        )
+        manager = self.scheduler.decoupled_spec_manager
         if manager is not None:
             # A cache flush starts a new formal measurement interval. Discard
             # the partial native exchange window so it cannot leak across it.

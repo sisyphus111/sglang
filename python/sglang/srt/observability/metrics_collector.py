@@ -427,18 +427,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.spec_draft_occupancy_rate = Gauge(
-            name="sglang:spec_draft_occupancy_rate",
-            documentation="Actual proposed drafts divided by the configured fixed-K proposal capacity.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.spec_proposed_draft_length = Gauge(
-            name="sglang:spec_proposed_draft_length",
-            documentation="Mean number of actual draft tokens presented per verify request-row.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.spec_cap_length = Gauge(
             name="sglang:spec_cap_length",
             documentation="Mean DSpark confidence-scheduled verify window per verify step, incl the bonus slot (0 when no cap is scheduled).",
@@ -1327,10 +1315,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
-        self._log_gauge(self.spec_draft_occupancy_rate, stats.spec_draft_occupancy_rate)
-        self._log_gauge(
-            self.spec_proposed_draft_length, stats.spec_proposed_draft_length
-        )
         self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
         self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)

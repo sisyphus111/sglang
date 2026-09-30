@@ -2,18 +2,20 @@
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
-from sglang.srt.managers.load_snapshot import DecoupledSpecDecodeMetrics  # noqa: E402
+from sglang.srt.managers.load_snapshot import (  # noqa: E402
+    DecoupledSpecDecodeMetrics,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (  # noqa: E402
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -44,8 +46,55 @@ def _output(*, proposed=..., correct: int = 1):
 
 
 class TestSpeculativeResponseMetrics(CustomTestCase):
+    def test_load_snapshot_accepts_real_scheduler_stats(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.managers.scheduler_components.load_inquirer import (
+            SchedulerLoadInquirer,
+        )
+        from sglang.srt.observability.metrics_collector import SchedulerStats
+
+        # Exercise the HTTP snapshot producer with the real stats schema. A
+        # permissive mock would hide fields removed along with Prometheus gauges.
+        pools = MagicMock()
+        pools.get_pool_stats.return_value.get_kv_token_stats.return_value = (0, 0.0)
+        inquirer = SchedulerLoadInquirer(
+            disaggregation_mode=DisaggregationMode.NULL,
+            ps=SimpleNamespace(dp_rank=0),
+            server_args=SimpleNamespace(),
+            max_total_num_tokens=1024,
+            max_running_requests=8,
+            pool_stats_observer=pools,
+            tp_worker=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_waiting_queue=list,
+            get_stats=SchedulerStats,
+            get_chunked_req=lambda: None,
+            get_disagg_prefill_bootstrap_queue=lambda: None,
+            get_disagg_prefill_inflight_queue=list,
+            get_disagg_decode_prealloc_queue=lambda: None,
+            get_disagg_decode_transfer_queue=lambda: None,
+            get_spec_total_num_accept_tokens=lambda: 80,
+            get_spec_total_num_forward_ct=lambda: 40,
+            get_total_prefill_uncached_tokens=lambda: 0,
+            get_total_prefill_busy_us=lambda: 0,
+            get_decode_moment_totals=lambda: (0,),
+            get_decode_metrics_windows=list,
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.load_inquirer.get_lora",
+            return_value=SimpleNamespace(enable_lora=False),
+        ):
+            snapshot = inquirer.get_loads()
+        self.assertEqual(snapshot.speculative.accept_length, 2.0)
+        self.assertEqual(snapshot.speculative.draft_occupancy_rate, 0.0)
+        self.assertEqual(snapshot.speculative.proposed_draft_length, 0.0)
+
     def test_decode_metrics_window_uses_fixed_iteration_denominators(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.decode_metrics_window_id = 4
         reporter.decode_metrics_windows = deque(maxlen=64)
 
@@ -71,6 +120,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
     def test_decode_window_drains_decoupled_metrics_once(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.decode_metrics_window_id = 0
         reporter.decode_metrics_windows = deque(maxlen=64)
         manager = MagicMock()
@@ -97,6 +148,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
     def test_metrics_reset_discards_partial_decoupled_window(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         manager = MagicMock()
         reporter.scheduler = SimpleNamespace(decoupled_spec_manager=manager)
         reporter.forward_ct_decode = 1
@@ -119,6 +172,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
     def test_decoupled_window_rejects_selector_row_misalignment(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.decode_metrics_window_id = 0
         reporter.decode_metrics_windows = deque(maxlen=64)
         manager = MagicMock()
@@ -153,6 +208,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
                 return value
 
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.decode_metrics_window_id = 0
         reporter.decode_metrics_windows = deque(maxlen=64)
         manager = VerifierManager()
@@ -186,6 +243,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
     def test_non_spec_decode_window_has_no_speculative_ratios(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.decode_metrics_window_id = 0
         reporter.decode_metrics_windows = deque(maxlen=64)
 
@@ -205,6 +264,8 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
     def test_service_reporter_keeps_actual_and_nominal_denominators(self):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(decoupled_spec_manager=None)
+        reporter._pending_decoupled_decode_metrics_window = None
         reporter.spec_num_accept_tokens = 0
         reporter.spec_num_forward_ct = 0
         reporter.spec_proposed_drafts_ct = 0
@@ -234,12 +295,10 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
         self.assertEqual(meta_info["spec_num_correct_drafts"], 1)
         self.assertEqual(meta_info["spec_accept_rate"], 0.5)
         self.assertEqual(meta_info["spec_accept_length"], 2.0)
-        self.assertAlmostEqual(meta_info["spec_draft_occupancy_rate"], 1 / 3)
         self.assertEqual(meta_info["spec_proposed_draft_length"], 1.0)
         self.assertEqual(meta_info["spec_num_proposed_drafts_by_position"], [2, 0, 0])
         self.assertEqual(meta_info["spec_num_correct_drafts_by_position"], [1, 0, 0])
         self.assertEqual(meta_info["spec_accept_rate_by_position"], [0.5, None, None])
-        self.assertEqual(meta_info["spec_proposed_drafts_histogram"], [0, 2])
 
     def test_other_spec_falls_back_to_fixed_k(self):
         meta_info = {}
@@ -248,7 +307,6 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
         self.assertEqual(meta_info["spec_num_proposed_drafts"], 6)
         self.assertAlmostEqual(meta_info["spec_accept_rate"], 1 / 6)
-        self.assertEqual(meta_info["spec_draft_occupancy_rate"], 1.0)
 
     def test_zero_actual_proposals_are_reported_without_fake_acceptance(self):
         meta_info = {}
@@ -259,4 +317,3 @@ class TestSpeculativeResponseMetrics(CustomTestCase):
 
         self.assertEqual(meta_info["spec_num_proposed_drafts"], 0)
         self.assertIsNone(meta_info["spec_accept_rate"])
-        self.assertEqual(meta_info["spec_draft_occupancy_rate"], 0.0)
