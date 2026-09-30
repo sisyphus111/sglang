@@ -46,19 +46,26 @@ to exactly that allocation.
 ## Pair invariants
 
 The verifier uses `speculative_algorithm=DECOUPLED_VERIFY`; the drafter is a
-plain decode engine whose algorithm is unset. The drafter may use the legacy
-non-overlap scheduler or the GPU-authoritative overlap path. The role templates
+plain decode engine whose algorithm is unset. Both roles keep decoupled state
+on GPU with either overlap or non-overlap scheduling. The role templates
 must agree on:
 
 - `speculative_num_steps` (K)
 - `speculative_eagle_topk` (currently F=1)
 - `speculative_num_draft_tokens` (K+1 for F=1)
 
-The current drafter additionally requires TP1 and `page_size=1`. Drafter
-overlap requires the shared GPU backend, `disable_radix_cache=true`, mixed
-chunked prefill disabled, and ReplaySSM disabled. Dense attention drafts restore
+The current drafter additionally requires TP1, `page_size=1`, the shared GPU
+backend, and ReplaySSM disabled. Dense attention drafts restore
 the committed prefix through KV positions; Mamba/GDN drafts additionally require
 a routable recurrent-state checkpoint pool. Both roles require DP1 and PP1.
+
+Drafter radix caching can reuse stable prefill prefixes; rollbackable decode
+suffixes are not inserted. Size the Mamba pool for both the checkpoint ring and
+the selected cache strategy. The upstream `no_buffer` strategy still requires
+non-overlap scheduling. Mixed prefill/decode requires FA3/FA4 and, for GDN,
+the Triton decode backend. MIXED batches run eagerly; ordinary decode can still
+use CUDA Graph. Validate these optional paths with the actual model and workload
+before using them in a performance comparison.
 
 `SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND` selects native C++ threads/libzmq
 (`1`) or Python threads/pyzmq (`0`). Both use the same native GPU backend and

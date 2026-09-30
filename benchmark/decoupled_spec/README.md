@@ -157,9 +157,18 @@ drafter:
   codec 和 native GPU backend，允许 Python/C++ peer 混合部署；Python transport 仍需要
   编译 GPU extension。
 - **Verifier/drafter overlap**：两个 role 分别设置 `disable_overlap_schedule`。两边都为
-  `false` 即 dual overlap，也可以只开启一侧。当前 drafter overlap 要求 TP1、
-  `page_size=1`、shared GPU backend、`disable_radix_cache=true`，并且不能启用 mixed
-  chunked prefill 或 ReplaySSM。
+  `false` 即 dual overlap，也可以只开启一侧。Drafter 两种调度方式共用 GPU 状态机，
+  都要求 TP1、`page_size=1`、shared GPU backend，并关闭 ReplaySSM。
+- **Drafter radix cache**：可以复用和发布稳定的 prefill prefix；decode 的可回滚
+  speculative suffix 不写入 radix cache。GDN prefill 沿用官方 COW 和状态 tracking，
+  decode checkpoint ring 借用其 active slot，decode graph 不捕获普通 radix tracking。
+  `no_buffer` 仍遵循上游的禁用 overlap
+  限制；Mamba pool 的最小容量由 runtime 根据 K、并发数和 cache strategy 校验。
+- **Drafter mixed prefill/decode**：`enable_mixed_chunk=true` 的接入当前限于 FA3/FA4；
+  GDN 模型还要求 Triton decode backend。MIXED batch 使用 eager 路径，普通 decode
+  仍可使用 CUDA Graph。Qwen3.5 GDN 的 FA3 + Triton、`extra_buffer` 配置已通过
+  mixed、radix、mixed+radix 的真实模型回归（dual overlap，bs8，每条输出 4096 tokens），
+  包括重复请求的 prefix cache 命中。FA4 和 `no_buffer` 尚未纳入这轮 GPU 回归。
 
 Verifier 和 drafter 必须使用相同的 K、top-k 和 K+1 verify-token width。Adaptive 模式下，
 YAML 中的 K 是最大捕获宽度，运行时 active K 只能从已配置且已 profile 的候选值中选择。

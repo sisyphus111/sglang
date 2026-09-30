@@ -48,7 +48,7 @@ from plot_observability import (
 from plot_speculative import render_speculative
 from plot_utils import upper_iqr_outlier_threshold
 from client.request_loader import _codeforces_messages, load_requests
-from config import load_yaml, validate_role_pair
+from server.orchestrator import load_config, validate_config
 from run_io import require_run_dir, update_run_config, update_status
 
 
@@ -1068,63 +1068,40 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
             "qwen35_27b_tp4_0_8b_tp1_k3_overlap_cpp_replayssm_bs64.yaml",
         ):
             with self.subTest(name=name):
-                config = load_yaml(_ROOT / "configs" / "server" / name)
+                config = load_config(_ROOT / "configs" / "server" / name)
                 for role in ("verifier", "drafter"):
                     self.assertNotIn(
                         "SGLANG_DECOUPLED_SPEC_SNAPSHOT_WAIT_MS",
-                        config[role]["runtime"]["env"],
+                        getattr(config, role).runtime.env,
                     )
 
     def test_role_pair_supports_both_drafter_schedule_modes(self):
-        verifier = {
-            "runtime": {
-                "cuda_visible_devices": ["0", "1", "2", "3"],
-                "env": {"SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND": "1"},
-            },
-            "server_args": {
-                "speculative_algorithm": "DECOUPLED_VERIFY",
-                "speculative_num_steps": 3,
-                "speculative_eagle_topk": 1,
-                "speculative_num_draft_tokens": 4,
-                "decoupled_spec_bind_endpoint": "tcp://127.0.0.1:31100",
-                "decoupled_spec_connect_endpoints": ["tcp://127.0.0.1:31101"],
-            },
-        }
-        drafter = {
-            "runtime": {
-                "cuda_visible_devices": ["4"],
-                "env": {"SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND": "true"},
-            },
-            "server_args": {
-                "speculative_algorithm": None,
-                "speculative_num_steps": 3,
-                "speculative_eagle_topk": 1,
-                "speculative_num_draft_tokens": 4,
-                "disable_overlap_schedule": True,
-                "disable_radix_cache": True,
-                "decoupled_spec_bind_endpoint": "tcp://127.0.0.1:31101",
-                "decoupled_spec_connect_endpoints": ["tcp://127.0.0.1:31100"],
-            },
-        }
-
+        config = load_config(
+            _ROOT
+            / "configs/server/qwen35_27b_tp4_0_8b_tp1_k3_nonoverlap_cpp_replayssm_bs64_out4k.yaml"
+        )
         for disable_overlap_schedule in (True, False):
-            with self.subTest(disable_overlap_schedule=disable_overlap_schedule):
-                candidate = copy.deepcopy(drafter)
-                candidate["server_args"]["disable_overlap_schedule"] = (
-                    disable_overlap_schedule
-                )
-                validate_role_pair(verifier, candidate)
+            for disable_radix_cache in (True, False):
+                with self.subTest(
+                    disable_overlap_schedule=disable_overlap_schedule,
+                    disable_radix_cache=disable_radix_cache,
+                ):
+                    candidate = copy.deepcopy(config)
+                    candidate.drafter.server_args.update(
+                        disable_overlap_schedule=disable_overlap_schedule,
+                        disable_radix_cache=disable_radix_cache,
+                    )
+                    validate_config(candidate)
 
-        mixed_backend = copy.deepcopy(drafter)
-        mixed_backend["runtime"]["env"]["SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND"] = "0"
-        validate_role_pair(verifier, mixed_backend)
+        mixed_backend = copy.deepcopy(config)
+        mixed_backend.drafter.runtime.env["SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND"] = "0"
+        validate_config(mixed_backend)
 
-        verifier_topk_two = copy.deepcopy(verifier)
-        drafter_topk_two = copy.deepcopy(drafter)
-        verifier_topk_two["server_args"]["speculative_eagle_topk"] = 2
-        drafter_topk_two["server_args"]["speculative_eagle_topk"] = 2
-        with self.assertRaisesRegex(ValueError, "requires F=1"):
-            validate_role_pair(verifier_topk_two, drafter_topk_two)
+        topk_two = copy.deepcopy(config)
+        topk_two.verifier.server_args["speculative_eagle_topk"] = 2
+        topk_two.drafter.server_args["speculative_eagle_topk"] = 2
+        with self.assertRaisesRegex(ValueError, "requires topk=1"):
+            validate_config(topk_two)
 
     def test_named_cli_overrides_preserve_unspecified_yaml_values(self):
         parser = argparse.ArgumentParser()

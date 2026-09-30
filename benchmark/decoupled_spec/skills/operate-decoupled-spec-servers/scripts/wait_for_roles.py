@@ -40,8 +40,10 @@ def _http_ready(base_url: str, role: str, timeout_s: float) -> tuple[bool, str |
     # generic generation-based health probe. /model_info proves that its HTTP
     # process is serving after the launcher has recorded http_ready.
     path = "/model_info" if role == "drafter" else "/health"
+    # Engine URLs are cluster-local; never route probes through *_proxy.
+    direct_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(  # noqa: S310 - URL comes from saved local config.
+        with direct_http.open(
             base_url.rstrip("/") + path, timeout=timeout_s
         ) as response:
             status = int(response.status)

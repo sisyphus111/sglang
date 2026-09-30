@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from itertools import product
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -178,12 +179,27 @@ class TestUnifiedServerConfig(CustomTestCase):
             )
 
     def test_drafter_supports_both_schedule_modes(self):
-        for disable_overlap_schedule in (True, False):
-            with self.subTest(disable_overlap_schedule=disable_overlap_schedule):
+        for (
+            disable_overlap_schedule,
+            disable_radix_cache,
+            enable_mixed_chunk,
+        ) in product((True, False), repeat=3):
+            with self.subTest(
+                disable_overlap_schedule=disable_overlap_schedule,
+                disable_radix_cache=disable_radix_cache,
+                enable_mixed_chunk=enable_mixed_chunk,
+            ):
                 config_text = _minimal_config().replace(
+                    "    disable_radix_cache: true\n"
                     "    disable_overlap_schedule: true\n",
+                    "    disable_radix_cache: "
+                    f"{str(disable_radix_cache).lower()}\n"
                     "    disable_overlap_schedule: "
-                    f"{str(disable_overlap_schedule).lower()}\n",
+                    f"{str(disable_overlap_schedule).lower()}\n"
+                    "    enable_mixed_chunk: "
+                    f"{str(enable_mixed_chunk).lower()}\n"
+                    "    attention_backend: fa3\n"
+                    "    mamba_radix_cache_strategy: extra_buffer\n",
                 )
                 with tempfile.TemporaryDirectory() as directory:
                     path = Path(directory) / "server.yaml"
@@ -193,6 +209,14 @@ class TestUnifiedServerConfig(CustomTestCase):
                 self.assertEqual(
                     config.drafter.server_args["disable_overlap_schedule"],
                     disable_overlap_schedule,
+                )
+                self.assertEqual(
+                    config.drafter.server_args["disable_radix_cache"],
+                    disable_radix_cache,
+                )
+                self.assertEqual(
+                    config.drafter.server_args["enable_mixed_chunk"],
+                    enable_mixed_chunk,
                 )
 
     def test_drafter_overlap_keeps_phase_one_guards(self):

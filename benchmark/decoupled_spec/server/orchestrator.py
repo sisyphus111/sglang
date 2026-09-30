@@ -7,8 +7,8 @@ import hashlib
 import ipaddress
 import json
 import os
-import signal
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -51,6 +51,8 @@ _DYNAMIC_SERVER_ARGS = {
 }
 _CPP_DATA_PLANE_ENV = "SGLANG_DECOUPLED_SPEC_USE_CPP_PYBIND"
 _VERIFY_PROFILE_ENV = "SGLANG_DECOUPLED_VERIFY_THROUGHPUT_PROFILE_PATH"
+# Readiness probes target node-local engines and must ignore *_proxy settings.
+_DIRECT_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class RaySettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -162,14 +164,6 @@ def _validate_role(role: str, settings: RoleSettings) -> dict[str, Any]:
             raise ValueError("the current decoupled drafter requires tp_size=1")
         if int(args.get("page_size", 1)) != 1:
             raise ValueError("the current decoupled drafter requires page_size=1")
-        if (
-            not args.get("disable_overlap_schedule", False)
-            and not args.get("disable_radix_cache", False)
-        ):
-            raise ValueError(
-                "drafter overlap requires disable_radix_cache=true for "
-                "GPU-owned recurrent-state checkpoints"
-            )
     else:
         algorithm = args.get("speculative_algorithm")
         if algorithm is None:
@@ -607,14 +601,11 @@ class EngineActor:
             self.allocation()
         self._requires_transport = include_transport
         port_names = (
-            ("http", "transport", "nccl")
-            if include_transport
-            else ("http", "nccl")
+            ("http", "transport", "nccl") if include_transport else ("http", "nccl")
         )
         try:
             self._leases = {
-                name: _reserve_tcp_socket(self.node_ip)
-                for name in port_names
+                name: _reserve_tcp_socket(self.node_ip) for name in port_names
             }
         except BaseException:
             self._release_port_leases()
@@ -829,7 +820,7 @@ class EngineActor:
         if status.get("state") != "http_ready":
             return None
         try:
-            with urllib.request.urlopen(
+            with _DIRECT_HTTP.open(
                 str(status["http_url"]).rstrip("/") + endpoint_path,
                 timeout=1.0,
             ) as response:
@@ -1125,6 +1116,11 @@ class RayServerOrchestrator:
             )
         ).resolve()
         benchmark_package_root = Path(__file__).resolve().parents[1]
+        # ray.init replaces SIGINT/SIGTERM handlers (Python and native). Keep
+        # the launcher's handlers so a stop request still shuts down the fleet.
+        stop_handlers = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)
+        }
         ray.init(
             address=self.ray_address,
             namespace=self.ray_namespace,
@@ -1157,6 +1153,8 @@ class RayServerOrchestrator:
                 },
             },
         )
+        for sig, handler in stop_handlers.items():
+            signal.signal(sig, handler)
         return ray
 
     def _get_refs(
@@ -1338,9 +1336,7 @@ class RayServerOrchestrator:
                     )
 
             if self.config.drafter is not None:
-                draft_tp_size = int(
-                    self.config.drafter.server_args.get("tp_size", 1)
-                )
+                draft_tp_size = int(self.config.drafter.server_args.get("tp_size", 1))
                 for drafter_rank, node_id in enumerate(
                     self.placement_plan.drafter_node_ids
                 ):
