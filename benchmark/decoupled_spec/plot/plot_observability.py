@@ -15,14 +15,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_io import require_run_dir
 from plot_utils import (
     COLORS,
     UPPER_IQR_OUTLIER_POLICY,
     save_figure,
+    select_formal_decode_windows,
     style_axis,
     upper_iqr_outlier_threshold,
 )
+from run_io import require_run_dir
 
 ROLE_COLORS = {"verifier": COLORS[0], "drafter": COLORS[1]}
 ROLE_COLOR_INDICES = {
@@ -172,6 +173,19 @@ def _extract_transport_mean_points(
     finished_wall_time: float | None,
 ) -> list[dict[str, Any]]:
     """Aggregate windows first observed at each poll using their exact sums."""
+    retained_keys = None
+    if finished_wall_time is not None:
+        retained, _ = select_formal_decode_windows(
+            _extract_decode_metric_rows(
+                [sample for sample in samples if sample.get("error") is None],
+                started_wall_time,
+            ),
+            started_wall_time,
+            finished_wall_time,
+        )
+        retained_keys = {
+            (row["target_id"], row["dp_rank"], row["window_id"]) for row in retained
+        }
     dp_ranks_by_target: dict[str, set[int]] = {}
     ordered_samples = []
     for source_index, sample in enumerate(samples):
@@ -225,10 +239,11 @@ def _extract_transport_mean_points(
                         raise ValueError(f"conflicting decode metrics window: {key}")
                     continue
                 seen_windows[key] = window
+                if retained_keys is not None and key not in retained_keys:
+                    continue
                 end_time = float(window["end_time"])
                 if end_time < started_wall_time or (
-                    finished_wall_time is not None
-                    and end_time > finished_wall_time
+                    finished_wall_time is not None and end_time > finished_wall_time
                 ):
                     continue
                 decoupled_spec = window.get("decoupled_spec")
@@ -241,9 +256,7 @@ def _extract_transport_mean_points(
                     continue
                 has_new_transport_window = True
                 for field, _ in _TRANSPORT_PANELS:
-                    histogram_totals = _latency_histogram_totals(
-                        transport.get(field)
-                    )
+                    histogram_totals = _latency_histogram_totals(transport.get(field))
                     if histogram_totals is None:
                         continue
                     count, sum_us = histogram_totals
@@ -251,8 +264,7 @@ def _extract_transport_mean_points(
                     totals[field][1] += sum_us
 
             inside_sampling_window = collected_wall_time >= started_wall_time and (
-                finished_wall_time is None
-                or collected_wall_time <= finished_wall_time
+                finished_wall_time is None or collected_wall_time <= finished_wall_time
             )
             # A trailing poll can be the first observation of the last engine
             # windows completed before the formal request finished.
@@ -336,6 +348,13 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
         else None
     )
     decode_metric_rows = _extract_decode_metric_rows(samples, origin)
+    boundary_exclusions = []
+    if formal_window and formal_window.get("client_finished_wall_time") is not None:
+        decode_metric_rows, boundary_exclusions = select_formal_decode_windows(
+            decode_metric_rows,
+            formal_window["client_started_wall_time"],
+            formal_window["client_finished_wall_time"],
+        )
 
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 6.4), sharex=True)
     ax_requests, ax_throughput, ax_usage, ax_spec = axes.flat
@@ -564,7 +583,7 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
         for axis, title, ylabel in (
             (ax_iter, iteration_title, "iteration latency (ms)"),
             (ax_batch, "Mean batch size", "requests / iteration"),
-            (ax_context, "Mean context length", "tokens / request"),
+            (ax_context, "Mean context length (CPU view)", "tokens / request"),
             (
                 ax_valid_draft,
                 "Valid draft length",
@@ -903,9 +922,7 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
             color = target_colors.get(target_id, ROLE_COLORS.get(role, COLORS[3]))
             times = [point["time_s"] for point in values]
             for field, _ in _TRANSPORT_PANELS:
-                mean_values = [
-                    point["transport_means"].get(field) for point in values
-                ]
+                mean_values = [point["transport_means"].get(field) for point in values]
                 if not any(value is not None for value in mean_values):
                     continue
                 axis = transport_axes[field]
@@ -1173,6 +1190,7 @@ def render_observability(run_dir: str | Path) -> dict[str, Any]:
     manifest["iteration_latency_outlier_policy"] = UPPER_IQR_OUTLIER_POLICY
     manifest["iteration_latency_outlier_count"] = len(iteration_latency_outliers)
     manifest["iteration_latency_outliers"] = iteration_latency_outliers
+    manifest["decode_boundary_exclusions"] = boundary_exclusions
     manifest["zero_based_axes"] = ["running_batch_size", "iteration_latency"]
     return manifest
 

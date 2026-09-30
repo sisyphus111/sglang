@@ -19,6 +19,7 @@ from plot_utils import (
     finite_float,
     load_csv,
     load_json,
+    select_formal_decode_windows,
     upper_iqr_outlier_threshold,
 )
 from run_io import require_run_dir
@@ -75,6 +76,7 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
     drafter = server.get("drafter", {})
     client = run_config.get("client", {})
     observability: dict[str, Any] = {}
+    boundary_exclusions = []
     samples_path = run_path / "observer" / "samples.jsonl"
     if samples_path.is_file():
         records = [
@@ -103,6 +105,28 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         )
         for record in records:
             _update_decode_metric_windows(record, windows, min_end_time)
+        timeline_path = run_path / "observer" / "bench_timeline.json"
+        if timeline_path.is_file():
+            timeline = load_json(timeline_path)
+            if timeline["client_finished_wall_time"] is not None:
+                retained, boundary_exclusions = select_formal_decode_windows(
+                    [
+                        {
+                            "target_id": entry["target_id"],
+                            "dp_rank": entry["dp_rank"],
+                            **entry["window"],
+                        }
+                        for entry in windows.values()
+                    ],
+                    timeline["client_started_wall_time"],
+                    timeline["client_finished_wall_time"],
+                )
+                windows = {
+                    (row["target_id"], row["dp_rank"], row["window_id"]): windows[
+                        (row["target_id"], row["dp_rank"], row["window_id"])
+                    ]
+                    for row in retained
+                }
         by_target, by_role = _summarize_decode_metric_windows(
             windows, list(targets_by_id.values())
         )
@@ -159,7 +183,10 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         decode_metric_lines = [
             "### Decode-window telemetry",
             "",
-            "| Engine | Windows | Iteration latency mean | p50 | p95 | Mean BS | Mean context | Valid draft len | Accept len |",
+            "CPU context length does not track the decoupled drafter's GPU "
+            "logical cursor; it can remain at the prefill prefix.",
+            "",
+            "| Engine | Windows | Iteration latency mean | p50 | p95 | Mean BS | Mean CPU context | Valid draft len | Accept len |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         ordered_metrics = sorted(
@@ -297,6 +324,25 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
                     )
                 )
             decoupled_metric_lines.append("")
+    boundary_lines: list[str] = []
+    if boundary_exclusions:
+        boundary_lines = [
+            "### Formal decode-window boundaries",
+            "",
+            "Telemetry uses only windows ending inside the Client interval. "
+            "The first window per engine/DP rank is excluded before all "
+            "aggregations and plotting because it can span warmup or idle time. "
+            "Raw observer data is unchanged.",
+            "",
+            "| Engine | DP rank | Excluded window ID | End wall time | Iteration latency (ms) |",
+            "| --- | ---: | ---: | ---: | ---: |",
+            *(
+                "| {target_id} | {dp_rank} | {window_id} | {end_time:.6f} | "
+                "{iter_latency_ms:.3f} |".format(**row)
+                for row in boundary_exclusions
+            ),
+            "",
+        ]
     iteration_outlier_lines: list[str] = []
     if iteration_latency_outliers:
         iteration_outlier_lines = [
@@ -311,9 +357,7 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
             "| --- | ---: | ---: | ---: | ---: | ---: |",
             *(
                 "| {target_id} | {dp_rank} | {threshold_ms:.3f} | "
-                "{window_id} | {time_s:.3f} | {iter_latency_ms:.3f} |".format(
-                    **item
-                )
+                "{window_id} | {time_s:.3f} | {iter_latency_ms:.3f} |".format(**item)
                 for item in iteration_latency_outliers
             ),
             "",
@@ -365,6 +409,7 @@ def generate_report(run_dir: str | Path) -> dict[str, Any]:
         f"| Mean accept length | {_format(batch.get('acclen'))} tokens/verify |",
         "",
         *decode_metric_lines,
+        *boundary_lines,
         *iteration_outlier_lines,
         *decoupled_metric_lines,
         "### Request-level metrics",

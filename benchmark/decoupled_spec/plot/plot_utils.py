@@ -44,6 +44,31 @@ def finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def select_formal_decode_windows(
+    windows: list[dict[str, Any]], started: float, finished: float
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select deduplicated request windows and record each uncertain boundary.
+
+    A window records only its end time. The earliest in-request window per
+    target/DP rank may include warmup or idle time, so none of its counters can
+    be attributed to this request. Do not restore it for a short request.
+    """
+    candidates = sorted(
+        (row for row in windows if started <= row["end_time"] <= finished),
+        key=lambda row: (row["end_time"], row["window_id"]),
+    )
+    seen = set()
+    retained, excluded = [], []
+    for row in candidates:
+        group = (row["target_id"], row["dp_rank"])
+        if group in seen:
+            retained.append(row)
+        else:
+            seen.add(group)
+            excluded.append(row)
+    return retained, excluded
+
+
 def upper_iqr_outlier_threshold(
     values: list[Any], *, minimum_count: int = 8
 ) -> float | None:
@@ -53,9 +78,7 @@ def upper_iqr_outlier_threshold(
     ]
     if len(finite_values) < minimum_count:
         return None
-    q1, _, q3 = statistics.quantiles(
-        finite_values, n=4, method="inclusive"
-    )
+    q1, _, q3 = statistics.quantiles(finite_values, n=4, method="inclusive")
     return q3 + 3 * (q3 - q1)
 
 

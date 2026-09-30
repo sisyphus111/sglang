@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aiohttp import web
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,9 +30,6 @@ from client.client import (
     build_batch_payload,
     run_batch,
 )
-from client.observer import _summarize_decode_metric_windows
-from client.observer import collect as collect_observability
-from generate_report import generate_report
 from client.metrics import (
     BATCH_JSON_FIELDS,
     CONTENT_JSON_FIELDS,
@@ -39,6 +37,10 @@ from client.metrics import (
     build_result_artifacts,
     write_result_artifacts,
 )
+from client.observer import _summarize_decode_metric_windows
+from client.observer import collect as collect_observability
+from client.request_loader import _codeforces_messages, load_requests
+from generate_report import generate_report
 from plot_latency import render_latency
 from plot_observability import (
     _extract_transport_mean_points,
@@ -47,9 +49,8 @@ from plot_observability import (
 )
 from plot_speculative import render_speculative
 from plot_utils import upper_iqr_outlier_threshold
-from client.request_loader import _codeforces_messages, load_requests
-from server.orchestrator import load_config, validate_config
 from run_io import require_run_dir, update_run_config, update_status
+from server.orchestrator import load_config, validate_config
 
 
 def _integer_histogram(offset, counts):
@@ -129,9 +130,7 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
             "python",
         )
 
-        self.assertEqual(
-            [message["role"] for message in messages], ["system", "user"]
-        )
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
         self.assertIn("Time limit: 1 seconds", messages[1]["content"])
         self.assertIn("Input:\n1 2", messages[1]["content"])
         self.assertTrue(messages[1]["content"].endswith("Markdown fences."))
@@ -488,10 +487,10 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
         self.assertEqual([point["time_s"] for point in points], [0.5, 1.5, 2.5, 3.5])
         self.assertEqual(
             [point["transport_means"][field] for point in points],
-            [10.0, 35.0, None, None],
+            [None, 35.0, None, None],
         )
         self.assertEqual(
-            [point["transport_counts"][field] for point in points], [2, 4, 0, 0]
+            [point["transport_counts"][field] for point in points], [0, 4, 0, 0]
         )
 
     def test_iteration_latency_presentation_outlier_threshold(self):
@@ -562,9 +561,9 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
                 windows = [
                     {
                         "window_id": index,
-                        "end_time": 100.0 + index,
+                        "end_time": 100.5 + index,
                         "num_decode_iters": 1,
-                        "iter_latency_ms": latency,
+                        "iter_latency_ms": 1000.0 if index == 0 else latency,
                         "num_decode_rows": 8,
                         "sum_context_lens": 8000,
                         "num_verify_rows": 8 if role == "verifier" else 0,
@@ -607,8 +606,10 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
             generate_report(run_dir)
 
             report = (run_dir / "plots" / "run_report.md").read_text(encoding="utf-8")
-            self.assertIn("| verifier | 3 | 10.000 ms", report)
-            self.assertIn("| drafter | 4 | 7.000 ms", report)
+            self.assertIn("| verifier | 2 | 10.000 ms", report)
+            self.assertIn("| drafter | 2 | 7.000 ms", report)
+            self.assertIn("### Formal decode-window boundaries", report)
+            self.assertIn("| verifier | 0 | 0 | 100.500000 | 1000.000 |", report)
             self.assertIn("decoupled_spec_metrics.png", report)
             self.assertEqual(
                 {path.name for path in run_dir.iterdir()},
@@ -748,7 +749,9 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
             finally:
                 await runner.cleanup()
 
-            self.assertGreaterEqual(summary["sample_ct"], 2)
+            # One poll covers both roles; wall-clock duration does not guarantee
+            # a second poll when the test host is busy.
+            self.assertGreaterEqual(summary["sample_ct"], 1)
             self.assertTrue(samples)
             self.assertEqual(set(summary["decode_metrics"]), {"verifier", "drafter"})
             for role in ("verifier", "drafter"):
@@ -780,15 +783,11 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
                         1,
                     )
                     self.assertEqual(
-                        metrics["decoupled_spec"]["tail_select"][
-                            "num_seqlock_retries"
-                        ],
+                        metrics["decoupled_spec"]["tail_select"]["num_seqlock_retries"],
                         3,
                     )
                     self.assertEqual(
-                        metrics["decoupled_spec"]["tail_select"][
-                            "max_seqlock_retries"
-                        ],
+                        metrics["decoupled_spec"]["tail_select"]["max_seqlock_retries"],
                         3,
                     )
                     self.assertEqual(
@@ -1025,25 +1024,25 @@ class TestDecoupledSpecBenchmark(CustomTestCase):
 
             manifest = render_observability(run_dir)
 
-            self.assertEqual(manifest["decode_metrics_window_ct"], 4)
+            self.assertEqual(manifest["decode_metrics_window_ct"], 1)
             self.assertEqual(
                 manifest["decode_metrics_window_ct_by_role"],
-                {"drafter": 1, "verifier": 3},
+                {"verifier": 1},
             )
+            self.assertEqual(len(manifest["decode_boundary_exclusions"]), 3)
             self.assertEqual(len(manifest["outputs"]), 3)
-            self.assertEqual(manifest["decoupled_spec_metrics_window_ct"], 4)
+            self.assertEqual(manifest["decoupled_spec_metrics_window_ct"], 1)
             self.assertEqual(manifest["decoupled_spec_time_axis"], "Batch runtime (s)")
             self.assertEqual(manifest["selector_target_id"], "verifier")
-            self.assertEqual(manifest["selector_dp_rank"], 1)
+            self.assertEqual(manifest["selector_dp_rank"], 0)
             self.assertEqual(
                 manifest["selector_series"],
                 [
-                    {"target_id": "verifier", "dp_rank": 0, "num_select_rows": 8},
-                    {"target_id": "verifier", "dp_rank": 1, "num_select_rows": 12},
+                    {"target_id": "verifier", "dp_rank": 0, "num_select_rows": 4},
                 ],
             )
             self.assertEqual(manifest["transport_zero_count_policy"], "gap")
-            self.assertEqual(manifest["transport_observer_point_ct"], 4)
+            self.assertEqual(manifest["transport_observer_point_ct"], 1)
             self.assertEqual(
                 manifest["transport_latency_plot_policy"],
                 "per-observer-sample weighted exact mean over newly observed "

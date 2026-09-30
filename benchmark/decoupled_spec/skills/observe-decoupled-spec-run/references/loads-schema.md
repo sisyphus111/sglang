@@ -67,6 +67,13 @@ deduplicated windows. Iteration-latency means are weighted by each window's
 `num_decode_iters`; batch/context/spec ratios are recomputed from raw window
 numerators and denominators rather than averaging ratios.
 
+`sum_context_lens` and `mean_context_length` use the scheduler's CPU view to
+avoid synchronizing decode. A decoupled drafter keeps its advancing logical
+cursor only on GPU, so its CPU request length can remain at the prefill prefix.
+Do not interpret this drafter metric as the current GPU context length or use
+it to compare attention costs. Iteration latency and actual decode-row counts
+remain usable independently of this limitation.
+
 ## Decoupled-spec histogram contracts
 
 Every tail histogram has this exact integer-bin representation:
