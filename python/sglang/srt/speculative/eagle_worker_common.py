@@ -30,7 +30,6 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -561,12 +560,11 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    with operations_nvtx_range("sglang.speculative.target_verify_forward"):
-        forward_batch_output = target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-        )
+    forward_batch_output = target_worker.forward_batch_generation(
+        batch=None,
+        forward_batch=verify_forward_batch,
+        is_verify=True,
+    )
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
@@ -583,12 +581,11 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    with operations_nvtx_range("sglang.speculative.eagle_sample"):
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    (
+        predict,
+        accept_lens,
+        accept_index,
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -604,14 +601,13 @@ def run_eagle_verify(
         )
 
     # Update mamba state for hybrid GDN models after verification
-    with operations_nvtx_range("sglang.speculative.mamba_commit_after_verify"):
-        commit_mamba_states_after_verify(
-            target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            num_draft_tokens,
-        )
+    commit_mamba_states_after_verify(
+        target_worker,
+        batch,
+        accept_lens,
+        accept_index,
+        num_draft_tokens,
+    )
 
     if not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]

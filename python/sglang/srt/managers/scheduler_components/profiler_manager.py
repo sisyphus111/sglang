@@ -228,7 +228,7 @@ class SchedulerProfilerManager:
                     )
                 ),
                 experimental_config=(
-                    torch.profiler._ExperimentalConfig(profile_all_threads=True)
+                    None
                     if not _is_npu
                     else torch_npu.profiler._ExperimentalConfig(
                         export_type=torch_npu.profiler.ExportType.Text,
